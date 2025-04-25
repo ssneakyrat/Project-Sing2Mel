@@ -198,7 +198,7 @@ def process_file_for_mp(args):
     return stage1_process_file(file_metadata, phone_map, sample_rate, max_audio_length, max_mel_frames, hop_length)
 
 # Stage 2: GPU-based feature extraction
-def stage2_extract_features_batch(batch_data, hop_length, win_length, n_mels, fmin, fmax, device, config):
+def stage2_extract_features_batch(batch_data, hop_length, win_length, n_mels, fmin, fmax, device):
     """
     Process a batch of audio chunks on GPU for feature extraction.
     This runs in a single process to maximize GPU utilization.
@@ -376,10 +376,6 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
 
         os.makedirs(cache_dir, exist_ok=True)
         
-        # Load config for filterbank parameters
-        with open('config.yaml', 'r') as f:
-            self.config = yaml.safe_load(f)
-        
         # Create separate cache files for training and validation
         dataset_type = "train" if self.is_train else "val"
         cache_path = os.path.join(
@@ -485,8 +481,7 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         for batch_idx, batch in enumerate(tqdm(batches, desc="Processing batches on GPU")):
             batch_results = stage2_extract_features_batch(
                 batch, self.hop_length, self.win_length, 
-                self.n_mels, self.fmin, self.fmax, self.device,
-                config=self.config  # Pass the config
+                self.n_mels, self.fmin, self.fmax, self.device
             )
             processed_features.extend(batch_results)
         
@@ -677,7 +672,7 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
 
 def get_dataloader(batch_size=16, num_workers=4, pin_memory=True, persistent_workers=True, 
                   train_files=None, val_files=None, device='cuda', collate_fn=None, 
-                  n_harmonics=10, context_window_sec=None, seed=42, create_val=True):
+                    context_window_sec=None, seed=42, create_val=True):
     """
     Get dataloaders for the singing voice dataset.
     
@@ -690,7 +685,6 @@ def get_dataloader(batch_size=16, num_workers=4, pin_memory=True, persistent_wor
         val_files: Number of files to use for validation (if None, use all except training)
         device: Device to use for GPU acceleration ('cuda' or 'cpu')
         collate_fn: Custom collate function (if None, use the standardized one)
-        n_harmonics: Number of harmonics to extract
         context_window_sec: Context window size in seconds, used for chunking audio
         seed: Random seed for reproducible file selection
         create_val: Whether to create a validation dataloader

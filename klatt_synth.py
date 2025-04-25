@@ -13,7 +13,7 @@ from klatt.parameters import (
 )
 from klatt.generator import generate_sound
 from klatt.transfer_function import get_vocal_tract_transfer_function_coefficients
-from utils.save_audio import save_wav
+from utils import save_wav
 
 class KlattSynthesizer:
     """Main class for the Klatt speech synthesizer."""

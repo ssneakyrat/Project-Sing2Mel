@@ -1,3 +1,7 @@
 *.pyc
 *.wav
 *.png
+*.log
+datasets/
+phone_maps/
+cache/
