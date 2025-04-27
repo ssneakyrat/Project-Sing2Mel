@@ -705,7 +705,7 @@ def get_dataloader(batch_size=16, num_workers=4, pin_memory=True, persistent_wor
         win_length=WIN_LENGTH,
         fmin=FMIN,
         fmax=FMAX,
-        num_workers=num_workers,
+        num_workers=8,
         device=device,
         context_window_sec=context_window_sec,  # Pass context window parameter
         is_train=True,
@@ -745,7 +745,7 @@ def get_dataloader(batch_size=16, num_workers=4, pin_memory=True, persistent_wor
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
             batch_size=batch_size,
-            shuffle=False,
+            shuffle=True,
             num_workers=num_workers,
             pin_memory=pin_memory,
             persistent_workers=persistent_workers if num_workers > 0 else False,

@@ -171,7 +171,7 @@ def main():
         val_files=10,
         device='cuda' if torch.cuda.is_available() else 'cpu',
         collate_fn=standardized_collate_fn,  # Use the standardized collate function from utils.py
-        context_window_sec=2,  # Pass context window from config
+        context_window_sec=5,  # Pass context window from config
         seed=42
     )
 

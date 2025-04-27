@@ -5,3 +5,6 @@
 datasets/
 phone_maps/
 cache/
+visuals/
+*.pth
+dump_phone_map.py
