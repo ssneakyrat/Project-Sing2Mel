@@ -19,19 +19,21 @@ class HarmonicSynthesizer(nn.Module):
     6. Efficient upsampling
     7. Dynamic harmonic selection
     8. Phase calculation caching
-    9. High frequency enhancement (NEW)
+    9. High frequency enhancement with efficient FFT-based filtering
     """
-    def __init__(self, sample_rate=24000, hop_length=240, num_harmonics=100):
+    def __init__(self, sample_rate=24000, hop_length=240, num_harmonics=100, input_channels=128):
         super(HarmonicSynthesizer, self).__init__()
         self.sample_rate = sample_rate
         self.hop_length = hop_length
         self.num_harmonics = num_harmonics
+        self.input_channels = input_channels
         
         # Optimized amplitude predictor using depthwise separable convolutions
+        # Adjusted to handle dynamic input channel count
         self.harmonic_amplitude_net = nn.Sequential(
             # Depthwise + Pointwise (separable convolution)
-            nn.Conv1d(128, 128, kernel_size=3, padding=1, groups=128),  # Depthwise
-            nn.Conv1d(128, 256, kernel_size=1),  # Pointwise
+            nn.Conv1d(input_channels, input_channels, kernel_size=3, padding=1, groups=input_channels),  # Depthwise
+            nn.Conv1d(input_channels, 256, kernel_size=1),  # Pointwise
             nn.LeakyReLU(0.1),
             
             # Second separable convolution
@@ -44,10 +46,9 @@ class HarmonicSynthesizer(nn.Module):
             nn.Softplus()
         )
         
-        # NEW: High-frequency enhancement network
-        # This network explicitly models aperiodicity/noise component of higher harmonics
+        # High-frequency enhancement network
         self.high_freq_network = nn.Sequential(
-            nn.Conv1d(128, 128, kernel_size=3, padding=1),
+            nn.Conv1d(input_channels, 128, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1),
             nn.Conv1d(128, 64, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1),
@@ -55,20 +56,41 @@ class HarmonicSynthesizer(nn.Module):
             nn.Sigmoid()
         )
         
-        # Add vocal-specific networks
-        # NOTE: FormantNetwork will be modified separately in formant_network.py
-        # to extend frequency range and use additive model
-        self.formant_network = FormantNetwork(num_formants=5, hidden_dim=128)
-        self.voice_quality_network = VoiceQualityNetwork(hidden_dim=128)
-        
-        # Add respiratory dynamics network
-        self.respiratory_network = RespiratoryDynamicsNetwork(hidden_dim=128)
+        # Add vocal-specific networks with the correct input channel count
+        self.formant_network = FormantNetwork(num_formants=5, hidden_dim=128, input_channels=input_channels)
+        self.voice_quality_network = VoiceQualityNetwork(hidden_dim=128, input_channels=input_channels)
+        self.respiratory_network = RespiratoryDynamicsNetwork(hidden_dim=128, input_channels=input_channels)
         
         # Register buffers for caching phase calculations
         self.register_buffer('phase_cache', None)
         self.register_buffer('last_f0', None)
-        # Store audio length as a scalar tensor
         self.register_buffer('last_audio_length', torch.tensor(0, dtype=torch.long))
+        
+        # Precompute constant tensors
+        harmonic_indices = torch.arange(1, num_harmonics + 1).reshape(1, -1, 1)
+        self.register_buffer('harmonic_indices', harmonic_indices)
+        
+        # Precompute harmonic tilt for spectral shaping
+        harmonic_tilt = (harmonic_indices - 1) / (num_harmonics - 1)
+        self.register_buffer('harmonic_tilt', harmonic_tilt)
+        
+        # Precompute spectral boost curve
+        upper_mid = 2 * num_harmonics // 3
+        indices = torch.arange(num_harmonics).reshape(1, -1, 1)
+        boost_curve = torch.exp(-0.5 * ((indices - upper_mid) / (num_harmonics / 6)) ** 2)
+        harmonic_boost = 1.0 + boost_curve * 1.0
+        self.register_buffer('harmonic_boost', harmonic_boost.reshape(1, -1, 1))
+        
+        # Precompute high-pass filter for high frequency noise
+        filter_size = 31
+        highpass_filter = torch.zeros(1, 1, filter_size)
+        highpass_filter[0, 0, filter_size//2] = 1.0  # Center spike
+        for i in range(1, filter_size//2 + 1):
+            highpass_filter[0, 0, filter_size//2 - i] = -0.5 / i
+            highpass_filter[0, 0, filter_size//2 + i] = -0.5 / i
+        # Normalize filter
+        highpass_filter = highpass_filter / highpass_filter.abs().sum()
+        self.register_buffer('highpass_filter', highpass_filter)
         
     def forward(self, f0, condition, audio_length):
         """
@@ -82,40 +104,28 @@ class HarmonicSynthesizer(nn.Module):
         batch_size, time_steps = f0.shape
         device = f0.device
         
+        # --- Step 1: Generate Control Parameters ---
+        
         # Predict harmonic amplitudes
         harmonic_amplitudes = self.harmonic_amplitude_net(condition)  # [B, num_harmonics, T]
         
-        # NEW: Predict high frequency noise component
+        # Predict high frequency noise component
         high_freq_noise = self.high_freq_network(condition)  # [B, num_harmonics, T]
         
         # Apply natural spectral tilt: Higher harmonics have more noise
-        harmonic_indices = torch.arange(1, self.num_harmonics + 1, device=device).reshape(1, -1, 1)
-        # Normalize to range [0, 1]
-        harmonic_tilt = (harmonic_indices - 1) / (self.num_harmonics - 1)  # [1, num_harmonics, 1]
-        
-        # Boost aperiodicity for higher harmonics (progressive noise-like quality)
-        high_freq_noise = torch.clamp(high_freq_noise + 0.5 * harmonic_tilt, 0.0, 1.0)
+        # Use precomputed harmonic_tilt
+        high_freq_noise = torch.clamp(high_freq_noise + 0.5 * self.harmonic_tilt, 0.0, 1.0)
         
         # Apply formant shaping to harmonic amplitudes
         shaped_amplitudes = self.formant_network(condition, f0, harmonic_amplitudes)
         
-        # NEW: Apply high-frequency floor to prevent complete attenuation
-        # This guarantees minimum amplitude for higher harmonics
-        high_freq_floor = 0.15 * harmonic_tilt  # [1, num_harmonics, 1]
+        # Apply high-frequency floor to prevent complete attenuation
+        high_freq_floor = 0.15 * self.harmonic_tilt
         shaped_amplitudes = torch.maximum(shaped_amplitudes, harmonic_amplitudes * high_freq_floor)
         
-        # NEW: Apply spectral tilt compensation to boost specific frequency ranges
-        # Create a bell curve centered on upper-mid harmonics
-        mid_point = self.num_harmonics // 3
-        upper_mid = 2 * self.num_harmonics // 3
-        
-        # Calculate distance from center point, normalize, and apply Gaussian
-        indices = torch.arange(self.num_harmonics, device=device).reshape(1, -1, 1)
-        boost_curve = torch.exp(-0.5 * ((indices - upper_mid) / (self.num_harmonics / 6)) ** 2)
-        
-        # Apply the boost to shaped amplitudes
-        harmonic_boost = 1.0 + boost_curve * 1.0
-        shaped_amplitudes = shaped_amplitudes * harmonic_boost.reshape(1, -1, 1)
+        # Apply spectral tilt compensation to boost specific frequency ranges
+        # Use precomputed harmonic_boost
+        shaped_amplitudes = shaped_amplitudes * self.harmonic_boost
         
         # Generate voice quality parameters
         jitter, shimmer, breathiness = self.voice_quality_network(condition, audio_length)
@@ -123,30 +133,50 @@ class HarmonicSynthesizer(nn.Module):
         # Generate respiratory dynamics and breath signal
         breath_signal, breath_features = self.respiratory_network(condition, f0, audio_length)
         
+        # --- Step 2: Consolidate Signals for Efficient Upsampling ---
+        
+        # Determine actual harmonics to generate
+        min_f0 = torch.clamp_min(f0.min(), 20.0)
+        max_harmonic_indices = torch.floor(self.sample_rate / (2 * min_f0)).long()
+        max_harmonic = max_harmonic_indices.min().item()
+        min_required_harmonics = 40
+        actual_harmonics = max(min(max_harmonic, self.num_harmonics), min_required_harmonics)
+        
+        # Combine signals for consolidated upsampling
+        # Only include the actual harmonics we'll use
+        signals_to_upsample = [
+            shaped_amplitudes[:, :actual_harmonics, :],
+            high_freq_noise[:, :actual_harmonics, :],
+            breath_features
+        ]
+        
+        # Concatenate along channel dimension
+        combined_signals = torch.cat(signals_to_upsample, dim=1)
+        
+        # Single upsampling operation for all control signals
+        upsampled_signals = self._efficient_upsample(combined_signals, audio_length)
+        
+        # Extract individual signals
+        harmonic_amps = upsampled_signals[:, :actual_harmonics, :]
+        high_freq_noise_upsampled = upsampled_signals[:, actual_harmonics:2*actual_harmonics, :]
+        breath_features_upsampled = upsampled_signals[:, 2*actual_harmonics:, :]
+        
         # Upsample f0 to audio sample rate
         f0_upsampled = self._efficient_upsample(f0.unsqueeze(1), audio_length).squeeze(1)  # [B, audio_length]
         
-        # Upsample breath features to condition harmonic generation
-        breath_features_upsampled = self._efficient_upsample(breath_features, time_steps)
-        
-        # Modify harmonic amplitudes based on breath pressure
-        breath_pressure = breath_features_upsampled[:, 0:1, :]  # [B, 1, T]
-        # Attenuate harmonics during inhalation, enhance during controlled exhalation
-        breath_modulation = 0.8 + 0.4 * breath_pressure  # Range: 0.8-1.2
-        shaped_amplitudes = shaped_amplitudes * breath_modulation
+        # --- Step 3: Phase Generation with Caching ---
         
         # Check if we can reuse cached phase calculation
         can_use_cache = (
             self.phase_cache is not None 
             and self.last_f0 is not None
             and self.last_audio_length.item() == audio_length
-            and f0.shape == self.last_f0.shape  # Check shapes match first
+            and f0.shape == self.last_f0.shape
             and torch.allclose(f0, self.last_f0, atol=1e-5)
         )
         
         if not can_use_cache:
             # Calculate instantaneous phase: integrate frequency over time
-            # Convert from Hz to radians per sample
             omega = 2 * math.pi * f0_upsampled / self.sample_rate  # [B, audio_length]
             phase = torch.cumsum(omega, dim=1)  # [B, audio_length]
             
@@ -158,66 +188,49 @@ class HarmonicSynthesizer(nn.Module):
             phase = self.phase_cache
         
         # Apply jitter to phase - small random variations for naturalness
-        # Modulate jitter by breath features for more realistic effect
-        inhalation = self._efficient_upsample(breath_features[:, 1:2, :], audio_length)
+        inhalation = breath_features_upsampled[:, 1:2, :]
         breath_jitter = jitter * (1.0 + inhalation * 0.5)  # Increase jitter during inhalation
         jittered_phase = phase + breath_jitter.squeeze(1) * torch.randn_like(phase)
         
-        # Upsample high_freq_noise to audio length for harmonic generation
-        high_freq_noise_upsampled = self._efficient_upsample(high_freq_noise, audio_length)
+        # --- Step 4: Vectorized Harmonic Generation ---
         
-        # MODIFIED: Ensure minimum number of harmonics regardless of F0
-        min_f0 = torch.clamp_min(f0_upsampled, 20.0)  # Prevent division by zero with minimum f0
-        max_harmonic_indices = torch.floor(self.sample_rate / (2 * min_f0)).long()
-        max_harmonic = max_harmonic_indices.min().item()
-        # Guarantee at least 40 harmonics to ensure high-frequency content
-        min_required_harmonics = 40
-        actual_harmonics = max(min(max_harmonic, self.num_harmonics), min_required_harmonics)
+        # Create harmonic indices tensor for vectorized operations
+        h_indices = torch.arange(1, actual_harmonics + 1, device=device).view(1, -1, 1)  # [1, actual_harmonics, 1]
         
-        # Upsample amplitudes to audio length - only for harmonics we'll actually use
-        harmonic_amps = self._efficient_upsample(
-            shaped_amplitudes[:, :actual_harmonics, :], 
-            audio_length
-        )  # [B, actual_harmonics, audio_length]
+        # Nyquist frequency limit check (vectorized)
+        nyquist_mask = (h_indices * f0_upsampled.unsqueeze(1) < self.sample_rate / 2).float()  # [B, actual_harmonics, audio_length]
         
-        # Initialize output signal
-        harmonic_signal = torch.zeros(batch_size, audio_length, device=device)
+        # Generate all harmonic phases at once
+        harmonic_phases = jittered_phase.unsqueeze(1) * h_indices  # [B, actual_harmonics, audio_length]
         
-        # Generate harmonic components
-        for h in range(1, actual_harmonics + 1):
-            # Nyquist frequency limit check to prevent aliasing
-            nyquist_mask = (h * f0_upsampled < self.sample_rate / 2).float()
-            
-            # Get amplitude for this harmonic
-            harmonic_amp = harmonic_amps[:, h-1, :]  # [B, audio_length]
-            
-            # NEW: Get high frequency noise level for this harmonic
-            noise_level = high_freq_noise_upsampled[:, h-1, :]  # [B, audio_length]
-            
-            # Generate sine wave for this harmonic using jittered phase
-            harmonic_phase = jittered_phase * h
-            
-            # NEW: For higher harmonics, add increasing phase dispersion
-            if h > 20:  # Apply only to higher harmonics
-                dispersion_factor = (h - 20) / (actual_harmonics - 20)
-                random_phase = torch.randn_like(harmonic_phase) * 0.2 * dispersion_factor
-                harmonic_phase = harmonic_phase + random_phase
-            
-            # Generate harmonic with noise component
-            harmonic_sine = torch.sin(harmonic_phase)
-            harmonic_noise = torch.randn_like(harmonic_sine)
-            
-            # Mix sine and noise based on high_freq_noise
-            harmonic_wave = (1.0 - noise_level) * harmonic_sine + noise_level * harmonic_noise
-            
-            # Apply amplitude and nyquist mask
-            harmonic = harmonic_amp * harmonic_wave * nyquist_mask
-            
-            harmonic_signal += harmonic
+        # Apply phase dispersion to higher harmonics
+        high_harm_mask = (h_indices > 20).float()
+        # Create as float tensor to avoid type mismatch when assigning float values
+        dispersion_factors = torch.zeros_like(h_indices, dtype=torch.float)
+        valid_indices = h_indices > 20
+        dispersion_factors[valid_indices] = (h_indices[valid_indices].float() - 20) / (actual_harmonics - 20)
+        random_phases = torch.randn_like(harmonic_phases) * 0.2 * dispersion_factors * high_harm_mask
+        harmonic_phases = harmonic_phases + random_phases
+        
+        # Generate sine waves for all harmonics at once
+        harmonic_sines = torch.sin(harmonic_phases)  # [B, actual_harmonics, audio_length]
+        
+        # Generate noise for all harmonics at once
+        harmonic_noise = torch.randn_like(harmonic_sines)
+        
+        # Mix sine and noise for all harmonics at once
+        harmonic_waves = (1.0 - high_freq_noise_upsampled) * harmonic_sines + high_freq_noise_upsampled * harmonic_noise
+        
+        # Apply amplitude and nyquist mask to all harmonics at once
+        harmonics = harmonic_amps * harmonic_waves * nyquist_mask
+        
+        # Sum all harmonics (vectorized)
+        harmonic_signal = torch.sum(harmonics, dim=1)  # [B, audio_length]
+        
+        # --- Step 5: Apply Voice Quality Effects ---
         
         # Apply voice quality effects (shimmer and breathiness)
-        # Modulate shimmer by breath pressure for more vocal-like behavior
-        exhalation = self._efficient_upsample(breath_features[:, 2:3, :], audio_length)
+        exhalation = breath_features_upsampled[:, 2:3, :]
         breath_shimmer = shimmer * (1.0 + exhalation * 0.3)  # More shimmer during controlled exhalation
         
         enhanced_signal = self.voice_quality_network.apply_voice_qualities(
@@ -225,48 +238,43 @@ class HarmonicSynthesizer(nn.Module):
         )
         
         # Mix harmonic and breath signals
-        # Apply crossfade based on voicing
         voiced = (f0_upsampled > 0).float()
-        voiced_expanded = voiced.unsqueeze(1)
-        
-        # Create weighted mix: mostly harmonic when voiced, mostly breath when unvoiced
         output_signal = (enhanced_signal * voiced) + (breath_signal.squeeze(1) * (1.0 - voiced))
         
-        # NEW: Add explicit high-frequency noise component for additional "air" in the sound
+        # Add efficient high-frequency noise component
         high_freq_air = self._generate_high_freq_noise(audio_length, batch_size, device)
-        
-        # Mix with main signal - applying voicing mask to control noise
-        # Add more noise during unvoiced segments, less during voiced
         output_signal = output_signal + high_freq_air * ((1.0 - voiced) * 0.3 + 0.05)
         
         return output_signal
     
     def _generate_high_freq_noise(self, audio_length, batch_size, device):
-        """Generate filtered noise for high frequencies only"""
+        """Generate filtered noise for high frequencies using FFT-based filtering"""
         # Generate white noise
-        white_noise = torch.randn(batch_size, audio_length, device=device)
+        white_noise = torch.randn(batch_size, 1, audio_length, device=device)
         
-        # Create a simple high-pass filter (this is a simplified approach)
-        # In practice, you would use a proper FIR or IIR filter implementation
+        # Method 1: For shorter audio, use direct convolution with precomputed filter
+        if audio_length < 10000:
+            high_freq_noise = F.conv1d(
+                white_noise,
+                self.highpass_filter.to(device),
+                padding=self.highpass_filter.shape[2]//2
+            ).squeeze(1)
+        # Method 2: For longer audio, use FFT-based filtering (more efficient)
+        else:
+            # Convert to frequency domain
+            noise_fft = torch.fft.rfft(white_noise.squeeze(1))
+            
+            # Create frequency domain high-pass filter
+            freqs = torch.fft.rfftfreq(audio_length, d=1.0/self.sample_rate, device=device)
+            high_pass = (freqs > 4000).float()  # High-pass at 4000 Hz
+            
+            # Apply filter in frequency domain
+            filtered_fft = noise_fft * high_pass
+            
+            # Convert back to time domain
+            high_freq_noise = torch.fft.irfft(filtered_fft, n=audio_length)
         
-        # Calculate DCT coefficients for a basic high-pass filter
-        filter_size = 31
-        highpass_filter = torch.zeros(filter_size, device=device)
-        highpass_filter[filter_size//2] = 1.0  # Center spike
-        # Create alternating pattern for neighboring samples (creates high-pass effect)
-        for i in range(1, filter_size//2 + 1):
-            highpass_filter[filter_size//2 - i] = -0.5 / i
-            highpass_filter[filter_size//2 + i] = -0.5 / i
-        
-        # Normalize filter
-        highpass_filter = highpass_filter / highpass_filter.abs().sum()
-        
-        # Apply convolution to get high-frequency noise
-        # This is simplified - in practice use torch.nn.functional.conv1d with proper padding
-        # This is a placeholder for the actual filtering implementation
-        high_freq_noise = white_noise * 0.05  # Scale down amplitude
-        
-        return high_freq_noise
+        return high_freq_noise * 0.05  # Scale down amplitude
         
     def _efficient_upsample(self, tensor, target_len):
         """More efficient upsampling with reduced memory footprint"""

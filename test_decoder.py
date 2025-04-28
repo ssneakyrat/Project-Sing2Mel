@@ -353,7 +353,7 @@ def main():
         optimizer, 
         mode='min', 
         factor=0.5, 
-        patience=25,
+        patience=100,
         verbose=True
     )
     
