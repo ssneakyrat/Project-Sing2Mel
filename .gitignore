@@ -8,3 +8,6 @@ cache/
 visuals/
 *.pth
 dump_phone_map.py
+cache_decoder/
+audio_samples/
+checkpoints/
