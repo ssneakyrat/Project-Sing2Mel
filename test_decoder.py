@@ -346,14 +346,14 @@ def main():
     ).to(device)
     
     # Optimizer
-    optimizer = optim.Adam(model.parameters(), lr=0.0005)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
     
     # Learning rate scheduler - reduce LR when loss plateaus
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 
         mode='min', 
         factor=0.5, 
-        patience=10,
+        patience=25,
         verbose=True
     )
     

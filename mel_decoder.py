@@ -4,9 +4,7 @@ import torch.nn.functional as F
 import math
 
 from decoder.conditioning_network import ConditioningNetwork
-from decoder.fusion_network import FusionNetwork
 from decoder.harmonic_synthesizer import HarmonicSynthesizer
-from decoder.noise_generator import FilteredNoiseGenerator
 
 class MelDecoder(nn.Module):
     """DDSP-based vocal synthesis model with harmonic, noise, and transient components"""
@@ -35,15 +33,6 @@ class MelDecoder(nn.Module):
             hop_length=hop_length,
             num_harmonics=num_harmonics
         )
-        
-        self.noise_gen = FilteredNoiseGenerator(
-            n_fft=1024,
-            hop_length=hop_length,
-            sample_rate=sample_rate
-        )
-        
-        # Fusion network - combines waveforms with learned weights
-        self.fusion_network = FusionNetwork(num_components=2)  # Updated to handle 3 components
         
     def forward(self, mel, f0, phoneme_seq, singer_id=None, language_id=None):
         """
@@ -74,11 +63,4 @@ class MelDecoder(nn.Module):
         # Generate harmonic component (pitched/tonal sounds)
         harmonic_signal = self.harmonic_synth(f0, condition, audio_length)
         
-        # Generate noise component (unpitched sounds, breath, turbulence)
-        noise_signal = self.noise_gen(condition, audio_length)
-        
-        # Combine components using fusion network
-        components = [harmonic_signal, noise_signal]
-        audio = self.fusion_network(components, condition)
-        
-        return audio
+        return harmonic_signal
