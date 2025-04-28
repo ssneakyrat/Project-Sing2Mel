@@ -7,7 +7,6 @@ from decoder.conditioning_network import ConditioningNetwork
 from decoder.fusion_network import FusionNetwork
 from decoder.harmonic_synthesizer import HarmonicSynthesizer
 from decoder.noise_generator import FilteredNoiseGenerator
-from decoder.transient_generator import TransientGenerator
 
 class MelDecoder(nn.Module):
     """DDSP-based vocal synthesis model with harmonic, noise, and transient components"""
@@ -43,14 +42,8 @@ class MelDecoder(nn.Module):
             sample_rate=sample_rate
         )
         
-        # New transient generator component
-        self.transient_gen = TransientGenerator(
-            hop_length=hop_length,
-            sample_rate=sample_rate
-        )
-        
         # Fusion network - combines waveforms with learned weights
-        self.fusion_network = FusionNetwork(num_components=3)  # Updated to handle 3 components
+        self.fusion_network = FusionNetwork(num_components=2)  # Updated to handle 3 components
         
     def forward(self, mel, f0, phoneme_seq, singer_id=None, language_id=None):
         """
@@ -84,11 +77,8 @@ class MelDecoder(nn.Module):
         # Generate noise component (unpitched sounds, breath, turbulence)
         noise_signal = self.noise_gen(condition, audio_length)
         
-        # Generate transient component (consonants, attacks, etc.)
-        transient_signal = self.transient_gen(condition, audio_length)
-        
         # Combine components using fusion network
-        components = [harmonic_signal, noise_signal, transient_signal]
+        components = [harmonic_signal, noise_signal]
         audio = self.fusion_network(components, condition)
         
         return audio
