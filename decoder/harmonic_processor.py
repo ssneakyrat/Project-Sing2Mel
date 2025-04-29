@@ -17,7 +17,7 @@ class HarmonicProcessor(nn.Module):
             nn.Softplus()  # Ensure positive amplitudes with smooth gradient
         )
         
-    def forward(self, condition, f0=None):
+    def forward(self, condition):
         """
         Generate harmonic amplitudes from conditioning.
         

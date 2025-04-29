@@ -16,7 +16,7 @@ class HarmonicSynthesizer(nn.Module):
     Includes noise component for modeling breathy and noisy vocal characteristics.
     Now with enhanced phase coherence for more natural vocal synthesis.
     """
-    def __init__(self, sample_rate=24000, hop_length=240, num_harmonics=100, input_channels=128, noise_mix_ratio=0.3):
+    def __init__(self, sample_rate=24000, hop_length=240, num_harmonics=100, input_channels=128, noise_mix_ratio=0.2):
         super(HarmonicSynthesizer, self).__init__()
         self.sample_rate = sample_rate
         self.hop_length = hop_length
@@ -61,7 +61,7 @@ class HarmonicSynthesizer(nn.Module):
         audio_length = (time_steps * self.hop_length_tensor).long()
 
         # Generate base harmonic amplitudes from conditioning
-        harmonic_amplitudes = self.harmonic_processor(condition, f0)  # [B, num_harmonics, T]
+        harmonic_amplitudes = self.harmonic_processor(condition)  # [B, num_harmonics, T]
         
         # Apply formant processing
         formant_amplitudes = self.formant_processor(condition, harmonic_amplitudes, self.num_harmonics)
@@ -145,7 +145,6 @@ class HarmonicSynthesizer(nn.Module):
         # Ensure mix preserves overall energy
         harmonic_weight = 1.0 - final_mix_ratio
         output_signal = harmonic_weight * harmonic_signal + final_mix_ratio * noise_signal
-        
         return output_signal.squeeze(1)  # [B, audio_length]
         
     def _efficient_upsample(self, tensor, target_len):
