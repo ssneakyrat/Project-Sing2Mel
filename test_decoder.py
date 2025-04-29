@@ -292,7 +292,7 @@ def main():
     # Load dataset
     batch_size = 16  # Smaller batch size for complex model
     num_epochs = 500
-    visualization_interval = 20  # Visualize every 5 epochs
+    visualization_interval = 10  # Visualize every 5 epochs
 
     train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
         batch_size=batch_size,
@@ -353,7 +353,7 @@ def main():
         optimizer, 
         mode='min', 
         factor=0.5, 
-        patience=100,
+        patience=50,
         verbose=True
     )
     

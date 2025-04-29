@@ -1,93 +1,92 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import math
 
 class ConditioningNetwork(nn.Module):
-    """Processes input features (mel, f0, phoneme) to generate conditioning vectors"""
-    def __init__(self, n_mels=80, num_phonemes=100, hidden_dim=128):
+    def __init__(self, n_mels=80, num_phonemes=100, hidden_dim=128, output_dim=None):
         super(ConditioningNetwork, self).__init__()
         self.hidden_dim = hidden_dim
         self.n_mels = n_mels
+        # If output_dim is not provided, default to hidden_dim
+        self.output_dim = output_dim if output_dim is not None else hidden_dim
+        
+        # Process mel spectrogram - lightweight 1D convolution approach
+        self.mel_encoder = nn.Sequential(
+            nn.Conv1d(n_mels, hidden_dim//2, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_dim//2),
+            nn.ReLU(),
+            nn.Conv1d(hidden_dim//2, hidden_dim//2, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm1d(hidden_dim//2),
+            nn.ReLU()
+        )
+        
+        # Process F0 - simple convolutional encoder
+        self.f0_encoder = nn.Sequential(
+            nn.Conv1d(1, hidden_dim//4, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_dim//4),
+            nn.ReLU()
+        )
+        
+        # Process phoneme features
+        self.phoneme_encoder = nn.Sequential(
+            nn.Conv1d(64, hidden_dim//4, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_dim//4),
+            nn.ReLU()
+        )
+        
+        # Process singer embedding
+        self.singer_encoder = nn.Sequential(
+            nn.Linear(32, hidden_dim//8),
+            nn.ReLU()
+        )
+        
+        # Process language embedding
+        self.language_encoder = nn.Sequential(
+            nn.Linear(32, hidden_dim//8),
+            nn.ReLU()
+        )
+        
+        # Calculate total channels after concatenation
+        total_channels = (hidden_dim // 2) + (hidden_dim // 4) + (hidden_dim // 4) + (hidden_dim // 8) + (hidden_dim // 8)
+        
+        # Combine all features efficiently with correct input channel count
+        self.combiner = nn.Sequential(
+            nn.Conv1d(total_channels, self.output_dim, kernel_size=1),
+            nn.BatchNorm1d(self.output_dim),
+            nn.ReLU()
+        )
+        
+    def forward(self, mel, f0, phoneme_embedded, singer_embedded, language_embedded):
+        # Get sequence length
+        seq_len = mel.size(2)
+        batch_size = mel.size(0)
         
         # Process mel spectrogram
-        self.mel_conv = nn.Sequential(
-            nn.Conv1d(n_mels, hidden_dim, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.1),
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.1)
-        )
+        mel_features = self.mel_encoder(mel)
         
         # Process F0
-        self.f0_embed = nn.Sequential(
-            nn.Conv1d(1, hidden_dim // 4, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.1)
-        )
+        f0_features = self.f0_encoder(f0)
         
-        # Process phoneme
-        self.phoneme_embed = nn.Embedding(num_phonemes + 1, hidden_dim // 4)
+        # Process phoneme embeddings (now already in the right format)
+        phoneme_features = self.phoneme_encoder(phoneme_embedded)
+        
+        # Process singer embedding - expand to match time dimension
+        singer_features = self.singer_encoder(singer_embedded)
+        singer_features = singer_features.unsqueeze(2).expand(-1, -1, seq_len)
+        
+        # Process language embedding - expand to match time dimension
+        language_features = self.language_encoder(language_embedded)
+        language_features = language_features.unsqueeze(2).expand(-1, -1, seq_len)
         
         # Combine all features
-        self.combined_conv = nn.Sequential(
-            nn.Conv1d(hidden_dim + hidden_dim // 2, hidden_dim, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.1),
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.1)
-        )
+        combined = torch.cat([
+            mel_features,              # [B, hidden_dim//2, T]
+            f0_features,               # [B, hidden_dim//4, T]
+            phoneme_features,          # [B, hidden_dim//4, T]
+            singer_features,           # [B, hidden_dim//8, T]
+            language_features          # [B, hidden_dim//8, T]
+        ], dim=1)
         
-    def forward(self, mel, f0, phoneme_seq):
-        """
-        Args:
-            mel: Mel spectrogram [B, T, n_mels] or [B, n_mels, T]
-            f0: Fundamental frequency contour [B, T]
-            phoneme_seq: Phoneme sequence [B, T]
-        Returns:
-            condition: Conditioning vector [B, hidden_dim, T]
-        """
-        batch_size = mel.shape[0]
-        
-        # Check and fix mel dimensions if needed
-        if mel.size(1) == self.n_mels:
-            # Already in [B, n_mels, T] format
-            pass
-        else:
-            # Convert from [B, T, n_mels] to [B, n_mels, T]
-            mel = mel.transpose(1, 2)
-        
-        # Get time dimension from mel
-        time_steps = mel.size(2)
-        
-        # Process mel
-        mel_features = self.mel_conv(mel)  # [B, hidden_dim, T]
-        
-        # Process F0 - ensure it's in [B, 1, T] format
-        if f0.dim() == 2:
-            f0 = f0.unsqueeze(1)  # [B, 1, T]
-        
-        # Ensure f0 has the same sequence length as mel
-        if f0.size(2) != time_steps:
-            f0 = F.interpolate(f0, size=time_steps, mode='linear', align_corners=False)
-            
-        f0_features = self.f0_embed(f0)  # [B, hidden_dim//4, T]
-        
-        # Process phoneme - ensure it has the same sequence length as mel
-        if phoneme_seq.size(1) != time_steps:
-            # Interpolate phoneme indices (this isn't ideal but works for training)
-            phoneme_seq_float = phoneme_seq.float().unsqueeze(1)  # [B, 1, phoneme_seq_len]
-            phoneme_seq_resized = F.interpolate(
-                phoneme_seq_float, 
-                size=time_steps, 
-                mode='nearest'
-            ).squeeze(1).long()  # [B, T]
-        else:
-            phoneme_seq_resized = phoneme_seq
-            
-        # Embed phonemes
-        phoneme_features = self.phoneme_embed(phoneme_seq_resized)  # [B, T, hidden_dim//4]
-        phoneme_features = phoneme_features.transpose(1, 2)  # [B, hidden_dim//4, T]
-        
-        # Combine features
-        combined = torch.cat([mel_features, f0_features, phoneme_features], dim=1)
-        condition = self.combined_conv(combined)
+        # Final conditioning
+        condition = self.combiner(combined)
         
         return condition

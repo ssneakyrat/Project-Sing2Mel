@@ -8,11 +8,7 @@ from decoder.harmonic_synthesizer import HarmonicSynthesizer
 
 class MelDecoder(nn.Module):
     """
-    Optimized DDSP-based vocal synthesis model with harmonic, noise, and transient components
-    - Improved memory efficiency
-    - Vectorized operations
-    - Consolidated processing
-    - Reduced redundant computations
+    DDSP-based singing vocal synthesis model.
     """
     def __init__(self, num_phonemes, num_singers, num_languages, 
                  n_mels=80, hop_length=240, num_harmonics=100, sample_rate=24000):
@@ -21,96 +17,55 @@ class MelDecoder(nn.Module):
         self.hop_length = hop_length
         self.sample_rate = sample_rate
         
-        # Embedding layers (efficient implementation)
-        self.phoneme_embed = nn.Embedding(num_phonemes + 1, 64)
-        self.singer_embed = nn.Embedding(num_singers, 32)
-        self.language_embed = nn.Embedding(num_languages, 32)
-        
-        # Conditioning network
+        # Define embedding dimensions
+        phoneme_embed_dim = 64
+        singer_embed_dim = 32
+        language_embed_dim = 32
         conditioning_hidden_dim = 128
+        
+        # Pre-calculate desired output dimension for conditioning network
+        conditioning_output_dim = conditioning_hidden_dim
+        
+        # Embedding layers (efficient implementation)
+        self.phoneme_embed = nn.Embedding(num_phonemes + 1, phoneme_embed_dim)
+        self.singer_embed = nn.Embedding(num_singers, singer_embed_dim)
+        self.language_embed = nn.Embedding(num_languages, language_embed_dim)
+        
+        # Conditioning network with explicit output dimension
         self.conditioning_network = ConditioningNetwork(
             n_mels=n_mels,
             num_phonemes=num_phonemes,
-            hidden_dim=conditioning_hidden_dim
+            hidden_dim=conditioning_hidden_dim,
+            output_dim=conditioning_output_dim
         )
-        
-        # Determine the actual output dimension from conditioning network
-        # This depends on the ConditioningNetwork implementation
-        # Default is typically 128, but could be different
-        conditioning_output_dim = getattr(self.conditioning_network, 'output_dim', conditioning_hidden_dim)
-        
-        # Calculate total conditioning dimensions including potential embeddings
-        total_conditioning_dims = conditioning_output_dim
-        if hasattr(self, 'singer_embed'):
-            total_conditioning_dims += self.singer_embed.embedding_dim  # 32
-        if hasattr(self, 'language_embed'):
-            total_conditioning_dims += self.language_embed.embedding_dim  # 32
         
         # DDSP Components with correct input channels
         self.harmonic_synth = HarmonicSynthesizer(
             sample_rate=sample_rate,
             hop_length=hop_length,
             num_harmonics=num_harmonics,
-            input_channels=total_conditioning_dims  # Now accounts for all embeddings
+            input_channels=conditioning_output_dim
         )
         
-        # Precompute audio length multiplier for efficiency
-        self.register_buffer('hop_length_tensor', torch.tensor(hop_length, dtype=torch.float))
+    def forward(self, mel, f0, phoneme_seq, singer_id, language_id):
+        # preprocess dimension conditioning
+        mel = mel.transpose(1, 2)  # now [B, n_mels, T]
+        f0 = f0.unsqueeze(1)  # Make it [B, 1, T]
         
-    def forward(self, mel, f0, phoneme_seq, singer_id=None, language_id=None):
-        """
-        Args:
-            mel: Mel spectrogram [B, T, n_mels] or [B, n_mels, T]
-            f0: Fundamental frequency contour [B, T]
-            phoneme_seq: Phoneme sequence [B, T]
-            singer_id: Singer identity [B] (optional)
-            language_id: Language identity [B] (optional)
-        Returns:
-            audio: Generated audio waveform [B, audio_length]
-        """
-        # Get batch size and sequence length
-        batch_size = mel.shape[0]
+        # Apply embedding layers to convert integer indices to embeddings
+        # For phonemes: convert from [B, T] to [B, 64, T]
+        phoneme_embedded = self.phoneme_embed(phoneme_seq)  # [B, T, 64]
+        phoneme_embedded = phoneme_embedded.transpose(1, 2)  # [B, 64, T]
         
-        # Normalize inputs for better consistency
-        # Standardize mel format to [B, n_mels, T]
-        if mel.size(1) == self.n_mels:
-            time_steps = mel.size(2)  # Already in [B, n_mels, T] format
-        else:
-            time_steps = mel.size(1)  # [B, T, n_mels] format
-            mel = mel.transpose(1, 2)  # Convert to [B, n_mels, T]
+        # Convert singer_id and language_id to embeddings
+        singer_embedded = self.singer_embed(singer_id)  # [B, 32]
+        language_embedded = self.language_embed(language_id)  # [B, 32]
         
-        # Ensure f0 and phoneme_seq have matching time dimensions
-        assert f0.size(1) == time_steps, "F0 time dimension must match mel spectrogram"
-        assert phoneme_seq.size(1) == time_steps, "Phoneme sequence time dimension must match mel spectrogram"
-        
-        # Calculate target audio length once using precomputed tensor
-        # Using float calculations before converting to integer for better stability
-        audio_length = (time_steps * self.hop_length_tensor).long()
-        
-        # Generate conditioning information from inputs (vectorized)
-        condition = self.conditioning_network(mel, f0, phoneme_seq)
-        
-        # Efficiently apply singer and language conditioning if provided
-        if singer_id is not None:
-            singer_embed = self.singer_embed(singer_id)  # [B, 32]
-            # Expand to condition's time dimension and combine
-            singer_embed = singer_embed.unsqueeze(2).expand(-1, -1, condition.size(2))
-            condition = torch.cat([condition, singer_embed], dim=1)
-            
-        if language_id is not None:
-            language_embed = self.language_embed(language_id)  # [B, 32]
-            # Expand to condition's time dimension and combine
-            language_embed = language_embed.unsqueeze(2).expand(-1, -1, condition.size(2))
-            condition = torch.cat([condition, language_embed], dim=1)
+        # Generate conditioning information from inputs with embeddings
+        condition = self.conditioning_network(mel, f0, phoneme_embedded, 
+                                            singer_embedded, language_embedded)
         
         # Generate harmonic component using optimized synthesizer
-        harmonic_signal = self.harmonic_synth(f0, condition, audio_length)
+        harmonic_signal = self.harmonic_synth(f0, mel, condition)
         
         return harmonic_signal
-        
-    def set_device(self, device):
-        """
-        Helper method to move all model components to the specified device
-        """
-        self.to(device)
-        return self
