@@ -8,7 +8,7 @@ from decoder.spectral_processor import SpectralProcessor
 from decoder.harmonic_processor import HarmonicProcessor
 from decoder.noise_processor import NoiseProcessor
 from decoder.phase_coherence_processor import PhaseCoherenceProcessor
-from decoder.refiner_network import RefinementNetwork    
+from decoder.refiner_network import RefinerNetwork    
 
 class HarmonicSynthesizer(nn.Module):
     """
@@ -50,10 +50,9 @@ class HarmonicSynthesizer(nn.Module):
             nn.Sigmoid()  # Output between 0-1 for noise mixing ratio
         )
 
-        self.refinement_network = RefinementNetwork(
+        self.refiner_network = RefinerNetwork(
             input_channels=self.input_channels,
-            fft_size=1024,  # Single FFT size for stability
-            hop_factor=4
+            sample_rate=sample_rate
         )
         
         # Register additional buffers for efficient computation
@@ -153,7 +152,7 @@ class HarmonicSynthesizer(nn.Module):
         harmonic_weight = 1.0 - final_mix_ratio
         output_signal = harmonic_weight * harmonic_signal + final_mix_ratio * noise_signal
 
-        refined_signal = self.refinement_network(output_signal.squeeze(1), condition)
+        refined_signal = self.refiner_network(output_signal.squeeze(1), condition)
             
         return refined_signal  # [B, audio_length]
         #return output_signal.squeeze(1)  # [B, audio_length]

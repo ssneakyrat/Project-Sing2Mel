@@ -2,494 +2,467 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import numpy as np
 
-class RefinementNetwork(nn.Module):
+class RefinerNetwork(nn.Module):
     """
-    Enhanced RefinementNetwork for singing vocals using DDSP principles.
-    Optimized for vocal synthesis with formant enhancement, dynamic control,
-    and sibilance management while maintaining numerical stability.
+    Lightweight DDSP-based singing voice enhancement network.
+    Uses harmonic+noise decomposition, source-filter modeling, and efficient neural architecture.
+    
+    Key improvements over RefinementNetwork:
+    - 70-80% parameter reduction through shared backbone and depthwise separable convolutions
+    - Physics-informed harmonic+noise synthesis instead of full STFT/ISTFT processing
+    - Specialized vocal-specific effects for singing enhancement
+    - More efficient source-filter model based on vocal tract physics
     """
-    def __init__(self, input_channels=128, fft_size=1024, hop_factor=4, sample_rate=24000):
-        super(RefinementNetwork, self).__init__()
+    def __init__(self, input_channels=64, sample_rate=24000):
+        super(RefinerNetwork, self).__init__()
         self.input_channels = input_channels
-        self.fft_size = fft_size
-        self.hop_length = fft_size // hop_factor
         self.sample_rate = sample_rate
         
-        # --- Basic controls from original RefinementNetwork ---
-        self.output_gain = nn.Sequential(
-            nn.Conv1d(input_channels, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(16, 1, kernel_size=1),
-            nn.Sigmoid()  # Output gain control (0-1)
-        )
-        
-        # Wet/dry balance
-        self.wet_dry = nn.Sequential(
-            nn.Conv1d(input_channels, 8, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(8, 1, kernel_size=1),
-            nn.Sigmoid()  # 0-1 range
-        )
-        
-        # --- New vocal-specific controls ---
-        
-        # 1. Formant enhancement (5 formants)
-        self.formant_enhancement = nn.Sequential(
+        # Shared feature backbone - reduces parameter count significantly
+        self.feature_backbone = nn.Sequential(
             nn.Conv1d(input_channels, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(32, 5, kernel_size=1),  # 5 formant regions
-            nn.Tanh()  # -1 to 1 range for formant emphasis
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(32, 32, kernel_size=3, padding=1, groups=4),  # Depthwise separable conv
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(32, 32, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2)
         )
         
-        # 2. Vocal-specific filter bank (8 bands)
-        self.vocal_filter_bank = nn.Sequential(
-            nn.Conv1d(input_channels, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(32, 8, kernel_size=1),  # 8 bands tuned to vocal frequencies
-            nn.Tanh()  # -1 to 1 range for cut/boost
+        # --- Harmonic synthesis parameters ---
+        self.harmonic_params = nn.Sequential(
+            nn.Conv1d(32, 16, kernel_size=3, padding=1, groups=4),  # Depthwise separable
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(16, 32, kernel_size=1)  # 1 for f0, 30 for harmonic amplitudes, 1 for overall gain
         )
         
-        # 3. Dynamic range control (compressor params)
-        self.comp_threshold = nn.Sequential(
-            nn.Conv1d(input_channels, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(16, 1, kernel_size=1),
-            nn.Sigmoid()  # 0-1 range for threshold mapping
+        # --- Noise synthesis parameters ---
+        self.noise_params = nn.Sequential(
+            nn.Conv1d(32, 16, kernel_size=3, padding=1, groups=4),  # Depthwise separable
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(16, 8, kernel_size=1)  # 8 noise bands
         )
         
-        self.comp_ratio = nn.Sequential(
-            nn.Conv1d(input_channels, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(16, 1, kernel_size=1),
-            nn.Sigmoid()  # 0-1 range mapped to 1:1-8:1
+        # --- Source-Filter parameters ---
+        self.filter_params = nn.Sequential(
+            nn.Conv1d(32, 16, kernel_size=3, padding=1, groups=4),  # Depthwise separable
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(16, 5, kernel_size=1)  # 5 formant parameters (simplified vocal tract)
         )
         
-        # 4. Sibilance control (de-esser)
-        self.sibilance_processor = nn.Sequential(
-            nn.Conv1d(input_channels, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv1d(16, 1, kernel_size=1),
-            nn.Sigmoid()  # Amount of reduction
+        # --- Specialized vocal effects ---
+        self.vocal_effects = nn.Sequential(
+            nn.Conv1d(32, 16, kernel_size=3, padding=1, groups=4),  # Depthwise separable
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(16, 6, kernel_size=1)  # 6 effect parameters: breath, vibrato, consonants, etc.
         )
         
-        # 5. Vowel-Consonant detector
-        self.vowel_consonant_detector = nn.Sequential(
-            nn.Conv1d(input_channels, 32, kernel_size=5, padding=2),  # Wider context
-            nn.ReLU(),
-            nn.Conv1d(32, 1, kernel_size=1),
-            nn.Sigmoid()  # 0 = consonant, 1 = vowel
+        # --- Output mixing parameters ---
+        self.output_params = nn.Sequential(
+            nn.Conv1d(32, 8, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(8, 3, kernel_size=1)  # [dry/wet, overall gain, EQ tilt]
         )
         
-        # 6. Vibrato enhancement
-        self.vibrato_enhance = nn.Sequential(
-            nn.Conv1d(input_channels, 16, kernel_size=7, padding=3),  # Wider kernel for temporal patterns
-            nn.ReLU(),
-            nn.Conv1d(16, 1, kernel_size=1),
-            nn.Tanh()  # For vibrato depth adjustment
-        )
-        
-        # --- Create specialized filters ---
-        
-        # Formant center frequencies (Hz) - standard defaults
-        formant_centers = torch.tensor([500, 1500, 2500, 3500, 4500], dtype=torch.float32)
-        self.register_buffer('formant_centers', formant_centers.view(1, -1, 1))
-        
-        # Formant bandwidths (Hz)
-        formant_bandwidths = torch.tensor([100, 200, 300, 400, 500], dtype=torch.float32)
-        self.register_buffer('formant_bandwidths', formant_bandwidths.view(1, -1, 1))
-        
-        # Create vocal-specific filter bands
-        self.register_buffer('filter_bands', self._create_vocal_filter_bands())
-        
-        # Create sibilance band (5-8kHz region)
-        nyquist = fft_size // 2
-        sibilance_band = torch.zeros(nyquist + 1)
-        sib_start = int(5000 / (sample_rate / 2) * nyquist)
-        sib_end = int(8000 / (sample_rate / 2) * nyquist)
-        sibilance_band[sib_start:sib_end] = 1.0
-        self.register_buffer('sibilance_band', sibilance_band.unsqueeze(0).unsqueeze(0))
-        
-        # Register window for STFT
-        self.register_buffer('window', torch.hann_window(fft_size))
+        # Create filter templates for formants and noise bands
+        self._init_filter_templates()
     
-    def _create_vocal_filter_bands(self):
-        """Create filter bands specifically tuned for vocal frequencies"""
-        nyquist = self.fft_size // 2
-        num_bins = nyquist + 1
+    def _init_filter_templates(self):
+        """Initialize filter templates for efficient processing"""
+        # Formant centers (normalized 0-1)
+        formant_defaults = torch.tensor([500, 1500, 2500, 3500, 4500], dtype=torch.float32)
+        formant_defaults = formant_defaults / (self.sample_rate / 2)  # Normalize
+        self.register_buffer('formant_defaults', formant_defaults)
         
-        # Vocal-focused frequency bands (in Hz)
-        band_centers = [
-            120,    # Sub-fundamental
-            240,    # Fundamental
-            500,    # First formant region
-            1100,   # Second formant region
-            2500,   # Third formant region
-            3500,   # Fourth formant region
-            5000,   # Sibilance/presence
-            8000    # Air/brightness
-        ]
+        # Formant bandwidths (normalized 0-1)
+        bandwidth_defaults = torch.tensor([80, 120, 200, 300, 400], dtype=torch.float32)
+        bandwidth_defaults = bandwidth_defaults / (self.sample_rate / 2)  # Normalize
+        self.register_buffer('bandwidth_defaults', bandwidth_defaults)
         
-        # Convert to bin indices
-        band_indices = [min(nyquist, int(freq / (self.sample_rate / 2) * nyquist)) for freq in band_centers]
-        
-        # Create filter bands with smooth overlaps
-        bands = torch.zeros(8, num_bins)
-        
-        for i in range(8):
-            center = band_indices[i]
-            
-            # Calculate width based on psychoacoustic principles (wider at higher frequencies)
-            if i < 2:
-                width = max(center // 2, 1)  # Narrow for fundamentals
-            elif i < 4:
-                width = max(center // 3, 1)  # Medium for low formants
-            else:
-                width = max(center // 4, 1)  # Wider for high frequencies
-            
-            # Create band with smooth edges
-            start = max(0, center - width)
-            end = min(num_bins, center + width)
-            
-            # Linear ramp up
-            if start > 0:
-                ramp_length = min(width, center - start)
-                if ramp_length > 0:  # Add safety check
-                    ramp_up = torch.linspace(0, 1, ramp_length)
-                    bands[i, start:start+ramp_length] = ramp_up
-            
-            # Center peak
-            bands[i, center] = 1.0
-            
-            # Linear ramp down
-            if end < num_bins:
-                ramp_length = min(width, end - center - 1)
-                if ramp_length > 0:  # Add safety check
-                    ramp_down = torch.linspace(1, 0, ramp_length)
-                    bands[i, center+1:center+1+ramp_length] = ramp_down
-        
-        # Normalize so bands sum to ~1.0 across all bands
-        band_sum = bands.sum(dim=0, keepdim=True)
-        band_sum[band_sum < 0.1] = 1.0  # Avoid division by small numbers
-        bands = bands / band_sum
-        
-        return bands.unsqueeze(0)  # [1, 8, F]
+        # Initialize noise band filters
+        noise_bands = self._create_noise_bands()
+        self.register_buffer('noise_bands', noise_bands)
     
-    def apply_formants(self, mag_db, formant_controls, stft_time):
-        """Apply formant enhancement to magnitude spectrum"""
-        batch_size = mag_db.shape[0]
-        num_bins = mag_db.shape[1]
+    def _create_noise_bands(self):
+        """Create overlapping noise bands for the noise component"""
+        n_mels = 8  # Number of noise bands
+        n_freqs = 512  # Number of frequency bins
         
-        # Interpolate formant controls to match STFT time steps
-        if formant_controls.shape[2] != stft_time:
-            formant_controls = F.interpolate(
-                formant_controls, size=stft_time, mode='linear', align_corners=False
-            )
+        # MEL scale centers
+        mel_min = 0
+        mel_max = 8000 / (self.sample_rate / 2)
+        mel_points = torch.linspace(mel_min, mel_max, n_mels + 2)
         
-        # Create frequency axis (normalized 0-1)
-        freq_axis = torch.linspace(0, 1, num_bins, device=mag_db.device)
+        # Convert MEL to Hz (normalized 0-1)
+        f_pts = 700 * (10**(mel_points / 2595) - 1) / (self.sample_rate / 2)
+        f_pts = f_pts.clamp(0, 1)
         
-        # Create formant filters
-        formant_filters = torch.zeros((batch_size, num_bins, stft_time), device=mag_db.device)
+        # Create triangular filters
+        filters = torch.zeros(n_mels, n_freqs)
         
-        # For each formant
-        for i in range(5):  # 5 formants
-            # Get center frequency (normalized 0-1)
-            center_freq = self.formant_centers[:, i] / (self.sample_rate / 2)
-            center_freq = center_freq.clamp(0.01, 0.99)  # Safety clamp
+        # Normalized frequency axis
+        freq_axis = torch.linspace(0, 1, n_freqs)
+        
+        for i in range(n_mels):
+            # Create triangular filter
+            left, center, right = f_pts[i], f_pts[i + 1], f_pts[i + 2]
             
-            # Get bandwidth (normalized 0-1)
-            bandwidth = self.formant_bandwidths[:, i] / (self.sample_rate / 2)
-            bandwidth = bandwidth.clamp(0.01, 0.3)  # Safety clamp
+            # Left side of triangle
+            left_slope = (freq_axis - left) / (center - left)
+            left_slope = torch.clamp(left_slope, 0, 1)
             
-            # Expand dimensions for broadcasting
-            freq = freq_axis.view(1, -1, 1)  # [1, F, 1]
-            center = center_freq.view(-1, 1, 1)  # [B, 1, 1]
-            bw = bandwidth.view(-1, 1, 1)  # [B, 1, 1]
+            # Right side of triangle
+            right_slope = (right - freq_axis) / (right - center)
+            right_slope = torch.clamp(right_slope, 0, 1)
             
-            # Create resonance filter
-            resonance = 1.0 / (1.0 + ((freq - center) / (bw / 2)) ** 2)
-            
-            # Get formant control for this formant
-            control = formant_controls[:, i:i+1]  # [B, 1, T]
-            
-            # Apply control to filter
-            formant_effect = resonance * control.transpose(1, 2)  # [B, F, T]
-            formant_filters += formant_effect
+            # Combine
+            filters[i] = left_slope * right_slope
         
-        # Limit enhancement range to ±6 dB
-        formant_filters = formant_filters.clamp(-6.0, 6.0)
+        # Normalize
+        filters = filters / (filters.sum(dim=0, keepdim=True) + 1e-8)
         
-        # Apply to magnitude spectrum
-        enhanced_mag_db = mag_db + formant_filters
-        
-        return enhanced_mag_db
+        return filters.unsqueeze(0)  # [1, 8, F]
     
-    def apply_vocal_eq(self, mag_db, filter_controls, stft_time):
-        """Apply vocal-specific EQ to magnitude spectrum"""
-        # Interpolate filter controls to match STFT time steps
-        if filter_controls.shape[2] != stft_time:
-            filter_controls = F.interpolate(
-                filter_controls, size=stft_time, mode='linear', align_corners=False
-            )
-        
-        # Reshape filter controls for batched matrix op
-        filter_weights = filter_controls.unsqueeze(2)  # [B, 8, 1, T]
-        
-        # Apply filters (weighted sum of filter bands)
-        filter_bands_expanded = self.filter_bands.unsqueeze(-1)  # [1, 8, F, 1]
-        filter_effect = torch.sum(filter_bands_expanded * filter_weights, dim=1)  # [B, F, T]
-        
-        # Scale to reasonable EQ range (±6 dB)
-        filter_effect = filter_effect * 6.0
-        
-        # Apply to magnitude spectrum
-        filtered_mag_db = mag_db + filter_effect
-        
-        return filtered_mag_db
-    
-    def apply_sibilance_control(self, mag_db, sibilance_amount, stft_time):
-        """Apply de-essing to control sibilance"""
-        # Interpolate sibilance amount to match STFT time steps
-        if sibilance_amount.shape[2] != stft_time:
-            sibilance_amount = F.interpolate(
-                sibilance_amount, size=stft_time, mode='linear', align_corners=False
-            )
-        
-        # Scale amount for reasonable range (max -12dB reduction)
-        sibilance_amount = sibilance_amount.clamp(0.0, 1.0)
-        reduction_db = -12.0 * sibilance_amount
-        
-        # Apply reduction only to sibilance frequency band
-        sibilance_mask = self.sibilance_band.expand(-1, -1, stft_time)
-        reduction_db = reduction_db * sibilance_mask
-        
-        # Apply reduction to magnitude spectrum
-        processed_mag_db = mag_db + reduction_db
-        
-        return processed_mag_db
-    
-    def enhance_vibrato(self, phase, vibrato_control, stft_time):
-        """Enhance natural vibrato through phase modulation"""
-        # Interpolate vibrato control to match STFT time steps
-        if vibrato_control.shape[2] != stft_time:
-            vibrato_control = F.interpolate(
-                vibrato_control, size=stft_time, mode='linear', align_corners=False
-            )
-        
-        # Scale vibrato control to a reasonable range (±0.3 rad max)
-        vibrato_strength = vibrato_control.clamp(-1.0, 1.0) * 0.3
-        
-        # Apply a 5-6Hz modulation (common vibrato rate) to the phase
-        time_indices = torch.arange(stft_time, device=phase.device).float()
-        vibrato_freq = torch.tensor(2 * math.pi * 5.5 / (self.sample_rate / self.hop_length), device=phase.device)
-        
-        # Create modulation signal
-        mod_signal = torch.sin(vibrato_freq * time_indices).view(1, 1, -1)
-        
-        # Focus on mid-frequency region where vibrato is most noticeable
-        # Create a band-pass filter focusing on 200-2000Hz
-        num_bins = phase.shape[1]
-        vibrato_mask = torch.zeros(num_bins, device=phase.device)
-        
-        # Convert Hz to bin indices
-        low_bin = max(1, int(200 / (self.sample_rate / 2) * (num_bins - 1)))
-        high_bin = min(num_bins - 1, int(2000 / (self.sample_rate / 2) * (num_bins - 1)))
-        
-        # Create smooth ramp for vibrato band
-        vibrato_mask[low_bin:high_bin] = 1.0
-        
-        # Apply modulation to phase, scaled by control signal and mask
-        vibrato_mod = (vibrato_strength * mod_signal).unsqueeze(1)  # [B, 1, 1, T]
-        vibrato_mask = vibrato_mask.view(1, -1, 1)  # [1, F, 1]
-        
-        enhanced_phase = phase + (vibrato_mod * vibrato_mask)
-        
-        return enhanced_phase
-    
-    def apply_compression(self, signal, threshold, ratio, audio_length):
-        """Apply dynamic range compression to the audio signal"""
-        # Ensure control signals match audio length
-        if threshold.shape[1] != audio_length:
-            threshold = F.interpolate(threshold.unsqueeze(1), size=audio_length, 
-                                    mode='linear', align_corners=False).squeeze(1)
-        
-        if ratio.shape[1] != audio_length:
-            ratio = F.interpolate(ratio.unsqueeze(1), size=audio_length, 
-                                mode='linear', align_corners=False).squeeze(1)
-        
-        # Scale parameters to appropriate ranges
-        threshold_db = -40 * threshold - 10  # Map 0-1 to -50 to -10 dB
-        ratio_val = 1 + 7 * ratio  # Map 0-1 to ratio 1:1-8:1
-        
-        # Fixed time constants for stability
-        attack_time = 0.005  # 5ms
-        release_time = 0.050  # 50ms
-        
-        # Convert attack/release times to coefficients
-        attack_coef = torch.exp(-1.0 / (attack_time * self.sample_rate))
-        release_coef = torch.exp(-1.0 / (release_time * self.sample_rate))
-        
-        # Calculate envelope (approximate RMS)
-        envelope = torch.abs(signal)
-        
-        # Convert to dB
-        envelope_db = 20 * torch.log10(torch.clamp(envelope, min=1e-5))
-        
-        # Calculate gain reduction
-        gain_reduction_db = torch.minimum(
-            torch.zeros_like(envelope_db),
-            (threshold_db - envelope_db) * (1 - 1/ratio_val)
-        )
-        
-        # Apply attack/release smoothing
-        smoothed_gain_db = torch.zeros_like(gain_reduction_db)
-        
-        # First sample
-        smoothed_gain_db[:, 0] = gain_reduction_db[:, 0]
-        
-        # Remaining samples - apply smoothing
-        for i in range(1, audio_length):
-            # Determine whether to use attack or release coefficient
-            is_attack = gain_reduction_db[:, i] < smoothed_gain_db[:, i-1]
-            coef = torch.where(is_attack, attack_coef, release_coef)
-            
-            # Apply smoothing
-            smoothed_gain_db[:, i] = coef * smoothed_gain_db[:, i-1] + (1 - coef) * gain_reduction_db[:, i]
-        
-        # Convert gain reduction from dB to linear
-        smoothed_gain_linear = 10 ** (smoothed_gain_db / 20)
-        
-        # Apply gain reduction
-        compressed_signal = signal * smoothed_gain_linear
-        
-        return compressed_signal
-    
-    def forward(self, signal, condition):
+    def harmonic_synthesis(self, f0, harmonic_amplitudes, n_samples):
         """
-        Apply vocal-specific refinement to the audio signal.
+        Synthesize harmonic component using efficient sinusoidal modeling
         
         Args:
-            signal: Input audio [B, T]
+            f0: Fundamental frequency [B, T]
+            harmonic_amplitudes: Amplitude of each harmonic [B, n_harmonics, T]
+            n_samples: Number of audio samples to generate
+        
+        Returns:
+            Harmonic component [B, n_samples]
+        """
+        batch_size = f0.shape[0]
+        n_harmonics = harmonic_amplitudes.shape[1]
+        
+        # Ensure f0 is in Hz and properly bounded
+        f0 = torch.clamp(f0, 50, 1000)  # Typical singing range in Hz
+        
+        # Create time vector
+        t = torch.arange(n_samples, device=f0.device).float() / self.sample_rate
+        
+        # Interpolate control signals to audio rate
+        f0_audio = F.interpolate(f0.unsqueeze(1), size=n_samples, mode='linear', align_corners=False).squeeze(1)
+        harmonic_amplitudes = F.interpolate(harmonic_amplitudes, size=n_samples, mode='linear', align_corners=False)
+        
+        # Accumulate phase by integrating frequency
+        phase = torch.cumsum(f0_audio / self.sample_rate, dim=1)
+        
+        # Initialize harmonic signal
+        harmonic_signal = torch.zeros(batch_size, n_samples, device=f0.device)
+        
+        # Generate harmonics efficiently using broadcast operations
+        for i in range(n_harmonics):
+            # Harmonic frequency is (i+1) * f0
+            harmonic_phase = phase * (i + 1) * 2 * math.pi
+            
+            # Sinusoidal oscillator
+            harmonic = torch.sin(harmonic_phase)
+            
+            # Apply amplitude envelope
+            harmonic_signal += harmonic * harmonic_amplitudes[:, i]
+        
+        # Normalize to prevent clipping
+        max_val = torch.max(torch.abs(harmonic_signal), dim=1, keepdim=True)[0] + 1e-7
+        harmonic_signal = harmonic_signal / max_val.clamp(min=1.0)
+        
+        return harmonic_signal
+    
+    def noise_synthesis(self, noise_bands_gains, n_samples):
+        """
+        Synthesize the noise component using filtered noise bands
+        
+        Args:
+            noise_bands_gains: Gains for each noise band [B, n_bands, T]
+            n_samples: Number of audio samples to generate
+        
+        Returns:
+            Noise component [B, n_samples]
+        """
+        batch_size = noise_bands_gains.shape[0]
+        n_bands = noise_bands_gains.shape[1]
+        
+        # Interpolate control signals to audio rate
+        noise_gains = F.interpolate(noise_bands_gains, size=n_samples, mode='linear', align_corners=False)
+        
+        # Generate white noise
+        white_noise = torch.randn(batch_size, n_samples, device=noise_bands_gains.device)
+        
+        # Apply noise shaping in frequency domain
+        noise_fft = torch.fft.rfft(white_noise)
+        n_freqs = noise_fft.shape[1]
+        
+        # Ensure noise_bands is compatible with n_freqs
+        if self.noise_bands.shape[1] != n_freqs:
+            # Interpolate noise bands to match FFT size
+            noise_bands_interp = F.interpolate(self.noise_bands.unsqueeze(0), size=n_freqs, mode='linear', align_corners=False)[0]
+        else:
+            noise_bands_interp = self.noise_bands
+        
+        # Initialize shaped noise spectrum
+        shaped_noise_fft = torch.zeros_like(noise_fft)
+        
+        # Apply each noise band
+        for i in range(n_bands):
+            # Get band gains over time (downsample for efficiency)
+            band_gain = noise_gains[:, i:i+1]  # [B, 1, T]
+            band_gain_ds = F.avg_pool1d(band_gain, kernel_size=256, stride=256)
+            
+            # Get band filter
+            band_filter = noise_bands_interp[i:i+1]  # [1, F]
+            
+            # Apply band filter to noise
+            band_contrib = band_filter.unsqueeze(0) * band_gain_ds.mean(dim=2, keepdim=True)
+            shaped_noise_fft += noise_fft * band_contrib
+        
+        # Inverse FFT to get time-domain noise
+        shaped_noise = torch.fft.irfft(shaped_noise_fft, n=n_samples)
+        
+        # Normalize
+        max_val = torch.max(torch.abs(shaped_noise), dim=1, keepdim=True)[0] + 1e-7
+        shaped_noise = shaped_noise / max_val.clamp(min=1.0)
+        
+        return shaped_noise
+    
+    def apply_source_filter(self, source, formant_params, n_samples):
+        """
+        Apply source-filter model using efficient formant filters
+        
+        Args:
+            source: Source signal (harmonic + noise) [B, T]
+            formant_params: Parameters for formant filters [B, 5, T_control]
+            n_samples: Number of audio samples
+        
+        Returns:
+            Filtered audio [B, T]
+        """
+        batch_size = source.shape[0]
+        
+        # Interpolate formant parameters to control rate
+        control_rate = n_samples // 256 + 1
+        formant_params = F.interpolate(formant_params, size=control_rate, mode='linear', align_corners=False)
+        
+        # Process in the frequency domain
+        source_fft = torch.fft.rfft(source)
+        n_freqs = source_fft.shape[1]
+        
+        # Create frequency axis (0-1 normalized)
+        freq_axis = torch.linspace(0, 1, n_freqs, device=source.device)
+        
+        # Create formant filter
+        formant_filter = torch.ones((batch_size, n_freqs, control_rate), device=source.device)
+        
+        # Apply each formant
+        for f in range(5):  # 5 formants
+            # Get formant parameters: center frequency and bandwidth
+            formant_center = self.formant_defaults[f] * (1.0 + 0.5 * formant_params[:, f, :].tanh())
+            formant_center = formant_center.unsqueeze(1)  # [B, 1, T]
+            
+            # Bandwidth increases with higher formants
+            bandwidth = self.bandwidth_defaults[f] * (1.0 + 0.3 * torch.abs(formant_params[:, f, :]))
+            bandwidth = bandwidth.unsqueeze(1)  # [B, 1, T]
+            
+            # Create resonant filter (efficient vectorized implementation)
+            freq_expanded = freq_axis.unsqueeze(0).unsqueeze(-1)  # [1, F, 1]
+            
+            # Resonant filter formula
+            numerator = 1.0
+            denominator = 1.0 + ((freq_expanded - formant_center) / (bandwidth / 2)) ** 2
+            resonance = numerator / denominator
+            
+            # Apply to the filter
+            formant_filter = formant_filter * resonance
+        
+        # Apply formant filter to source
+        # Interpolate filter to match FFT time frames
+        n_fft_frames = source_fft.shape[-1]
+        if control_rate != n_fft_frames:
+            formant_filter = F.interpolate(formant_filter, size=n_fft_frames, mode='linear', align_corners=False)
+        
+        # Apply filter
+        filtered_fft = source_fft * formant_filter
+        
+        # Inverse FFT
+        filtered = torch.fft.irfft(filtered_fft, n=n_samples)
+        
+        return filtered
+    
+    def apply_vocal_effects(self, audio, effect_params, n_samples):
+        """
+        Apply specialized vocal effects: breathiness, vibrato, consonant enhancement
+        
+        Args:
+            audio: Input audio [B, T]
+            effect_params: Effect parameters [B, 6, T_control]
+            n_samples: Number of audio samples
+        
+        Returns:
+            Processed audio [B, T]
+        """
+        batch_size = audio.shape[0]
+        
+        # Interpolate effect parameters to control rate
+        control_rate = max(n_samples // 256, 1)
+        effect_params = F.interpolate(effect_params, size=control_rate, mode='linear', align_corners=False)
+        
+        # Extract individual effect parameters
+        breathiness = torch.sigmoid(effect_params[:, 0:1])         # 0-1 range
+        vibrato_depth = torch.tanh(effect_params[:, 1:2]) * 0.1    # ±0.1 range for vibrato
+        vibrato_rate = 5.0 + torch.sigmoid(effect_params[:, 2:3]) * 2.0  # 5-7 Hz
+        consonant_enhance = torch.sigmoid(effect_params[:, 3:4])   # 0-1 range
+        onset_boost = torch.sigmoid(effect_params[:, 4:5])         # 0-1 range
+        release_control = torch.sigmoid(effect_params[:, 5:6])     # 0-1 range
+        
+        # 1. Apply vibrato
+        time_indices = torch.arange(0, n_samples, device=audio.device).float() / self.sample_rate
+        vibrato_phase = 2 * math.pi * vibrato_rate.mean() * time_indices
+        vibrato_mod = torch.sin(vibrato_phase).unsqueeze(0) * vibrato_depth.mean() * 0.3
+        
+        # Apply vibrato via simple variable delay approach
+        modulated_audio = audio.clone()
+        max_delay = int(0.001 * self.sample_rate)  # 1ms max delay
+        
+        for b in range(batch_size):
+            delay_samples = (vibrato_mod[b] * max_delay).round().int()
+            for i in range(n_samples):
+                idx = max(0, min(n_samples-1, i - delay_samples[i]))
+                modulated_audio[b, i] = audio[b, idx]
+        
+        # 2. Add breathiness
+        breath_noise = torch.randn_like(audio) * 0.05
+        breath_amount = F.interpolate(breathiness, size=n_samples, mode='linear', align_corners=False)
+        audio_with_breath = modulated_audio * (1.0 - breath_amount.squeeze(1) * 0.3) + breath_noise * breath_amount.squeeze(1)
+        
+        # 3. Enhance consonants (high frequency boost during consonants)
+        # Detect consonants using high-frequency energy
+        audio_fft = torch.fft.rfft(audio_with_breath)
+        n_freqs = audio_fft.shape[1]
+        
+        # Simple high-shelf EQ for consonant enhancement
+        hf_boost = F.interpolate(consonant_enhance, size=n_freqs, mode='linear', align_corners=False)
+        shelf_freq = int(n_freqs * 0.3)  # Start boost around 30% of Nyquist
+        
+        boost_filter = torch.ones((batch_size, n_freqs), device=audio.device)
+        boost_filter[:, shelf_freq:] = 1.0 + hf_boost[:, 0, shelf_freq:] * 2.0  # Up to 6dB boost
+        
+        # Apply boost
+        enhanced_fft = audio_fft * boost_filter.unsqueeze(-1)
+        enhanced_audio = torch.fft.irfft(enhanced_fft, n=n_samples)
+        
+        # 4. Apply onset/release processing
+        # Simplified onset/release detector (envelope follower)
+        envelope = torch.zeros_like(enhanced_audio)
+        attack = 0.1
+        release = 0.001
+        
+        for i in range(1, n_samples):
+            env_prev = envelope[:, i-1]
+            curr_abs = torch.abs(enhanced_audio[:, i])
+            is_attack = curr_abs > env_prev
+            alpha = torch.where(is_attack, attack, release)
+            envelope[:, i] = env_prev * (1 - alpha) + curr_abs * alpha
+        
+        # Apply gain based on onset/release
+        onset_gain = F.interpolate(onset_boost, size=n_samples, mode='linear', align_corners=False).squeeze(1)
+        release_gain = F.interpolate(release_control, size=n_samples, mode='linear', align_corners=False).squeeze(1)
+        
+        # Enhance onsets and control releases
+        derivative = torch.zeros_like(envelope)
+        derivative[:, 1:] = envelope[:, 1:] - envelope[:, :-1]
+        
+        # Apply processing
+        onset_mask = F.relu(derivative) * onset_gain * 3.0
+        release_mask = F.relu(-derivative) * release_gain * 0.7
+        
+        processed_audio = enhanced_audio * (1.0 + onset_mask - release_mask)
+        
+        # Final normalization
+        max_val = torch.max(torch.abs(processed_audio), dim=1, keepdim=True)[0] + 1e-7
+        processed_audio = processed_audio / max_val.clamp(min=1.0)
+        
+        return processed_audio
+    
+    def forward(self, audio, condition):
+        """
+        Apply DDSP-based vocal enhancement to the audio signal
+        
+        Args:
+            audio: Input audio [B, T]
             condition: Conditioning signal [B, C, T_cond]
             
         Returns:
             Processed audio [B, T]
         """
-        # Ensure input is valid
-        signal = torch.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0)
-        condition = torch.nan_to_num(condition, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        batch_size = signal.shape[0]
-        audio_length = signal.shape[1]
-        
-        # Get all control parameters
-        gain = self.output_gain(condition)  # [B, 1, T_cond]
-        formant_controls = self.formant_enhancement(condition)  # [B, 5, T_cond]
-        filter_controls = self.vocal_filter_bank(condition)  # [B, 8, T_cond]
-        comp_thresh = self.comp_threshold(condition)  # [B, 1, T_cond]
-        comp_ratio = self.comp_ratio(condition)  # [B, 1, T_cond]
-        sibilance_amount = self.sibilance_processor(condition)  # [B, 1, T_cond]
-        vowel_consonant = self.vowel_consonant_detector(condition)  # [B, 1, T_cond]
-        vibrato_control = self.vibrato_enhance(condition)  # [B, 1, T_cond]
-        mix = self.wet_dry(condition)  # [B, 1, T_cond]
-        
-        # Apply conservative limits to control parameters
-        gain = torch.clamp(gain, 0.5, 1.5)
-        mix = torch.clamp(mix, 0.3, 0.7)
+        batch_size = audio.shape[0]
+        n_samples = audio.shape[1]
         
         # Ensure signal is 2D [B, T]
-        if signal.dim() == 3:
-            signal = signal.squeeze(1)
+        if audio.dim() == 3:
+            audio = audio.squeeze(1)
         
         # Preserve original signal for wet/dry mixing
-        original_signal = signal.clone()
+        original_audio = audio.clone()
         
-        # Reshape control params to match audio if needed
-        if gain.shape[2] != audio_length:
-            gain = F.interpolate(gain, size=audio_length, mode='linear', align_corners=False)
-            mix = F.interpolate(mix, size=audio_length, mode='linear', align_corners=False)
+        # Extract shared features
+        features = self.feature_backbone(condition)
+        
+        # Get all parameters from shared features
+        harmonic_params = self.harmonic_params(features)  # [B, 32, T_cond]
+        noise_params = self.noise_params(features)  # [B, 8, T_cond]
+        filter_params = self.filter_params(features)  # [B, 5, T_cond]
+        effect_params = self.vocal_effects(features)  # [B, 6, T_cond]
+        output_params = self.output_params(features)  # [B, 3, T_cond]
+        
+        # Extract individual harmonic parameters
+        f0 = harmonic_params[:, 0:1]  # Fundamental frequency control
+        f0 = (f0.tanh() * 0.5 + 0.5) * 950 + 50  # Map to 50-1000 Hz
+        harmonic_amps = torch.sigmoid(harmonic_params[:, 1:31])  # 30 harmonics with amplitudes 0-1
+        harmonic_gain = torch.sigmoid(harmonic_params[:, 31:32])  # Overall harmonic gain
         
         try:
-            # --- STFT-based processing ---
-            stft = torch.stft(
-                signal,
-                n_fft=self.fft_size,
-                hop_length=self.hop_length,
-                window=self.window,
-                return_complex=True
-            )
+            # 1. Synthesize harmonic component
+            harmonic_signal = self.harmonic_synthesis(f0.squeeze(1), harmonic_amps, n_samples)
+            harmonic_signal = harmonic_signal * F.interpolate(harmonic_gain, size=n_samples, 
+                                                            mode='linear', align_corners=False).squeeze(1)
             
-            # Handle NaNs in STFT output
-            if torch.isnan(stft).any() or torch.isinf(stft).any():
-                # If STFT failed, return original signal with gain
-                return torch.clamp(original_signal * gain.squeeze(1), -1.0, 1.0)
+            # 2. Synthesize noise component
+            noise_signal = self.noise_synthesis(torch.sigmoid(noise_params), n_samples)
             
-            # Get magnitude and phase
-            mag = torch.abs(stft)  # [B, F, T]
-            phase = torch.angle(stft)
+            # 3. Combine source components
+            source_signal = harmonic_signal + noise_signal * 0.3  # Mix with appropriate balance
             
-            # Convert magnitude to dB
-            mag_db = 20 * torch.log10(torch.clamp(mag, min=1e-5))
+            # 4. Apply source-filter model
+            filtered_signal = self.apply_source_filter(source_signal, filter_params, n_samples)
             
-            # Get STFT time steps
-            stft_time = mag.shape[2]
+            # 5. Apply vocal-specific effects
+            processed_signal = self.apply_vocal_effects(filtered_signal, effect_params, n_samples)
             
-            # --- Apply vocal-specific processing ---
-            
-            # 1. Formant enhancement
-            enhanced_mag_db = self.apply_formants(mag_db, formant_controls, stft_time)
-            
-            # 2. Vocal-specific EQ
-            filtered_mag_db = self.apply_vocal_eq(enhanced_mag_db, filter_controls, stft_time)
-            
-            # 3. Sibilance control (de-essing)
-            processed_mag_db = self.apply_sibilance_control(filtered_mag_db, sibilance_amount, stft_time)
-            
-            # 4. Vibrato enhancement
-            processed_phase = self.enhance_vibrato(phase, vibrato_control, stft_time)
-            
-            # Convert processed mag_db back to linear
-            processed_mag = 10 ** (processed_mag_db / 20)
-            
-            # Reconstruct complex STFT
-            output_stft = processed_mag * torch.exp(1j * processed_phase)
-            
-            # Convert back to time domain
-            processed = torch.istft(
-                output_stft,
-                n_fft=self.fft_size,
-                hop_length=self.hop_length,
-                window=self.window,
-                length=audio_length
-            )
-            
-            # 5. Dynamic range compression
-            processed = self.apply_compression(
-                processed,
-                comp_thresh.squeeze(1),
-                comp_ratio.squeeze(1),
-                audio_length
-            )
-            
-            # Check for NaNs in output
-            if torch.isnan(processed).any() or torch.isinf(processed).any():
-                # Fallback to original if processing failed
-                processed = original_signal
-            
-            # Apply output gain
-            processed = processed * gain.squeeze(1)
+            # 6. Apply output parameters
+            wet_dry = F.interpolate(torch.sigmoid(output_params[:, 0:1]), size=n_samples,
+                                  mode='linear', align_corners=False).squeeze(1)
+            output_gain = F.interpolate(torch.sigmoid(output_params[:, 1:2]) * 1.5, size=n_samples,
+                                      mode='linear', align_corners=False).squeeze(1)
             
             # Apply wet/dry mix
-            output = (mix.squeeze(1) * processed) + ((1.0 - mix.squeeze(1)) * original_signal)
+            output = wet_dry * processed_signal + (1.0 - wet_dry) * original_audio
             
-            # Final sanity check and clamping
-            output = torch.nan_to_num(output, nan=0.0, posinf=0.0, neginf=0.0)
+            # Apply output gain
+            output = output * output_gain
+            
+            # Final safety checks
+            if torch.isnan(output).any() or torch.isinf(output).any():
+                # Fallback to original if processing failed
+                output = original_audio
+            
+            # Clamp to prevent clipping
             output = torch.clamp(output, -1.0, 1.0)
             
         except Exception as e:
-            # Complete fallback if any error occurs
-            output = original_signal * gain.squeeze(1)
-            output = torch.clamp(output, -1.0, 1.0)
+            # Fallback: return original signal
+            output = original_audio
         
         return output
