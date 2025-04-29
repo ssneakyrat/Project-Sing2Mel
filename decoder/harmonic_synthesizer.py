@@ -9,13 +9,14 @@ from decoder.harmonic_processor import HarmonicProcessor
 from decoder.noise_processor import NoiseProcessor
 from decoder.phase_coherence_processor import PhaseCoherenceProcessor
 from decoder.refiner_network import RefinerNetwork    
+from decoder.effects_network import EffectsNetwork
 
 class HarmonicSynthesizer(nn.Module):
     """
     Enhanced DDSP-based Harmonic Synthesizer with improved spectral shaping
     for human vocal clarity, optimized to minimize upsampling operations.
     Includes noise component for modeling breathy and noisy vocal characteristics.
-    Now with enhanced phase coherence for more natural vocal synthesis.
+    Phase reset mechanism has been removed to prevent broken phoneme transitions.
     """
     def __init__(self, sample_rate=24000, hop_length=240, num_harmonics=100, input_channels=128, noise_mix_ratio=0.2):
         super(HarmonicSynthesizer, self).__init__()
@@ -39,7 +40,7 @@ class HarmonicSynthesizer(nn.Module):
         # Initialize the noise processor
         self.noise_processor = NoiseProcessor(input_channels=input_channels)
         
-        # Initialize the phase coherence processor (NEW)
+        # Initialize the phase coherence processor (modified version without resets)
         self.phase_processor = PhaseCoherenceProcessor(num_harmonics=num_harmonics, input_channels=input_channels)
 
         # Adaptive noise mixer network - learns when to apply more/less noise
@@ -55,6 +56,11 @@ class HarmonicSynthesizer(nn.Module):
             sample_rate=sample_rate
         )
         
+        self.effects_network = EffectsNetwork(
+            input_channels=self.input_channels,
+            sample_rate=sample_rate
+        )
+
         # Register additional buffers for efficient computation
         self.register_buffer('hop_length_tensor', torch.tensor(hop_length, dtype=torch.float))
         self.register_buffer('default_noise_ratio', torch.tensor(noise_mix_ratio, dtype=torch.float))
@@ -75,7 +81,7 @@ class HarmonicSynthesizer(nn.Module):
         # Apply spectral processing
         enhanced_amplitudes = self.spectral_processor(condition, formant_amplitudes)
         
-        # Get formant information for enhanced phase processing (NEW)
+        # Get formant information for enhanced phase processing
         # This assumes formant_processor exposes formant parameters
         formant_centers = None
         formant_bandwidths = None
@@ -103,30 +109,23 @@ class HarmonicSynthesizer(nn.Module):
         # 2. Compute cumulative phase (integrate frequency)
         phase = torch.cumsum(phase_increments, dim=2)  # [B, 1, audio_length]
         
-        # 3. Apply phase coherence processing (NEW)
-        phase_offsets, reset_points, reset_patterns = self.phase_processor(
+        # 3. Get phase offsets from the modified phase processor
+        # Note: The phase processor now only returns phase_offsets (no reset points)
+        phase_offsets = self.phase_processor(
             condition, f0_expanded, formant_centers, formant_bandwidths
         )
         
         # Upsample phase modifications
         phase_offsets_upsampled = self._efficient_upsample(phase_offsets, audio_length)
-        reset_points_upsampled = self._efficient_upsample(reset_points, audio_length)
-        reset_patterns_upsampled = self._efficient_upsample(reset_patterns, audio_length)
         
-        # 4. Generate all harmonics at once with enhanced phase coherence
+        # 4. Generate all harmonics at once with smooth phase coherence
         base_harmonic_phases = phase * self.harmonic_indices  # [B, num_harmonics, audio_length]
         
-        # Apply phase offsets to base phases
-        modified_harmonic_phases = base_harmonic_phases + phase_offsets_upsampled
+        # Apply phase offsets to base phases for the final harmonic phases
+        # No more reset mechanism - just smooth phase relationships
+        final_harmonic_phases = base_harmonic_phases + phase_offsets_upsampled
         
-        # Apply phase resets at appropriate points
-        final_harmonic_phases = self.phase_processor.apply_phase_resets(
-            modified_harmonic_phases, 
-            reset_points_upsampled, 
-            reset_patterns_upsampled
-        )
-        
-        # Generate harmonic signals with enhanced phase coherence
+        # Generate harmonic signals with smooth phase coherence
         harmonic_signals = torch.sin(final_harmonic_phases)  # [B, num_harmonics, audio_length]
         
         # 5. Apply enhanced amplitudes to harmonic signals
@@ -152,10 +151,10 @@ class HarmonicSynthesizer(nn.Module):
         harmonic_weight = 1.0 - final_mix_ratio
         output_signal = harmonic_weight * harmonic_signal + final_mix_ratio * noise_signal
 
-        refined_signal = self.refiner_network(output_signal.squeeze(1), condition)
+        effects_signal = self.refiner_network(output_signal.squeeze(1), condition)
+        refined_signal = self.refiner_network(effects_signal, condition)
             
         return refined_signal  # [B, audio_length]
-        #return output_signal.squeeze(1)  # [B, audio_length]
         
     def _efficient_upsample(self, tensor, target_len):
         """More efficient upsampling with reduced memory footprint"""
