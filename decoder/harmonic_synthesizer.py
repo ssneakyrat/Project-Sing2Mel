@@ -7,12 +7,14 @@ from decoder.formant_processor import FormantProcessor
 from decoder.spectral_processor import SpectralProcessor
 from decoder.harmonic_processor import HarmonicProcessor
 from decoder.noise_processor import NoiseProcessor
+from decoder.phase_coherence_processor import PhaseCoherenceProcessor
     
 class HarmonicSynthesizer(nn.Module):
     """
     Enhanced DDSP-based Harmonic Synthesizer with improved spectral shaping
     for human vocal clarity, optimized to minimize upsampling operations.
     Includes noise component for modeling breathy and noisy vocal characteristics.
+    Now with enhanced phase coherence for more natural vocal synthesis.
     """
     def __init__(self, sample_rate=24000, hop_length=240, num_harmonics=100, input_channels=128, noise_mix_ratio=0.3):
         super(HarmonicSynthesizer, self).__init__()
@@ -35,6 +37,9 @@ class HarmonicSynthesizer(nn.Module):
         
         # Initialize the noise processor
         self.noise_processor = NoiseProcessor(input_channels=input_channels)
+        
+        # Initialize the phase coherence processor (NEW)
+        self.phase_processor = PhaseCoherenceProcessor(num_harmonics=num_harmonics, input_channels=input_channels)
 
         # Adaptive noise mixer network - learns when to apply more/less noise
         self.noise_mixer = nn.Sequential(
@@ -56,13 +61,20 @@ class HarmonicSynthesizer(nn.Module):
         audio_length = (time_steps * self.hop_length_tensor).long()
 
         # Generate base harmonic amplitudes from conditioning
-        harmonic_amplitudes = self.harmonic_processor(condition)  # [B, num_harmonics, T]
+        harmonic_amplitudes = self.harmonic_processor(condition, f0)  # [B, num_harmonics, T]
         
         # Apply formant processing
         formant_amplitudes = self.formant_processor(condition, harmonic_amplitudes, self.num_harmonics)
         
         # Apply spectral processing
         enhanced_amplitudes = self.spectral_processor(condition, formant_amplitudes)
+        
+        # Get formant information for enhanced phase processing (NEW)
+        # This assumes formant_processor exposes formant parameters
+        formant_centers = None
+        formant_bandwidths = None
+        if hasattr(self.formant_processor, 'get_formant_params'):
+            formant_centers, formant_bandwidths, _ = self.formant_processor.get_formant_params(condition)
         
         # ===== ONLY UPSAMPLE ESSENTIAL SIGNALS =====
         
@@ -85,14 +97,36 @@ class HarmonicSynthesizer(nn.Module):
         # 2. Compute cumulative phase (integrate frequency)
         phase = torch.cumsum(phase_increments, dim=2)  # [B, 1, audio_length]
         
-        # 3. Generate all harmonics at once
-        harmonic_phases = phase * self.harmonic_indices  # [B, num_harmonics, audio_length]
-        harmonic_signals = torch.sin(harmonic_phases)  # [B, num_harmonics, audio_length]
+        # 3. Apply phase coherence processing (NEW)
+        phase_offsets, reset_points, reset_patterns = self.phase_processor(
+            condition, f0_expanded, formant_centers, formant_bandwidths
+        )
         
-        # 4. Apply enhanced amplitudes to harmonic signals
+        # Upsample phase modifications
+        phase_offsets_upsampled = self._efficient_upsample(phase_offsets, audio_length)
+        reset_points_upsampled = self._efficient_upsample(reset_points, audio_length)
+        reset_patterns_upsampled = self._efficient_upsample(reset_patterns, audio_length)
+        
+        # 4. Generate all harmonics at once with enhanced phase coherence
+        base_harmonic_phases = phase * self.harmonic_indices  # [B, num_harmonics, audio_length]
+        
+        # Apply phase offsets to base phases
+        modified_harmonic_phases = base_harmonic_phases + phase_offsets_upsampled
+        
+        # Apply phase resets at appropriate points
+        final_harmonic_phases = self.phase_processor.apply_phase_resets(
+            modified_harmonic_phases, 
+            reset_points_upsampled, 
+            reset_patterns_upsampled
+        )
+        
+        # Generate harmonic signals with enhanced phase coherence
+        harmonic_signals = torch.sin(final_harmonic_phases)  # [B, num_harmonics, audio_length]
+        
+        # 5. Apply enhanced amplitudes to harmonic signals
         weighted_harmonics = harmonic_signals * enhanced_amplitudes_upsampled  # [B, num_harmonics, audio_length]
         
-        # 5. Sum all harmonics
+        # 6. Sum all harmonics
         harmonic_signal = torch.sum(weighted_harmonics, dim=1, keepdim=True)  # [B, 1, audio_length]
         
         # ===== NOISE GENERATION AND MIXING =====

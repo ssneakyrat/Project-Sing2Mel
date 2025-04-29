@@ -123,3 +123,40 @@ class FormantProcessor(nn.Module):
         
         # Apply the combined formant scaling to harmonic amplitudes
         return harmonic_amplitudes * formant_scaling
+    
+    def get_formant_params(self, condition):
+        """
+        Extract formant parameters for external use by other processors.
+        
+        Args:
+            condition: Conditioning features [B, input_channels, T]
+            
+        Returns:
+            formant_centers: Formant center frequencies [B, T, num_formants]
+            formant_bandwidths: Formant bandwidths [B, T, num_formants]
+            formant_amplitudes: Formant amplitudes [B, T, num_formants]
+        """
+        batch_size, _, time_steps = condition.shape
+        
+        # Generate formant parameters: [B, num_formants*3, T]
+        formant_params = self.formant_param_net(condition)
+        
+        # Split formant parameters into center frequencies, bandwidths, and amplitudes
+        # Reshape to [B, num_formants, 3, T] then split on dim 2
+        formant_params = formant_params.view(batch_size, self.num_formants, 3, time_steps)
+        
+        # Get center frequencies (Hz) - constrain to reasonable vocal range (80Hz - 11000Hz)
+        formant_centers = 80 + 11000 * torch.sigmoid(formant_params[:, :, 0, :])  # [B, num_formants, T]
+
+        # Get bandwidths (Hz) - constrain to reasonable range (50Hz - 1000Hz)
+        formant_bandwidths = 50 + 950 * torch.sigmoid(formant_params[:, :, 1, :])  # [B, num_formants, T]
+
+        # Get formant amplitudes - using softplus for positive values with smooth gradient
+        formant_amplitudes = F.softplus(formant_params[:, :, 2, :])  # [B, num_formants, T]
+        
+        # Reshape to make it easier to work with
+        formant_centers = formant_centers.transpose(1, 2)      # [B, T, num_formants]
+        formant_bandwidths = formant_bandwidths.transpose(1, 2)  # [B, T, num_formants]
+        formant_amplitudes = formant_amplitudes.transpose(1, 2)  # [B, T, num_formants]
+        
+        return formant_centers, formant_bandwidths, formant_amplitudes
