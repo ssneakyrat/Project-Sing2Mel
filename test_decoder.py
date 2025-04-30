@@ -315,8 +315,7 @@ def main():
         num_languages=num_languages,
         n_mels=N_MELS,
         hop_length=HOP_LENGTH,
-        sample_rate=SAMPLE_RATE,
-        num_harmonics=100
+        sample_rate=SAMPLE_RATE
     ).to(device)
     
     # Print model info
