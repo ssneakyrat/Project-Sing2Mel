@@ -7,7 +7,7 @@ class MelDecoder(nn.Module):
     """
     Lightweight DDSP-based singing voice synthesis model.
     Converts mel-spectrograms to audio guided by F0, phonemes, singer, and language.
-    Optimized for better performance with improved temporal modeling.
+    Optimized for better performance with improved source-filter vocal model.
     """
     def __init__(self, 
                  num_phonemes, 
@@ -56,166 +56,182 @@ class MelDecoder(nn.Module):
             nn.LeakyReLU(0.1),
         )
         
-        # IMPROVED: Replace GRU with bidirectional GRU for better temporal modeling
-        # Using same hidden size but bidirectional, so output is doubled
+        # Temporal modeling with CAUSAL convolutions instead of bidirectional GRU
         self.hidden_size = 64
-        self.gru = nn.GRU(
-            96, 
-            self.hidden_size, 
-            batch_first=False,
-            bidirectional=True
-        )
-        
-        # IMPROVED: Add a projection layer to combine bidirectional outputs
-        # This helps with information flow between directions
-        self.bi_projection = nn.Sequential(
-            nn.Conv1d(self.hidden_size * 2, self.hidden_size, kernel_size=1),
-            nn.LeakyReLU(0.1)
-        )
-        
-        # IMPROVED: Add temporal context integration
-        # This helps capture longer dependencies for smoother transitions
-        self.context_layer = nn.Sequential(
-            nn.Conv1d(self.hidden_size, self.hidden_size, kernel_size=5, padding=2, dilation=1),
+        self.temporal_conv = nn.Sequential(
+            nn.Conv1d(96, self.hidden_size, kernel_size=3, padding=1, dilation=1),
             nn.LeakyReLU(0.1),
-            nn.Conv1d(self.hidden_size, self.hidden_size, kernel_size=5, padding=4, dilation=2),
+            nn.Conv1d(self.hidden_size, self.hidden_size, kernel_size=3, padding=2, dilation=2),
             nn.LeakyReLU(0.1),
-            nn.Conv1d(self.hidden_size, self.hidden_size, kernel_size=1)
+            nn.Conv1d(self.hidden_size, self.hidden_size, kernel_size=3, padding=4, dilation=4),
+            nn.LeakyReLU(0.1),
+            nn.Conv1d(self.hidden_size, self.hidden_size, kernel_size=1),
         )
         
-        # Synthesis parameter generators - using updated hidden size
-        self.harmonic_amplitudes = nn.Sequential(
-            nn.Conv1d(self.hidden_size, self.num_harmonics, kernel_size=3, padding=1),
-            nn.Softplus(),
+        # Simplified glottal source model
+        self.glottal_pulse_params = nn.Conv1d(self.hidden_size, 3, kernel_size=3, padding=1)
+        
+        # Combined frequency domain processing parameters
+        self.unified_filter_params = nn.Sequential(
+            nn.Conv1d(self.hidden_size, 128, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1),
+            nn.Conv1d(128, n_fft//2+1, kernel_size=3, padding=1),
+            #nn.Softplus(),
         )
         
-        # Spectral filter for noise component
-        self.noise_filter = nn.Sequential(
-            nn.Conv1d(self.hidden_size, n_fft//2+1, kernel_size=3, padding=1),
-            nn.Softplus(),
+        # Component mixture balance
+        self.component_mix = nn.Sequential(
+            nn.Conv1d(self.hidden_size, 3, kernel_size=3, padding=1),
+            nn.Softmax(dim=1),
         )
         
-        # Mixing parameter (harmonic vs. noise balance)
-        self.harmonic_mix = nn.Sequential(
-            nn.Conv1d(self.hidden_size, 1, kernel_size=3, padding=1),
-            nn.Sigmoid(),  
-        )
+        # Precomputed values
+        self.register_buffer('window', torch.hann_window(self.n_fft))
+        self.register_buffer('formant_centers', torch.tensor([10, 20, 36, 56, 80], dtype=torch.float32))
+        self.register_buffer('freq_bins', torch.arange(0, self.n_fft//2+1, dtype=torch.float32))
         
-        # Initialize window for STFT
-        self.register_buffer(
-            'window', 
-            torch.hann_window(self.n_fft)
-        )
+        # Precomputed coefficients for glottal source
+        self.register_buffer('opening_factors', 
+                           torch.linspace(0, math.pi, steps=int(0.9 * self.hop_length)))
+        self.register_buffer('closing_factors', 
+                           1 - torch.linspace(0, 1, steps=int(0.1 * self.hop_length))**2)
     
-    def _harmonics_phase_corrected(self, f0):
+    def _generate_glottal_source(self, f0, glottal_params):
         """
-        Generate phase-corrected harmonics based on F0.
-        Ensures phase continuity across frames.
-        Optimized implementation with vectorized operations.
+        Simplified glottal source generation with optimized operations.
         
         Args:
             f0: Fundamental frequency trajectory [B, T]
-        
+            glottal_params: Simplified parameters [B, 3, T]
+            
         Returns:
-            Phase-corrected harmonic frequencies [B, num_harmonics, T*hop_length]
+            Glottal source waveform [B, T*hop_length]
         """
         batch_size, n_frames = f0.shape
         audio_length = n_frames * self.hop_length
         device = f0.device
         
-        # Convert f0 from Hz to angular frequency (radians per sample)
-        omega = 2 * math.pi * f0 / self.sample_rate  # [B, T]
+        # Convert f0 to phase increments
+        phase_increment = 2 * math.pi * f0 / self.sample_rate
         
-        # Pre-calculate harmonic indices (1, 2, 3, ..., num_harmonics)
-        harmonic_indices = torch.arange(1, self.num_harmonics + 1, device=device).float()
-        harmonic_indices = harmonic_indices.view(1, -1, 1)  # [1, num_harmonics, 1]
+        # Simplified glottal parameters
+        open_quotient = torch.sigmoid(glottal_params[:, 0]) * 0.5 + 0.25  # [B, T]
+        spectral_tilt = torch.sigmoid(glottal_params[:, 1]) * 0.5         # [B, T]
+        shimmer = torch.sigmoid(glottal_params[:, 2]) * 0.05              # [B, T]
         
-        # Upsample omega to sample-level - use standard interpolation
-        # This is simpler and still efficient
-        omega_upsampled = F.interpolate(
-            omega.unsqueeze(1), 
-            size=audio_length, 
-            mode='linear', 
-            align_corners=False
-        ).squeeze(1)  # [B, T*hop_length]
+        # Accumulate phase efficiently
+        phase_increments = phase_increment.unsqueeze(2).expand(-1, -1, self.hop_length)
+        phase_increments = phase_increments.reshape(batch_size, -1)  # [B, T*hop_length]
+        phase = torch.zeros_like(phase_increments)
+        phase[:, 1:] = torch.cumsum(phase_increments[:, :-1], dim=1)
         
-        # Create cumulative phase by integrating omega (accumulated phase)
-        phase = torch.zeros(batch_size, audio_length, device=device)
-        phase[:, 1:] = torch.cumsum(omega_upsampled[:, :-1], dim=1)
+        # Generate simplified glottal pulses using precomputed factors
+        t = phase % (2 * math.pi)
         
-        # Expand phase for broadcasting with harmonics
-        phase = phase.unsqueeze(1)  # [B, 1, T*hop_length]
+        # Create glottal pulse shape with vectorized operations
+        open_mask = t < open_quotient.unsqueeze(2).expand(-1, -1, self.hop_length).reshape(batch_size, -1)
         
-        # Calculate all harmonic phases in one vectorized operation
-        # This avoids redundant calculations and memory allocations
-        harmonic_phases = phase * harmonic_indices  # [B, num_harmonics, T*hop_length]
+        # Simplified glottal pulse
+        pulse = torch.where(open_mask, 
+                          torch.sin(t / open_quotient.unsqueeze(2).expand(-1, -1, self.hop_length).reshape(batch_size, -1)),
+                          0)
         
-        # Generate phase-correct sinusoids
-        sinusoids = torch.sin(harmonic_phases)  # [B, num_harmonics, T*hop_length]
+        # Apply shimmer
+        shimmer_factor = 1.0 + shimmer.unsqueeze(2).expand(-1, -1, self.hop_length).reshape(batch_size, -1) * (torch.rand_like(pulse) - 0.5)
+        pulse = pulse * shimmer_factor
         
-        return sinusoids
+        return pulse
     
-    def _filter_noise(self, noise_filter):
+    def _apply_unified_filtering(self, source, frication_noise, aspiration_noise, filter_params):
         """
-        Apply spectral filtering to noise using efficient FFT-based approach.
-        Optimized implementation using PyTorch's built-in STFT/ISTFT.
+        Unified frequency domain processing - combines all filtering operations.
         
         Args:
-            noise_filter: Filter shapes in frequency domain [B, n_fft//2+1, T]
+            source: Glottal source signal [B, T*hop_length]
+            frication_noise: Unfiltered frication noise [B, T*hop_length]
+            aspiration_noise: Unfiltered aspiration noise [B, T*hop_length]
+            filter_params: Combined filter parameters [B, n_fft//2+1, T]
             
         Returns:
-            Filtered noise [B, T*hop_length]
+            Processed signals [B, T*hop_length, 3] - source, frication, aspiration
         """
-        batch_size, n_freq, n_frames = noise_filter.shape
-        device = noise_filter.device
+        batch_size, audio_length = source.shape
         
-        # Generate white noise at target length
-        audio_length = n_frames * self.hop_length
-        noise = torch.randn(batch_size, audio_length, device=device)
+        # Stack all sources for batch processing
+        min_len = min(source.shape[1], frication_noise.shape[1], aspiration_noise.shape[1])
+        source = source[:, :min_len]
+        frication_noise = frication_noise[:, :min_len]
+        aspiration_noise = aspiration_noise[:, :min_len]
+        all_signals = torch.stack([source, frication_noise, aspiration_noise], dim=1)  # [B, 3, T*hop_length]
         
-        # Compute STFT using PyTorch's optimized implementation
-        noise_stft = torch.stft(
-            noise,
+        # Compute STFT on all signals at once
+        all_stft = torch.stft(
+            all_signals.reshape(-1, audio_length),  # [B*3, T*hop_length]
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             window=self.window,
             return_complex=True,
             normalized=False,
             onesided=True
-        )  # [B, F, T] where F = n_fft//2+1
+        ).reshape(batch_size, 3, self.n_fft//2+1, -1)  # [B, 3, F, T']
         
-        # Always interpolate noise_filter to exactly match STFT time frames
-        stft_frames = noise_stft.shape[2]
-        adjusted_filter = F.interpolate(
-            noise_filter,
-            size=stft_frames,
-            mode='linear',
-            align_corners=False
-        )
+        # Expand filter parameters
+        expanded_filters = filter_params.unsqueeze(1).expand(-1, 3, -1, -1)
         
-        # Apply frequency-domain filtering using broadcasting
-        # For complex tensors in PyTorch, we need to be careful about dimensions
-        # noise_stft is [B, F, T] complex tensor
-        # We need adjusted_filter to be [B, F, T] real tensor
-        filtered_stft = noise_stft * adjusted_filter
+        # Optional: Modify filters for different components
+        filter_mods = torch.ones_like(expanded_filters)
+        filter_mods[:, 0] *= 1.2  # Enhance vocal content
+        filter_mods[:, 1] *= 0.8  # Reduce aspiration
+        filter_mods[:, 2] *= 0.6  # Reduce frication
+        expanded_filters = expanded_filters * filter_mods
         
-        # Convert back to time domain using inverse STFT
-        filtered_output = torch.istft(
-            filtered_stft,
+        # Apply filtering
+        min_len = min(all_stft.shape[-1], expanded_filters.shape[-1])
+        all_stft = all_stft[:, :, :, :min_len]
+        expanded_filters = expanded_filters[:, :, :, :min_len]
+        filtered_stft = all_stft * expanded_filters
+        
+        # Convert back to time domain
+        filtered_signals = torch.istft(
+            filtered_stft.reshape(-1, self.n_fft//2+1, filtered_stft.shape[-1]),
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             window=self.window,
             normalized=False,
             onesided=True,
             length=audio_length
-        )  # [B, T*hop_length]
+        ).reshape(batch_size, 3, audio_length)  # [B, 3, T*hop_length]
         
-        return filtered_output
+        return filtered_signals
+    
+    def _generate_noise(self, batch_size, audio_length, device, correlation=0.0):
+        """
+        Optimized noise generation.
+        
+        Args:
+            batch_size: Batch size
+            audio_length: Length of audio
+            device: Device to use
+            correlation: Temporal correlation factor (0=white noise, >0=colored noise)
+            
+        Returns:
+            Noise signal [B, T*hop_length]
+        """
+        noise = torch.randn(batch_size, audio_length, device=device)
+        
+        if correlation > 0:
+            # Simplified temporal correlation using IIR filter
+            noise = torch.nn.functional.conv1d(
+                noise.unsqueeze(1),
+                torch.tensor([[[correlation, 1-correlation]]]).to(device),
+                padding=1
+            ).squeeze(1)
+        
+        return noise
     
     def forward(self, mel, f0, phoneme_seq, singer_id, language_id):
         """
-        Forward pass of the lightweight DDSP singer model.
-        Now with improved temporal modeling for better voice quality.
+        Optimized forward pass.
         
         Args:
             mel: Mel-spectrogram [B, T, n_mels]
@@ -228,6 +244,7 @@ class MelDecoder(nn.Module):
             Audio signal [B, T*hop_length]
         """
         batch_size, seq_length = mel.shape[0], mel.shape[1]
+        device = mel.device
         
         # Transpose mel to match Conv1D expected shape [B, n_mels, T]
         mel = mel.transpose(1, 2)
@@ -238,7 +255,7 @@ class MelDecoder(nn.Module):
         f0_expanded = f0.unsqueeze(1)  # [B, 1, T]
         f0_features = F.leaky_relu(self.f0_conv(f0_expanded), 0.1)  # [B, 8, T]
         
-        # Process phoneme sequence - assuming phoneme_seq is [B, T]
+        # Process phoneme sequence
         phoneme_emb = self.phoneme_embed(phoneme_seq)  # [B, T, phoneme_embed_dim]
         phoneme_emb = phoneme_emb.transpose(1, 2)  # [B, phoneme_embed_dim, T]
         
@@ -254,68 +271,44 @@ class MelDecoder(nn.Module):
         # Extract conditioning features
         cond = self.conditioning(combined)  # [B, 96, T]
         
-        # IMPROVED: Apply bidirectional temporal modeling
-        cond_temporal = cond.transpose(1, 2).transpose(0, 1)  # [T, B, 96]
-        gru_out, _ = self.gru(cond_temporal)  # [T, B, hidden_size*2] (bidirectional)
-        gru_out = gru_out.transpose(0, 1).transpose(1, 2)  # [B, hidden_size*2, T]
+        # Apply temporal modeling with causal convolutions
+        temporal_features = self.temporal_conv(cond)  # [B, hidden_size, T]
         
-        # IMPROVED: Project bidirectional features to original dimension
-        gru_projected = self.bi_projection(gru_out)  # [B, hidden_size, T]
+        # Generate source-filter model parameters
+        glottal_params = self.glottal_pulse_params(temporal_features)  # [B, 3, T]
+        filter_params = self.unified_filter_params(temporal_features)  # [B, n_fft//2+1, T]
         
-        # IMPROVED: Apply temporal context integration for smoother transitions
-        temporal_features = self.context_layer(gru_projected) + gru_projected  # [B, hidden_size, T]
+        # Get component mixing parameters
+        mix_params = self.component_mix(temporal_features)  # [B, 3, T]
         
-        # Generate synthesis parameters
-        harmonic_amps = self.harmonic_amplitudes(temporal_features)  # [B, num_harmonics, T]
-        noise_filters = self.noise_filter(temporal_features)  # [B, n_fft//2+1, T]
-        mix_param = self.harmonic_mix(temporal_features)  # [B, 1, T]
+        # Generate glottal source signal
+        glottal_source = self._generate_glottal_source(f0, glottal_params)  # [B, T*hop_length]
         
-        # Generate raw harmonics (sine waves with phase correction)
-        harmonic_waves = self._harmonics_phase_corrected(f0)  # [B, num_harmonics, T*hop_length]
+        # Generate noise components efficiently
+        audio_length = glottal_source.shape[1]
+        frication_noise = self._generate_noise(batch_size, audio_length, device, correlation=0.0)
+        aspiration_noise = self._generate_noise(batch_size, audio_length, device, correlation=0.8)
         
-        # Calculate target audio length
-        audio_length = harmonic_waves.shape[2]
+        # Apply unified filtering to all components
+        filtered_signals = self._apply_unified_filtering(
+            glottal_source, frication_noise, aspiration_noise, filter_params)  # [B, 3, T*hop_length]
         
-        # Efficient batch upsampling of all control parameters at once
-        # Stack parameters along a new dimension for a single upsampling operation
-        control_params = torch.cat([
-            harmonic_amps,  # [B, num_harmonics, T]
-            mix_param,      # [B, 1, T]
-        ], dim=1)  # [B, num_harmonics+1, T]
-        
-        # Single upsampling operation
-        control_params_upsampled = F.interpolate(
-            control_params,
+        # Upsample mixing parameters efficiently
+        mix_upsampled = F.interpolate(
+            mix_params,
             size=audio_length,
             mode='linear',
             align_corners=False
-        )  # [B, num_harmonics+1, T*hop_length]
+        )  # [B, 3, T*hop_length]
         
-        # Split upsampled parameters
-        harmonic_amps_upsampled = control_params_upsampled[:, :self.num_harmonics]  # [B, num_harmonics, T*hop_length]
-        mix_upsampled = control_params_upsampled[:, -1:]  # [B, 1, T*hop_length]
+        # Separate mix parameters
+        source_mix = mix_upsampled[:, 0]
+        frication_mix = mix_upsampled[:, 1]
+        aspiration_mix = mix_upsampled[:, 2]
         
-        # Apply amplitudes to each harmonic and sum
-        # Use torch.bmm for more efficient batch matrix multiplication
-        harmonic_waves_flat = harmonic_waves.transpose(1, 2)  # [B, T*hop_length, num_harmonics]
-        harmonic_amps_flat = harmonic_amps_upsampled.transpose(1, 2)  # [B, T*hop_length, num_harmonics]
-        
-        # Element-wise multiplication and sum along last dimension
-        harmonic_signal = torch.sum(harmonic_waves_flat * harmonic_amps_flat, dim=2)  # [B, T*hop_length]
-        
-        # Generate and filter noise
-        noise_signal = self._filter_noise(noise_filters)  # [B, T*hop_length]
-        
-        # Mix harmonic and noise components
-        mix_upsampled = mix_upsampled.squeeze(1)  # [B, T*hop_length]
-        
-        # Ensure all tensors have same length (handle edge cases)
-        min_length = min(harmonic_signal.shape[1], noise_signal.shape[1], mix_upsampled.shape[1])
-        harmonic_signal = harmonic_signal[:, :min_length]
-        noise_signal = noise_signal[:, :min_length]
-        mix_upsampled = mix_upsampled[:, :min_length]
-        
-        # Final mixing
-        audio_signal = mix_upsampled * harmonic_signal + (1 - mix_upsampled) * noise_signal
+        # Final mixing of all components
+        audio_signal = (source_mix * filtered_signals[:, 0] + 
+                       frication_mix * filtered_signals[:, 1] + 
+                       aspiration_mix * filtered_signals[:, 2])
         
         return audio_signal
