@@ -71,12 +71,13 @@ class MelDecoder(nn.Module):
         # Simplified glottal source model
         self.glottal_pulse_params = nn.Conv1d(self.hidden_size, 3, kernel_size=3, padding=1)
         
-        # Combined frequency domain processing parameters
-        self.unified_filter_params = nn.Sequential(
-            nn.Conv1d(self.hidden_size, 128, kernel_size=3, padding=1),
+        # Dynamic formant modeling parameters
+        self.num_formants = 5  # F1-F5 for rich vowel sounds
+        self.formant_predictor = nn.Sequential(
+            nn.Conv1d(self.hidden_size + self.phoneme_embed_dim + self.singer_embed_dim, 
+                     64, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1),
-            nn.Conv1d(128, n_fft//2+1, kernel_size=3, padding=1),
-            #nn.Softplus(),
+            nn.Conv1d(64, self.num_formants * 3, kernel_size=3, padding=1),
         )
         
         # Component mixture balance
@@ -85,16 +86,37 @@ class MelDecoder(nn.Module):
             nn.Softmax(dim=1),
         )
         
+        # Formant tracking smoothness parameter
+        self.register_parameter('formant_smooth', 
+                              nn.Parameter(torch.tensor(0.5), requires_grad=True))
+        
         # Precomputed values
         self.register_buffer('window', torch.hann_window(self.n_fft))
-        self.register_buffer('formant_centers', torch.tensor([10, 20, 36, 56, 80], dtype=torch.float32))
-        self.register_buffer('freq_bins', torch.arange(0, self.n_fft//2+1, dtype=torch.float32))
+        self.register_buffer('freq_bins', 
+                           torch.arange(0, self.n_fft//2+1, dtype=torch.float32) / (self.n_fft//2) * (self.sample_rate / 2))
         
         # Precomputed coefficients for glottal source
         self.register_buffer('opening_factors', 
                            torch.linspace(0, math.pi, steps=int(0.9 * self.hop_length)))
         self.register_buffer('closing_factors', 
                            1 - torch.linspace(0, 1, steps=int(0.1 * self.hop_length))**2)
+        
+        # Default formant ranges for different phoneme types
+        self.register_buffer('vowel_formant_defaults', torch.tensor([
+            [240, 2400],    # F1 range
+            [590, 3570],    # F2 range
+            [1400, 3200],   # F3 range
+            [2300, 4750],   # F4 range
+            [2900, 5300],   # F5 range
+        ], dtype=torch.float32))
+        
+        self.register_buffer('consonant_formant_defaults', torch.tensor([
+            [200, 2000],    # F1 range
+            [500, 3000],    # F2 range
+            [1000, 3500],   # F3 range
+            [2500, 4500],   # F4 range
+            [3000, 5000],   # F5 range
+        ], dtype=torch.float32))
     
     def _generate_glottal_source(self, f0, glottal_params):
         """
@@ -125,16 +147,33 @@ class MelDecoder(nn.Module):
         phase = torch.zeros_like(phase_increments)
         phase[:, 1:] = torch.cumsum(phase_increments[:, :-1], dim=1)
         
-        # Generate simplified glottal pulses using precomputed factors
+        # Generate glottal pulse shape with separate opening and closing phases
         t = phase % (2 * math.pi)
-        
-        # Create glottal pulse shape with vectorized operations
-        open_mask = t < open_quotient.unsqueeze(2).expand(-1, -1, self.hop_length).reshape(batch_size, -1)
-        
-        # Simplified glottal pulse
-        pulse = torch.where(open_mask, 
-                          torch.sin(t / open_quotient.unsqueeze(2).expand(-1, -1, self.hop_length).reshape(batch_size, -1)),
-                          0)
+        t_normalized = t / (2 * math.pi)  # Normalize to [0, 1] range
+
+        # Define dynamic open quotient and closing factor
+        open_quotient_expanded = open_quotient.unsqueeze(2).expand(-1, -1, self.hop_length).reshape(batch_size, -1)
+        closing_factor = (1 - spectral_tilt) * 1.5 + 0.5  # More tilt = slower closing
+
+        # Create masks for opening and closing phases
+        open_mask = t_normalized < open_quotient_expanded
+        close_mask = (t_normalized >= open_quotient_expanded) & (t_normalized < 1.0)
+
+        # Opening phase (rising part of the pulse)
+        opening_phase = torch.sin(math.pi * t_normalized / open_quotient_expanded)
+
+        # Closing phase (decaying part of the pulse)
+        # Normalize time in closing phase from [0,1]
+        t_closing = (t_normalized - open_quotient_expanded) / (1 - open_quotient_expanded)
+        t_closing = torch.clamp(t_closing, 0, 1)  # Ensure within bounds
+
+        # Apply spectral tilt to closing phase dynamics
+        closing_factor_expanded = closing_factor.unsqueeze(2).expand(-1, -1, self.hop_length).reshape(batch_size, -1)
+        closing_phase = 1 - t_closing ** closing_factor_expanded
+
+        # Combine opening and closing phases
+        pulse = torch.where(open_mask, opening_phase, 
+                        torch.where(close_mask, closing_phase, torch.zeros_like(t)))
         
         # Apply shimmer
         shimmer_factor = 1.0 + shimmer.unsqueeze(2).expand(-1, -1, self.hop_length).reshape(batch_size, -1) * (torch.rand_like(pulse) - 0.5)
@@ -142,15 +181,74 @@ class MelDecoder(nn.Module):
         
         return pulse
     
-    def _apply_unified_filtering(self, source, frication_noise, aspiration_noise, filter_params):
+    def _generate_formant_filter(self, formant_params, phoneme_features, singer_features):
         """
-        Unified frequency domain processing - combines all filtering operations.
+        Generates dynamic formant filter response based on phonemes and singer characteristics.
+        
+        Args:
+            formant_params: Raw formant parameters [B, num_formants*3, T]
+            phoneme_features: Phoneme embeddings [B, phoneme_embed_dim, T]
+            singer_features: Singer embeddings [B, singer_embed_dim, T]
+            
+        Returns:
+            Formant filter response [B, n_fft//2+1, T]
+        """
+        batch_size, _, n_frames = formant_params.shape
+        
+        # formant_params already contains the processed formant parameters
+        # Reshape to separate formant parameters
+        dynamic_formants = formant_params.view(batch_size, self.num_formants, 3, n_frames)
+        
+        # Extract frequency, bandwidth, and amplitude for each formant
+        frequencies = torch.sigmoid(dynamic_formants[:, :, 0]) * 5000  # [B, num_formants, T]
+        bandwidths = torch.sigmoid(dynamic_formants[:, :, 1]) * 500 + 50  # [B, num_formants, T]
+        amplitudes = torch.sigmoid(dynamic_formants[:, :, 2])  # [B, num_formants, T]
+        
+        # Apply formant smoothing (anti-aliasing)
+        smoothed_frequencies = frequencies.clone()
+        smoothed_bandwidths = bandwidths.clone()
+        if n_frames > 1:
+            alpha = torch.sigmoid(self.formant_smooth)
+            smoothed_frequencies[:, :, 1:] = (1 - alpha) * frequencies[:, :, 1:] + alpha * frequencies[:, :, :-1]
+            smoothed_bandwidths[:, :, 1:] = (1 - alpha) * bandwidths[:, :, 1:] + alpha * bandwidths[:, :, :-1]
+        
+        # Generate formant filter response for each frequency bin
+        freq_bins = self.freq_bins.unsqueeze(0).unsqueeze(0).unsqueeze(3)  # [1, 1, F, 1]
+        formant_freqs = smoothed_frequencies.unsqueeze(2)  # [B, num_formants, 1, T]
+        formant_bws = smoothed_bandwidths.unsqueeze(2)  # [B, num_formants, 1, T]
+        formant_amps = amplitudes.unsqueeze(2)  # [B, num_formants, 1, T]
+        
+        # Calculate frequency response for each formant (resonance peaks)
+        distance = torch.abs(freq_bins - formant_freqs)
+        formant_responses = formant_amps * torch.exp(-distance**2 / (2 * formant_bws**2))
+        
+        # Combine all formant responses
+        combined_response = torch.sum(formant_responses, dim=1)  # [B, F, T]
+        
+        # Normalize and apply minimum gain threshold
+        min_gain = 0.01
+        combined_response = torch.clamp(combined_response, min=min_gain)
+        
+        # Convert to dB scale for better control
+        formant_filter = 20 * torch.log10(combined_response)
+        
+        # Apply smoothing across frequency bins for stability
+        formant_filter = F.avg_pool1d(formant_filter, kernel_size=3, stride=1, padding=1)
+        
+        return formant_filter
+    
+    def _apply_unified_filtering(self, source, frication_noise, aspiration_noise, 
+                               formant_filter, phoneme_emb, singer_emb):
+        """
+        Unified frequency domain processing with dynamic formant filtering.
         
         Args:
             source: Glottal source signal [B, T*hop_length]
             frication_noise: Unfiltered frication noise [B, T*hop_length]
             aspiration_noise: Unfiltered aspiration noise [B, T*hop_length]
-            filter_params: Combined filter parameters [B, n_fft//2+1, T]
+            formant_filter: Dynamic formant filter response [B, n_fft//2+1, T]
+            phoneme_emb: Phoneme embeddings [B, phoneme_embed_dim, T]
+            singer_emb: Singer embeddings [B, singer_embed_dim, T]
             
         Returns:
             Processed signals [B, T*hop_length, 3] - source, frication, aspiration
@@ -175,10 +273,21 @@ class MelDecoder(nn.Module):
             onesided=True
         ).reshape(batch_size, 3, self.n_fft//2+1, -1)  # [B, 3, F, T']
         
-        # Expand filter parameters
-        expanded_filters = filter_params.unsqueeze(1).expand(-1, 3, -1, -1)
+        # Generate dynamic formant filter from parameters
+        min_len = min(formant_filter.shape[-1], phoneme_emb.shape[-1], singer_emb.shape[-1])
+        formant_filter = formant_filter[:, :, :min_len]
+        phoneme_emb_slice = phoneme_emb[:, :, :min_len]
+        singer_emb_slice = singer_emb[:, :, :min_len]
         
-        # Optional: Modify filters for different components
+        dynamic_filter = self._generate_formant_filter(formant_filter, phoneme_emb_slice, singer_emb_slice)
+        
+        # Convert from dB to linear scale
+        dynamic_filter_linear = 10**(dynamic_filter / 20)
+        
+        # Expand filter for all signal components
+        expanded_filters = dynamic_filter_linear.unsqueeze(1).expand(-1, 3, -1, -1)
+        
+        # Modify filters for different components
         filter_mods = torch.ones_like(expanded_filters)
         filter_mods[:, 0] *= 1.2  # Enhance vocal content
         filter_mods[:, 1] *= 0.8  # Reduce aspiration
@@ -231,7 +340,7 @@ class MelDecoder(nn.Module):
     
     def forward(self, mel, f0, phoneme_seq, singer_id, language_id):
         """
-        Optimized forward pass.
+        Optimized forward pass with dynamic formant modeling.
         
         Args:
             mel: Mel-spectrogram [B, T, n_mels]
@@ -276,7 +385,11 @@ class MelDecoder(nn.Module):
         
         # Generate source-filter model parameters
         glottal_params = self.glottal_pulse_params(temporal_features)  # [B, 3, T]
-        filter_params = self.unified_filter_params(temporal_features)  # [B, n_fft//2+1, T]
+        
+        # Generate formant filter parameters
+        formant_params = self.formant_predictor(
+            torch.cat([temporal_features, phoneme_emb, singer_emb], dim=1)
+        )  # [B, num_formants*3, T]
         
         # Get component mixing parameters
         mix_params = self.component_mix(temporal_features)  # [B, 3, T]
@@ -289,9 +402,10 @@ class MelDecoder(nn.Module):
         frication_noise = self._generate_noise(batch_size, audio_length, device, correlation=0.0)
         aspiration_noise = self._generate_noise(batch_size, audio_length, device, correlation=0.8)
         
-        # Apply unified filtering to all components
+        # Apply unified filtering with dynamic formants
         filtered_signals = self._apply_unified_filtering(
-            glottal_source, frication_noise, aspiration_noise, filter_params)  # [B, 3, T*hop_length]
+            glottal_source, frication_noise, aspiration_noise, 
+            formant_params, phoneme_emb, singer_emb)  # [B, 3, T*hop_length]
         
         # Upsample mixing parameters efficiently
         mix_upsampled = F.interpolate(
