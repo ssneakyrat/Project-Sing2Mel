@@ -18,8 +18,6 @@ os.makedirs('visuals', exist_ok=True)
 os.makedirs('visuals/decoder', exist_ok=True)
 os.makedirs('audio_samples', exist_ok=True)
 
-
-
 def extract_audio_from_dataset(batch, device):
     """Extract original audio from dataset"""
     # Simply get the audio from the batch and move it to the device
@@ -233,8 +231,8 @@ def main():
     
     # Create loss function
     criterion = DecoderLoss(
-        stft_loss_weight=0.5,
-        mel_loss_weight=0.5
+        stft_loss_weight=0.7,
+        mel_loss_weight=0.3
     ).to(device)
     
     # Mel transform for extracting mel spectrogram from predicted audio
