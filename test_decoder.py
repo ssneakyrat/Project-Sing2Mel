@@ -193,15 +193,16 @@ def main():
     # Load dataset
     batch_size = 32  # Smaller batch size for complex model
     num_epochs = 1000
-    visualization_interval = 25  # Visualize every 5 epochs
+    visualization_interval = 5  # Visualize every 5 epochs
 
     train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
         batch_size=batch_size,
-        num_workers=4,
-        train_files=50,
-        val_files=20,
+        num_workers=1,
+        train_files=None,
+        val_files=50,
         device=device,
-        context_window_sec=2  # 2-second window
+        context_window_sec=2,  # 2-second window
+        persistent_workers=True
     )
     
     # Get dataset parameters
@@ -246,7 +247,7 @@ def main():
     ).to(device)
     
     # Optimizer
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(model.parameters(), lr=0.0005)
     
     # Learning rate scheduler - reduce LR when loss plateaus
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(

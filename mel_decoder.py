@@ -112,7 +112,7 @@ class MelDecoder(nn.Module):
         # Process F0 - make sure it's in Hz and properly shaped
         f0_unsqueeze = f0.unsqueeze(2)  # [B, T, 1]
         f0_unsqueeze = torch.clamp(f0_unsqueeze, min=0.0, max=1000.0)
-        f0_unsqueeze[f0_unsqueeze < 80] = 0  # Set unvoiced regions to 0
+        f0_unsqueeze[f0_unsqueeze < 80] = 0 + 1e-7  # Set unvoiced regions to 0
         pitch = f0_unsqueeze
         
         # Get expressive control parameters
