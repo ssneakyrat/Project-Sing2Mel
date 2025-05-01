@@ -24,7 +24,8 @@ class FeatureExtractor(nn.Module):
             phoneme_dim=128,
             singer_dim=16,
             language_dim=8,
-            hidden_dim=256):
+            hidden_dim=256,
+            num_attention_heads=4):
         super().__init__()
         self.output_splits = output_splits
         self.hidden_dim = hidden_dim
@@ -69,7 +70,22 @@ class FeatureExtractor(nn.Module):
             dropout=0.1
         )
         
-        # 5. Pre-output layers with residual connection
+        # 5. Self-Attention mechanism - NEW
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=256,
+            num_heads=num_attention_heads,
+            dropout=0.1,
+            batch_first=True  # This makes the input expected as [B, T, dim]
+        )
+        
+        # 6. Attention-GRU fusion layer - NEW
+        self.attn_gru_fusion = nn.Sequential(
+            weight_norm(nn.Linear(hidden_dim * 2, hidden_dim)),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+        
+        # 7. Pre-output layers with residual connection
         self.pre_out = nn.Sequential(
             weight_norm(nn.Linear(hidden_dim, 128)),
             nn.ReLU(),
@@ -79,7 +95,7 @@ class FeatureExtractor(nn.Module):
         # Final transformation from pre-out to hidden state
         self.pre_out_to_hidden = weight_norm(nn.Linear(128, 64))
         
-        # 6. Output projection
+        # 8. Output projection
         self.n_out = sum([v for k, v in output_splits.items()])
         self.dense_out = weight_norm(nn.Linear(64, self.n_out))
 
@@ -123,13 +139,22 @@ class FeatureExtractor(nn.Module):
         # Apply fusion layers
         fused = self.fusion_layers(concat_features)  # [B, T, 256]
         
-        # Apply GRU for temporal modeling
+        # Parallel processing with GRU and Self-Attention
+        # 1. GRU processing
         gru_out, _ = self.gru(fused)  # [B, T, hidden_dim]
         
-        # Apply pre-output layers
-        pre_out = self.pre_out(gru_out)  # [B, T, 128]
+        # 2. Self-Attention processing - Using batch_first=True
+        attn_out, _ = self.self_attn(fused, fused, fused)  # [B, T, 256]
         
-        # Apply residual connection and final pre-output transformation
+        # 3. Combine GRU and Self-Attention outputs
+        # Concatenate instead of simple addition for more expressivity
+        combined = torch.cat([gru_out, attn_out], dim=-1)  # [B, T, hidden_dim * 2]
+        combined = self.attn_gru_fusion(combined)  # [B, T, hidden_dim]
+        
+        # Apply pre-output layers
+        pre_out = self.pre_out(combined)  # [B, T, 128]
+        
+        # Apply final pre-output transformation
         x = self.pre_out_to_hidden(pre_out)  # [B, T, 64]
         
         # Output projection
