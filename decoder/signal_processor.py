@@ -122,6 +122,57 @@ class SignalProcessor(nn.Module):
             'attack_sharpness': attack_sharpness
         }
     
+    def interpolate_to_audio_rate(self, param, audio_length):
+        """
+        Interpolate a parameter to audio rate
+        
+        Args:
+            param: Parameter tensor [B, T, C]
+            audio_length: Target length in samples
+            
+        Returns:
+            Interpolated parameter at audio rate
+        """
+        if param.shape[1] != audio_length:
+            param_audio = F.interpolate(
+                param.transpose(1, 2),
+                size=audio_length,
+                mode='linear',
+                align_corners=False
+            ).transpose(1, 2)
+            return param_audio
+        return param
+    
+    def interpolate_parameters(self, expressive_params, audio_length):
+        """
+        Interpolate all parameters to audio rate only, deferring STFT rate interpolation
+        
+        Args:
+            expressive_params: Dictionary of expressive parameters
+            audio_length: Length of audio in samples
+            
+        Returns:
+            Dictionary with parameters interpolated to audio rate
+        """
+        # Create new dictionary to hold interpolated parameters
+        synced_params = {}
+        
+        # Interpolate parameters to audio rate only
+        for param_name in ['tension', 'breathiness', 'vocal_fry']:
+            param = expressive_params[param_name]
+            param_audio = self.interpolate_to_audio_rate(param, audio_length)
+            synced_params[param_name] = param_audio
+        
+        # Copy vibrato parameters directly
+        synced_params['vibrato_rate'] = expressive_params['vibrato_rate']
+        synced_params['vibrato_depth'] = expressive_params['vibrato_depth']
+        synced_params['vibrato_phase'] = expressive_params['vibrato_phase']
+        
+        # Calculate tension-derived parameters at audio rate
+        synced_params['tension_derived'] = self.calculate_tension_derived_params(synced_params['tension'])
+        
+        return synced_params
+    
     def process_audio(self, harmonic, noise, f0, time_idx, expressive_params):
         """
         Combined processing pipeline for all audio effects
@@ -137,62 +188,13 @@ class SignalProcessor(nn.Module):
             Processed audio signal [B, T_audio], F0 with vibrato [B, T_f0, 1]
         """
         batch_size, audio_length = harmonic.shape
-        f0_frames = f0.shape[1]
-        params_frames = expressive_params['vibrato_rate'].shape[1]
         
         # 1. Apply vibrato to F0 (will handle shape mismatches internally)
         f0_with_vibrato = self.apply_vibrato(f0, time_idx, expressive_params)
         
-        # 2. Create synchronized parameters for audio processing
-        # We need to interpolate all parameters to audio length for proper processing
-        synced_params = {}
-        
-        # Handle tension parameter
-        tension = expressive_params['tension']
-        if tension.shape[1] != audio_length:
-            tension_audio = F.interpolate(
-                tension.transpose(1, 2),
-                size=audio_length,
-                mode='linear',
-                align_corners=False
-            ).transpose(1, 2)
-        else:
-            tension_audio = tension
-        synced_params['tension'] = tension_audio
-        
-        # Handle breathiness parameter
-        breathiness = expressive_params['breathiness']
-        if breathiness.shape[1] != audio_length:
-            breathiness_audio = F.interpolate(
-                breathiness.transpose(1, 2),
-                size=audio_length,
-                mode='linear',
-                align_corners=False
-            ).transpose(1, 2)
-        else:
-            breathiness_audio = breathiness
-        synced_params['breathiness'] = breathiness_audio
-        
-        # Handle vocal fry parameter
-        vocal_fry = expressive_params['vocal_fry']
-        if vocal_fry.shape[1] != audio_length:
-            vocal_fry_audio = F.interpolate(
-                vocal_fry.transpose(1, 2),
-                size=audio_length,
-                mode='linear',
-                align_corners=False
-            ).transpose(1, 2)
-        else:
-            vocal_fry_audio = vocal_fry
-        synced_params['vocal_fry'] = vocal_fry_audio
-        
-        # Recalculate tension-derived parameters with audio-length tension
-        synced_params['tension_derived'] = self.calculate_tension_derived_params(synced_params['tension'])
-        
-        # Add vibrato parameters - not needed for audio processing but kept for consistency
-        synced_params['vibrato_rate'] = expressive_params['vibrato_rate']
-        synced_params['vibrato_depth'] = expressive_params['vibrato_depth']
-        synced_params['vibrato_phase'] = expressive_params['vibrato_phase']
+        # 2. Interpolate all parameters at once to both audio and STFT rates
+        # This is the key optimization - do all interpolations in one place
+        synced_params = self.interpolate_parameters(expressive_params, audio_length)
         
         # 3. Apply combined spectral and time-domain effects with synced parameters
         harmonic_processed = self.apply_combined_effects(harmonic, f0_with_vibrato, synced_params)
@@ -202,22 +204,22 @@ class SignalProcessor(nn.Module):
         
         return output, f0_with_vibrato
     
-    def apply_combined_effects(self, harmonic, f0, expressive_params):
+    def apply_combined_effects(self, harmonic, f0, synced_params):
         """
         Combined application of tension and vocal fry effects
         
         Args:
             harmonic: Harmonic component [B, T]
             f0: Fundamental frequency with vibrato [B, T, 1]
-            expressive_params: Dictionary of expressive parameters
+            synced_params: Dictionary of pre-interpolated parameters
             
         Returns:
             Modified harmonic signal [B, T]
         """
-        # Extract parameters (should already be at audio rate from process_audio)
-        tension = expressive_params['tension']  # [B, T_audio, 1]
-        tension_derived = expressive_params['tension_derived']
-        vocal_fry = expressive_params['vocal_fry']  # [B, T_audio, 1]
+        # Extract parameters (already at audio rate from interpolate_parameters)
+        tension = synced_params['tension']  # [B, T_audio, 1]
+        tension_derived = synced_params['tension_derived']
+        vocal_fry = synced_params['vocal_fry']  # [B, T_audio, 1]
         
         batch_size, audio_length = harmonic.shape
         device = harmonic.device
@@ -249,6 +251,7 @@ class SignalProcessor(nn.Module):
         num_bins = harmonic_stft.shape[2]
         
         # Interpolate tension-derived parameters to STFT frame rate
+        # Do this interpolation now that we know the actual STFT dimensions
         spectral_tilt = F.interpolate(
             tension_derived['spectral_tilt'].transpose(1, 2),
             size=num_frames,
@@ -270,7 +273,7 @@ class SignalProcessor(nn.Module):
             align_corners=False
         ).transpose(1, 2)
         
-        # Downsample tension to STFT frame rate
+        # Also interpolate tension to STFT frame rate for harmonic emphasis
         tension_stft = F.interpolate(
             tension.transpose(1, 2) if tension.dim() == 3 else tension.unsqueeze(1),
             size=num_frames,
@@ -407,19 +410,21 @@ class SignalProcessor(nn.Module):
         
         return output_with_fry
     
-    def apply_breathiness(self, harmonic, noise, expressive_params):
+    def apply_breathiness(self, harmonic, noise, synced_params):
         """
         Apply breathiness control
         
         Args:
             harmonic: Processed harmonic component [B, T]
             noise: Noise component [B, T]
-            expressive_params: Dictionary of expressive parameters
+            synced_params: Dictionary of pre-interpolated parameters
             
         Returns:
             Mixed signal with breathiness control [B, T]
         """
-        breathiness = expressive_params['breathiness']
+        # Use pre-interpolated breathiness parameter directly - no need to interpolate again!
+        breathiness = synced_params['breathiness']
+        
         batch_size, audio_length = harmonic.shape
         
         # Get breathiness at audio rate, handling different tensor formats
@@ -427,15 +432,6 @@ class SignalProcessor(nn.Module):
             breathiness_expanded = breathiness.squeeze(-1)
         else:  # dim == 2
             breathiness_expanded = breathiness
-            
-        # Ensure breathiness has correct shape
-        if breathiness_expanded.shape[1] != audio_length:
-            breathiness_expanded = F.interpolate(
-                breathiness_expanded.unsqueeze(1),
-                size=audio_length,
-                mode='linear',
-                align_corners=False
-            ).squeeze(1)
 
         # Mix harmonic and noise with breathiness control
         output = (1 - breathiness_expanded) * harmonic + breathiness_expanded * noise

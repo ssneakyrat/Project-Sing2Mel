@@ -247,7 +247,7 @@ def main():
     ).to(device)
     
     # Optimizer
-    optimizer = optim.Adam(model.parameters(), lr=0.0005)
+    optimizer = optim.Adam(model.parameters(), lr=0.002)
     
     # Learning rate scheduler - reduce LR when loss plateaus
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(

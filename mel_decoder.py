@@ -21,7 +21,7 @@ class MelDecoder(nn.Module):
                  n_mels=80, 
                  hop_length=240, 
                  sample_rate=24000,
-                 num_harmonics=150, 
+                 num_harmonics=80, 
                  num_mag_harmonic=256,
                  num_mag_noise=80,
                  n_fft=1024):
