@@ -94,7 +94,7 @@ class MelDecoder(nn.Module):
             initial_phase: Optional initial phase for the harmonic oscillator
             
         Returns:
-            Audio signal [B, T*hop_length]
+            Audio signal [B, T*hop_length], expressive parameters dict
         """
         batch_size, n_frames = mel.shape[0], mel.shape[1]
         
@@ -151,4 +151,5 @@ class MelDecoder(nn.Module):
             harmonic, noise, f0_with_vibrato, time_idx, expressive_params
         )
             
-        return output
+        # Return both the audio output and the expressive parameters
+        return output, expressive_params
