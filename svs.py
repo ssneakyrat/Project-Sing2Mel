@@ -119,7 +119,7 @@ class SVS(nn.Module):
                  num_harmonics=80, 
                  num_mag_harmonic=256,
                  num_mag_noise=80,
-                 n_fft=1024):
+                 ):
         super(SVS, self).__init__()
         
         # Basic parameters
@@ -210,10 +210,10 @@ class SVS(nn.Module):
         f0_unsqueeze = f0.unsqueeze(2)  # [B, T, 1]
         
         # Generate mel spectrogram if not provided
-        mel = self.mel_encoder(f0_unsqueeze, phoneme_emb, singer_emb, language_emb)
+        predicted_mel = self.mel_encoder(f0_unsqueeze, phoneme_emb, singer_emb, language_emb)
 
         # Get control parameters from feature extractor
-        ctrls = self.feature_extractor(mel, f0, phoneme_emb, singer_emb, language_emb)
+        ctrls = self.feature_extractor(predicted_mel, f0, phoneme_emb, singer_emb, language_emb)
 
         # Process harmonic and noise parameters
         src_param = scale_function(ctrls['harmonic_magnitude'])
@@ -225,13 +225,12 @@ class SVS(nn.Module):
         # Process F0 - make sure it's in Hz and properly shaped
         f0_unsqueeze = torch.clamp(f0_unsqueeze, min=0.0, max=1000.0)
         f0_unsqueeze[f0_unsqueeze < 80] = 0 + 1e-7  # Set unvoiced regions to 0
-        pitch = f0_unsqueeze
         
         # Get expressive control parameters using the parameter predictor
         expressive_params = self.expressive_control(conditioning)
 
         # Create time indices for vibrato calculation
-        time_idx = torch.arange(n_frames, device=mel.device).float().unsqueeze(0).expand(batch_size, -1) / 100.0
+        time_idx = torch.arange(n_frames, device=predicted_mel.device).float().unsqueeze(0).expand(batch_size, -1) / 100.0
         
         # Apply vibrato to F0 at frame rate using the signal processor
         f0_with_vibrato = self.signal_processor.apply_vibrato(
@@ -260,4 +259,4 @@ class SVS(nn.Module):
         )
             
         # Return both the audio output and the expressive parameters
-        return output, expressive_params
+        return output, expressive_params, predicted_mel

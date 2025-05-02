@@ -24,7 +24,7 @@ def extract_audio_from_dataset(batch, device):
     # Simply get the audio from the batch and move it to the device
     return batch['audio'].to(device)
 
-def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, expressive_params=None, save_dir='visuals/decoder'):
+def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, expressive_params=None, latent_mel=None, save_dir='visuals/decoder'):
     """
     Visualize model outputs and expressive parameters
     
@@ -36,10 +36,15 @@ def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
         wave: Predicted waveform
         target_audio: Target audio waveform
         expressive_params: Dictionary of expressive parameters
+        latent_mel: Latent mel representation from model
         save_dir: Directory to save visualizations
     """
-    # Create figure with 4 subplots (3 original + 1 for parameters)
-    fig, ax = plt.subplots(4, 1, figsize=(12, 16), gridspec_kw={'height_ratios': [1, 1, 1.5, 1.5]})
+    # Determine number of subplots based on whether latent_mel is provided
+    n_plots = 5 if latent_mel is not None else 4
+    
+    # Create figure with subplots
+    fig, ax = plt.subplots(n_plots, 1, figsize=(12, 4 * n_plots), 
+                          gridspec_kw={'height_ratios': [1, 1, 1, 1.5, 1.5] if latent_mel is not None else [1, 1, 1.5, 1.5]})
     
     # Plot original mel
     if mel.dim() == 3 and mel.size(1) == N_MELS:
@@ -57,7 +62,47 @@ def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
     ax[1].imshow(predicted_mel[0].detach().cpu().numpy(), aspect='auto', origin='lower')
     ax[1].set_title('Reconstructed Mel Spectrogram')
     ax[1].set_ylabel('Mel Bin')
+
+    # Plot original mel
+    if latent_mel.dim() == 3 and latent_mel.size(1) == N_MELS:
+        # [B, n_mels, T] format
+        latent_mel_plot = latent_mel[0].detach().cpu().numpy()
+    else:
+        # [B, T, n_mels] format
+        latent_mel_plot = latent_mel[0].transpose(0, 1).detach().cpu().numpy()
     
+    ax[2].imshow(latent_mel_plot, aspect='auto', origin='lower')
+    ax[2].set_title('latent Mel Spectrogram')
+    ax[2].set_ylabel('Mel Bin')
+    '''
+    # Plot latent mel if provided
+    if latent_mel is not None:
+        # Convert latent mel to numpy and plot
+        latent_mel_np = latent_mel[0].detach().cpu().numpy()
+        
+        # Handle different possible shapes
+        if len(latent_mel_np.shape) == 3:
+            # If latent_mel is [B, C, T], plot the first few channels
+            latent_channels = min(5, latent_mel_np.shape[0])
+            latent_mel_display = latent_mel_np[:latent_channels].transpose(1, 0)
+        elif len(latent_mel_np.shape) == 2:
+            # If latent_mel is [T, C] or [C, T]
+            if latent_mel_np.shape[0] > latent_mel_np.shape[1]:
+                # Likely [T, C]
+                latent_mel_display = latent_mel_np
+            else:
+                # Likely [C, T]
+                latent_mel_display = latent_mel_np.T
+        else:
+            # Fallback for other formats
+            latent_mel_display = latent_mel_np
+        
+        ax[2].imshow(latent_mel_display, aspect='auto', origin='lower', cmap='viridis')
+        ax[2].set_title('Latent Mel Representation')
+        ax[2].set_ylabel('Feature Dimension')
+    '''
+    
+    # Plot waveforms
     wave_predicted = wave[0].detach().cpu().numpy()
     wave_target = target_audio[0].detach().cpu().numpy()
 
@@ -69,12 +114,13 @@ def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
     wave_target_aligned = wave_target[:min_len]
     time = np.arange(min_len) / SAMPLE_RATE
 
-    ax[2].plot(time, wave_predicted_aligned, label='Predicted', color='blue', alpha=0.7)
-    ax[2].plot(time, wave_target_aligned, label='Target', color='green', alpha=0.5)
-    ax[2].set_title('Waveform Comparison')
-    ax[2].set_xlabel('Time (s)')
-    ax[2].set_ylabel('Amplitude')
-    ax[2].legend(loc='upper right')
+    waveform_idx = 3 if latent_mel is not None else 2
+    ax[waveform_idx].plot(time, wave_predicted_aligned, label='Predicted', color='blue', alpha=0.7)
+    ax[waveform_idx].plot(time, wave_target_aligned, label='Target', color='green', alpha=0.5)
+    ax[waveform_idx].set_title('Waveform Comparison')
+    ax[waveform_idx].set_xlabel('Time (s)')
+    ax[waveform_idx].set_ylabel('Amplitude')
+    ax[waveform_idx].legend(loc='upper right')
     
     # Plot expressive parameters if provided
     if expressive_params is not None:
@@ -83,7 +129,8 @@ def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
         frame_time = np.arange(n_frames) * HOP_LENGTH / SAMPLE_RATE
         
         # Make a separate plot for parameters
-        parameter_ax = ax[3]
+        param_idx = 4 if latent_mel is not None else 3
+        parameter_ax = ax[param_idx]
         parameter_ax.set_title("Expressive Control Parameters")
         parameter_ax.set_xlabel("Time (s)")
         parameter_ax.set_ylabel("Parameter Value")
@@ -252,7 +299,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
         
         # Forward pass
         optimizer.zero_grad()
-        wave, expressive_params = model(f0, phoneme_seq, singer_id, language_id)
+        wave, expressive_params, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
         
         # Compute combined loss
         loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
@@ -295,7 +342,7 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
             target_audio = extract_audio_from_dataset(batch, device)
             
             # Forward pass
-            wave, expressive_params = model(f0, phoneme_seq, singer_id, language_id)
+            wave, expressive_params, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
             
             # Compute combined loss
             loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
@@ -306,9 +353,9 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
             
             # Visualize only the first batch if requested
             if visualize and batch_idx == 0:
-                # Regular visualization with parameters
+                # Regular visualization with parameters and latent_mel
                 visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
-                                 expressive_params, save_dir='visuals/decoder/val')
+                                 expressive_params, latent_mel, save_dir='visuals/decoder/val')
                 
                 # Dedicated parameter visualization with waveform
                 visualize_expressive_params_with_waveform(
