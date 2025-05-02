@@ -4,14 +4,15 @@ import torch.nn.functional as F
 import numpy as np
 
 from decoder.feature_extractor import FeatureExtractor
-from decoder.expressive_control import ExpressiveControl  # Import optimized version
-from decoder.harmonic_oscillator import HarmonicOscillator
+from decoder.expressive_control import ExpressiveControl  # Import parameter predictor
+from decoder.signal_processor import SignalProcessor  # Import new signal processor
 from decoder.wave_generator_oscillator import WaveGeneratorOscillator
 from decoder.core import scale_function, frequency_filter
 
 class MelDecoder(nn.Module):
     """
-    Lightweight DDSP-based singing voice synthesis model with optimized expressive control.
+    Lightweight DDSP-based singing voice synthesis model with separated
+    expressive control prediction and signal processing components.
     """
     def __init__(self, 
                  num_phonemes, 
@@ -74,12 +75,15 @@ class MelDecoder(nn.Module):
             amplitudes=self.harmonic_amplitudes,
             ratio=self.ratio)
         
-        # Initialize optimized expressive control
+        # Initialize expressive control for parameter prediction
         self.expressive_control = ExpressiveControl(input_dim=256, sample_rate=sample_rate)
+        
+        # Initialize signal processor for audio effects
+        self.signal_processor = SignalProcessor(sample_rate=sample_rate)
 
     def forward(self, mel, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
-        Optimized forward pass with combined expressive control processing.
+        Forward pass with separated expressive control and signal processing.
         
         Args:
             mel: Mel-spectrogram [B, T, n_mels]
@@ -115,19 +119,14 @@ class MelDecoder(nn.Module):
         f0_unsqueeze[f0_unsqueeze < 80] = 0 + 1e-7  # Set unvoiced regions to 0
         pitch = f0_unsqueeze
         
-        # Get expressive control parameters
+        # Get expressive control parameters using the parameter predictor
         expressive_params = self.expressive_control(conditioning)
 
-        # Create time indices for vibrato calculation - more efficient
+        # Create time indices for vibrato calculation
         time_idx = torch.arange(n_frames, device=mel.device).float().unsqueeze(0).expand(batch_size, -1) / 100.0
         
-        # OPTIMIZATION: Apply vibrato at frame rate first
-        # Ensure time_idx matches the shape of f0 and expressive parameters
-        if time_idx.shape[1] != n_frames or time_idx.shape[1] != expressive_params['vibrato_rate'].shape[1]:
-            time_idx = torch.arange(n_frames, device=mel.device).float().unsqueeze(0).expand(batch_size, -1) / 100.0
-        
-        # Apply vibrato to F0 at frame rate
-        f0_with_vibrato = self.expressive_control.apply_vibrato(
+        # Apply vibrato to F0 at frame rate using the signal processor
+        f0_with_vibrato = self.signal_processor.apply_vibrato(
             f0_unsqueeze, time_idx, expressive_params
         )
         
@@ -147,10 +146,8 @@ class MelDecoder(nn.Module):
         noise = torch.rand_like(harmonic).to(noise_param) * 2 - 1
         noise = frequency_filter(noise, noise_param)
         
-        # OPTIMIZATION: Apply all expressive effects in one combined operation
-        # This replaces separate calls to apply_tension, apply_vocal_fry, and apply_breathiness
-        # The process_audio method now handles all shape alignment internally
-        output, _ = self.expressive_control.process_audio(
+        # Apply all audio effects using the signal processor
+        output, _ = self.signal_processor.process_audio(
             harmonic, noise, f0_with_vibrato, time_idx, expressive_params
         )
             
