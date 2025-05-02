@@ -9,7 +9,7 @@ from decoder.signal_processor import SignalProcessor  # Import new signal proces
 from decoder.wave_generator_oscillator import WaveGeneratorOscillator
 from decoder.core import scale_function, frequency_filter
 
-class MelDecoder(nn.Module):
+class SVS(nn.Module):
     """
     Lightweight DDSP-based singing voice synthesis model with separated
     expressive control prediction and signal processing components.
@@ -25,7 +25,7 @@ class MelDecoder(nn.Module):
                  num_mag_harmonic=256,
                  num_mag_noise=80,
                  n_fft=1024):
-        super(MelDecoder, self).__init__()
+        super(SVS, self).__init__()
         
         # Basic parameters
         self.n_mels = n_mels

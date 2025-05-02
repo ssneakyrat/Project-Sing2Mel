@@ -11,7 +11,7 @@ import soundfile as sf
 from loss import DecoderLoss
 from dataset_decoder import get_dataloader, SAMPLE_RATE, N_MELS, HOP_LENGTH, WIN_LENGTH
 
-from mel_decoder import MelDecoder
+from svs import SVS
 
 # Create visuals folder if it doesn't exist
 os.makedirs('visuals', exist_ok=True)
@@ -354,7 +354,7 @@ def main():
     num_languages = len(train_dataset.language_map)
     
     # Create model
-    model = MelDecoder(
+    model = SVS(
         num_phonemes=num_phonemes,
         num_singers=num_singers,
         num_languages=num_languages,
