@@ -8,7 +8,7 @@ from decoder.feature_extractor import FeatureExtractor
 from decoder.expressive_control import ExpressiveControl  # Import parameter predictor
 from decoder.signal_processor import SignalProcessor  # Import new signal processor
 from decoder.wave_generator_oscillator import WaveGeneratorOscillator
-from decoder.core import scale_function, frequency_filter
+from decoder.core import scale_function, frequency_filter, upsample
 
 
 
@@ -79,12 +79,6 @@ class SVS(nn.Module):
             amplitudes=self.harmonic_amplitudes,
             ratio=self.ratio)
         
-        # Initialize expressive control for parameter prediction
-        self.expressive_control = ExpressiveControl(input_dim=256, sample_rate=sample_rate)
-        
-        # Initialize signal processor for audio effects
-        self.signal_processor = SignalProcessor(sample_rate=sample_rate)
-        
         # Initialize mel encoder
         self.mel_encoder = MelEncoder(
             n_mels=n_mels,
@@ -134,38 +128,22 @@ class SVS(nn.Module):
         # Process F0 - make sure it's in Hz and properly shaped
         f0_unsqueeze = torch.clamp(f0_unsqueeze, min=0.0, max=1000.0)
         f0_unsqueeze[f0_unsqueeze < 80] = 0 + 1e-7  # Set unvoiced regions to 0
-        
-        # Get expressive control parameters using the parameter predictor
-        expressive_params = self.expressive_control(conditioning)
 
-        # Create time indices for vibrato calculation
-        time_idx = torch.arange(n_frames, device=predicted_mel.device).float().unsqueeze(0).expand(batch_size, -1) / 100.0
-        
-        # Apply vibrato to F0 at frame rate using the signal processor
-        f0_with_vibrato = self.signal_processor.apply_vibrato(
-            f0_unsqueeze, time_idx, expressive_params
-        )
-        
-        # Upsample to audio rate for synthesis
-        f0_upsampled = F.interpolate(
-            f0_with_vibrato.transpose(1, 2), 
-            size=n_frames * self.hop_length, 
-            mode='linear',
-            align_corners=False
-        ).transpose(1, 2)
+        # upsample
+        pitch = upsample(f0_unsqueeze, self.block_size)
 
-        # Generate harmonic component
-        harmonic, final_phase = self.harmonic_synthesizer(f0_upsampled.squeeze(1), initial_phase)
-        harmonic = frequency_filter(harmonic, src_param)
+        # harmonic
+        harmonic, final_phase = self.harmonic_synthesizer(pitch, initial_phase)
+        harmonic = frequency_filter(
+                        harmonic,
+                        src_param)
 
-        # Generate noise component
+        # noise part
         noise = torch.rand_like(harmonic).to(noise_param) * 2 - 1
-        noise = frequency_filter(noise, noise_param)
+        noise = frequency_filter(
+                        noise,
+                        noise_param)
+        signal = harmonic + noise
         
-        # Apply all audio effects using the signal processor
-        output, _ = self.signal_processor.process_audio(
-            harmonic, noise, f0_with_vibrato, time_idx, expressive_params
-        )
-            
         # Return both the audio output and the expressive parameters
-        return output, expressive_params, predicted_mel
+        return signal, predicted_mel

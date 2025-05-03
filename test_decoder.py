@@ -24,7 +24,7 @@ def extract_audio_from_dataset(batch, device):
     # Simply get the audio from the batch and move it to the device
     return batch['audio'].to(device)
 
-def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, expressive_params=None, latent_mel=None, save_dir='visuals/decoder'):
+def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, latent_mel=None, save_dir='visuals/decoder'):
     """
     Visualize model outputs and expressive parameters
     
@@ -74,33 +74,6 @@ def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
     ax[2].imshow(latent_mel_plot, aspect='auto', origin='lower')
     ax[2].set_title('latent Mel Spectrogram')
     ax[2].set_ylabel('Mel Bin')
-    '''
-    # Plot latent mel if provided
-    if latent_mel is not None:
-        # Convert latent mel to numpy and plot
-        latent_mel_np = latent_mel[0].detach().cpu().numpy()
-        
-        # Handle different possible shapes
-        if len(latent_mel_np.shape) == 3:
-            # If latent_mel is [B, C, T], plot the first few channels
-            latent_channels = min(5, latent_mel_np.shape[0])
-            latent_mel_display = latent_mel_np[:latent_channels].transpose(1, 0)
-        elif len(latent_mel_np.shape) == 2:
-            # If latent_mel is [T, C] or [C, T]
-            if latent_mel_np.shape[0] > latent_mel_np.shape[1]:
-                # Likely [T, C]
-                latent_mel_display = latent_mel_np
-            else:
-                # Likely [C, T]
-                latent_mel_display = latent_mel_np.T
-        else:
-            # Fallback for other formats
-            latent_mel_display = latent_mel_np
-        
-        ax[2].imshow(latent_mel_display, aspect='auto', origin='lower', cmap='viridis')
-        ax[2].set_title('Latent Mel Representation')
-        ax[2].set_ylabel('Feature Dimension')
-    '''
     
     # Plot waveforms
     wave_predicted = wave[0].detach().cpu().numpy()
@@ -121,53 +94,6 @@ def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
     ax[waveform_idx].set_xlabel('Time (s)')
     ax[waveform_idx].set_ylabel('Amplitude')
     ax[waveform_idx].legend(loc='upper right')
-    
-    # Plot expressive parameters if provided
-    if expressive_params is not None:
-        # Create a frame-level time axis
-        n_frames = expressive_params['vibrato_rate'].shape[1]
-        frame_time = np.arange(n_frames) * HOP_LENGTH / SAMPLE_RATE
-        
-        # Make a separate plot for parameters
-        param_idx = 4 if latent_mel is not None else 3
-        parameter_ax = ax[param_idx]
-        parameter_ax.set_title("Expressive Control Parameters")
-        parameter_ax.set_xlabel("Time (s)")
-        parameter_ax.set_ylabel("Parameter Value")
-        
-        # Parameters to plot and their colors
-        param_colors = {
-            'vibrato_rate': 'red',
-            'vibrato_depth': 'orange',
-            'vibrato_phase': 'purple',
-            'breathiness': 'brown',
-            'tension': 'magenta',
-            'vocal_fry': 'cyan'
-        }
-        
-        # Plot each parameter
-        for param_name, color in param_colors.items():
-            if param_name in expressive_params:
-                # Extract parameter values for the first batch example
-                param_values = expressive_params[param_name][0].detach().cpu().numpy()
-                
-                # Reshape if needed
-                if len(param_values.shape) > 1:
-                    param_values = param_values.flatten()
-                
-                # Use only up to n_frames points
-                display_frames = min(len(frame_time), len(param_values))
-                parameter_ax.plot(
-                    frame_time[:display_frames], 
-                    param_values[:display_frames], 
-                    label=param_name,
-                    color=color,
-                    linewidth=2
-                )
-        
-        # Add legend
-        parameter_ax.legend(loc='upper right', fontsize='small')
-        parameter_ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(f'{save_dir}/epoch_{epoch}_batch_{batch_idx}.png')
@@ -299,7 +225,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
         
         # Forward pass
         optimizer.zero_grad()
-        wave, expressive_params, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
+        wave, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
         
         # Compute combined loss
         loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
@@ -342,7 +268,7 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
             target_audio = extract_audio_from_dataset(batch, device)
             
             # Forward pass
-            wave, expressive_params, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
+            wave, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
             
             # Compute combined loss
             loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
@@ -355,13 +281,7 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
             if visualize and batch_idx == 0:
                 # Regular visualization with parameters and latent_mel
                 visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
-                                 expressive_params, latent_mel, save_dir='visuals/decoder/val')
-                
-                # Dedicated parameter visualization with waveform
-                visualize_expressive_params_with_waveform(
-                    epoch, batch_idx, wave, expressive_params, 
-                    save_dir='visuals/decoder/params'
-                )
+                                 latent_mel, save_dir='visuals/decoder/val')
         
         avg_loss = total_loss / len(dataloader)
         avg_mel_loss = total_mel_loss / len(dataloader)
@@ -381,14 +301,14 @@ def main():
     os.makedirs('checkpoints', exist_ok=True)
     
     # Load dataset
-    batch_size = 16  # Smaller batch size for complex model
+    batch_size = 32  # Smaller batch size for complex model
     num_epochs = 500
-    visualization_interval = 5  # Visualize every 5 epochs
+    visualization_interval = 10  # Visualize every 5 epochs
 
     train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
         batch_size=batch_size,
         num_workers=1,
-        train_files=100,
+        train_files=200,
         val_files=10,
         device=device,
         context_window_sec=2,  # 2-second window
@@ -437,7 +357,7 @@ def main():
     ).to(device)
     
     # Optimizer
-    optimizer = optim.Adam(model.parameters(), lr=0.002)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
     
     # Learning rate scheduler - reduce LR when loss plateaus
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
