@@ -110,7 +110,7 @@ class SVS(nn.Module):
             initial_phase: Optional initial phase for the harmonic oscillator
             
         Returns:
-            Audio signal [B, T*hop_length], expressive parameters dict
+            Audio signal [B, T*hop_length], predicted_mel, and vocal parameters dict
         """
         batch_size, n_frames = f0.shape[0], f0.shape[1]
         
@@ -185,5 +185,19 @@ class SVS(nn.Module):
         
         signal = harmonic + noise
         
-        # Return both the audio output and the expressive parameters
-        return signal, predicted_mel
+        # Create dictionary of vocal parameters
+        vocal_params = {
+            # Harmonic filter parameters
+            'harmonic_articulation': ctrls['harmonic_articulation'],
+            'harmonic_presence_amount': ctrls['harmonic_presence_amount'],
+            'harmonic_exciter_amount': ctrls['harmonic_exciter_amount'],
+            'harmonic_breathiness': ctrls['harmonic_breathiness'],
+            # Noise filter parameters
+            'noise_articulation': ctrls['noise_articulation'],
+            'noise_presence_amount': ctrls['noise_presence_amount'],
+            'noise_exciter_amount': ctrls['noise_exciter_amount'],
+            'noise_breathiness': ctrls['noise_breathiness']
+        }
+        
+        # Return audio signal, predicted mel, and vocal parameters
+        return signal, predicted_mel, vocal_params

@@ -36,16 +36,15 @@ def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
         predicted_mel: Reconstructed mel spectrogram
         wave: Predicted waveform
         target_audio: Target audio waveform
-        expressive_params: Dictionary of expressive parameters
         latent_mel: Latent mel representation from model
         save_dir: Directory to save visualizations
     """
     # Determine number of subplots based on whether latent_mel is provided
-    n_plots = 5 if latent_mel is not None else 4
+    n_plots = 4
     
     # Create figure with subplots
     fig, ax = plt.subplots(n_plots, 1, figsize=(12, 4 * n_plots), 
-                          gridspec_kw={'height_ratios': [1, 1, 1, 1.5, 1.5] if latent_mel is not None else [1, 1, 1.5, 1.5]})
+                          gridspec_kw={'height_ratios': [1, 1, 1, 1.5] })
     
     # Plot original mel
     if mel.dim() == 3 and mel.size(1) == N_MELS:
@@ -106,13 +105,13 @@ def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
 
 def visualize_expressive_params_with_waveform(epoch, batch_idx, wave, params, save_dir='visuals/decoder/params'):
     """
-    Create a dedicated visualization for expressive parameters overlaid on the waveform
+    Create a dedicated visualization for vocal filter parameters overlaid on the waveform
     
     Args:
         epoch: Current epoch number
         batch_idx: Current batch index
         wave: Predicted waveform
-        params: Dictionary of expressive parameters
+        params: Dictionary of vocal filter parameters
         save_dir: Directory to save visualizations
     """
     if params is None:
@@ -139,24 +138,26 @@ def visualize_expressive_params_with_waveform(epoch, batch_idx, wave, params, sa
     ax2.tick_params(axis='y', labelcolor='red')
     
     # Create frame-level time axis for parameters
-    n_frames = params['vibrato_rate'].shape[1]
+    n_frames = params['harmonic_articulation'].shape[1]
     frame_time = np.arange(n_frames) * HOP_LENGTH / SAMPLE_RATE
     
-    # Parameters to plot with colors and line styles
+    # Parameters to plot with colors and line styles - updated for vocal filter parameters
     param_config = {
-        'vibrato_rate': {'color': 'red', 'linestyle': '-', 'linewidth': 2},
-        'vibrato_depth': {'color': 'orange', 'linestyle': '-', 'linewidth': 2},
-        'vibrato_phase': {'color': 'purple', 'linestyle': '--', 'linewidth': 2},
-        'breathiness': {'color': 'brown', 'linestyle': '-.', 'linewidth': 2},
-        'tension': {'color': 'magenta', 'linestyle': ':', 'linewidth': 2.5},
-        'vocal_fry': {'color': 'cyan', 'linestyle': '-', 'linewidth': 2}
+        'harmonic_articulation': {'color': 'red', 'linestyle': '-', 'linewidth': 2},
+        'harmonic_presence_amount': {'color': 'orange', 'linestyle': '-', 'linewidth': 2},
+        'harmonic_exciter_amount': {'color': 'green', 'linestyle': '--', 'linewidth': 2},
+        'harmonic_breathiness': {'color': 'purple', 'linestyle': '-.', 'linewidth': 2},
+        'noise_articulation': {'color': 'brown', 'linestyle': ':', 'linewidth': 2},
+        'noise_presence_amount': {'color': 'magenta', 'linestyle': '-', 'linewidth': 2.5},
+        'noise_exciter_amount': {'color': 'cyan', 'linestyle': '--', 'linewidth': 2},
+        'noise_breathiness': {'color': 'black', 'linestyle': '-.', 'linewidth': 2}
     }
     
     # Plot each parameter
     for param_name, style in param_config.items():
         if param_name in params:
             # Extract parameter values for the first batch example
-            param_values = params[param_name][0].detach().cpu().numpy()
+            param_values = torch.sigmoid(params[param_name][0]).detach().cpu().numpy()
             
             # Reshape if needed
             if len(param_values.shape) > 1:
@@ -176,7 +177,7 @@ def visualize_expressive_params_with_waveform(epoch, batch_idx, wave, params, sa
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize='medium')
     
-    ax1.set_title(f'Expressive Parameters vs Waveform (Epoch {epoch}, Batch {batch_idx})')
+    ax1.set_title(f'Vocal Filter Parameters vs Waveform (Epoch {epoch}, Batch {batch_idx})')
     ax1.grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -226,7 +227,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
         
         # Forward pass
         optimizer.zero_grad()
-        wave, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
+        wave, latent_mel, vocal_params = model(f0, phoneme_seq, singer_id, language_id)
         
         # Compute combined loss
         loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
@@ -242,6 +243,10 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
         total_loss += loss.item()
         total_mel_loss += mel_loss.item()
         total_stft_loss += stft_loss.item()
+        
+        # Visualize parameters occasionally during training
+        if batch_idx == 0 and epoch % 20 == 0:
+            visualize_expressive_params_with_waveform(epoch, batch_idx, wave, vocal_params)
     
     avg_loss = total_loss / len(dataloader)
     avg_mel_loss = total_mel_loss / len(dataloader)
@@ -269,7 +274,7 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
             target_audio = extract_audio_from_dataset(batch, device)
             
             # Forward pass
-            wave, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
+            wave, latent_mel, vocal_params = model(f0, phoneme_seq, singer_id, language_id)
             
             # Compute combined loss
             loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
@@ -283,6 +288,10 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
                 # Regular visualization with parameters and latent_mel
                 visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
                                  latent_mel, save_dir='visuals/decoder/val')
+                                 
+                # Visualize vocal parameters
+                visualize_expressive_params_with_waveform(epoch, batch_idx, wave, vocal_params, 
+                                                       save_dir='visuals/decoder/params')
         
         avg_loss = total_loss / len(dataloader)
         avg_mel_loss = total_mel_loss / len(dataloader)
@@ -302,15 +311,15 @@ def main():
     os.makedirs('checkpoints', exist_ok=True)
     
     # Load dataset
-    batch_size = 32  # Smaller batch size for complex model
+    batch_size = 64  # Smaller batch size for complex model
     num_epochs = 1000
-    visualization_interval = 20  # Visualize every 5 epochs
+    visualization_interval = 20  # Visualize every 20 epochs
 
     train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
         batch_size=batch_size,
         num_workers=1,
-        train_files=None,
-        val_files=30,
+        train_files=50,
+        val_files=50,
         device=device,
         context_window_sec=2,  # 2-second window
         persistent_workers=True
