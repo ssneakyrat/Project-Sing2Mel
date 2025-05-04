@@ -168,9 +168,9 @@ class SVS(nn.Module):
             exciter_amount=harmonic_exciter_amount,
             breathiness=harmonic_breathiness
         )
-        
+
         # noise part
-        noise = self.noise_generator( harmonic, noise_param )#torch.rand_like(harmonic+f0).to(noise_param) * 2 - 1
+        noise = self.noise_generator(harmonic, noise_param, pitch)
         noise = vocal_frequency_filter(
             noise, 
             noise_param, 
