@@ -7,125 +7,44 @@ import os
 from tqdm import tqdm
 import torchaudio
 import soundfile as sf
+
+from loss import DecoderLoss
 from dataset_decoder import get_dataloader, SAMPLE_RATE, N_MELS, HOP_LENGTH, WIN_LENGTH
 
-from mel_decoder import MelDecoder
+from svs import SVS
 
 # Create visuals folder if it doesn't exist
 os.makedirs('visuals', exist_ok=True)
 os.makedirs('visuals/decoder', exist_ok=True)
 os.makedirs('audio_samples', exist_ok=True)
-
-class DecoderLoss(nn.Module):
-    """Combined loss function for mel decoder including STFT loss"""
-    def __init__(self, stft_loss_weight=0.5, mel_loss_weight=0.5, 
-                 stft_n_ffts=[512, 1024, 2048], stft_hop_lengths=[50, 120, 240], 
-                 stft_win_lengths=[240, 600, 1200]):
-        super().__init__()
-        self.stft_loss_weight = stft_loss_weight
-        self.mel_loss_weight = mel_loss_weight
-        
-        # Mel loss
-        self.mel_criterion = nn.L1Loss()
-        
-        # Multi-resolution STFT loss components
-        self.stft_n_ffts = stft_n_ffts
-        self.stft_hop_lengths = stft_hop_lengths
-        self.stft_win_lengths = stft_win_lengths
-        
-        self.stft_mag_criterion = nn.L1Loss()
-        
-    def compute_stft_loss(self, predicted_audio, target_audio):
-        """Compute multi-resolution STFT loss"""
-        stft_loss = 0.0
-        
-        for n_fft, hop_length, win_length in zip(self.stft_n_ffts, self.stft_hop_lengths, self.stft_win_lengths):
-            # Compute STFT for predicted audio
-            pred_stft = torch.stft(
-                predicted_audio, 
-                n_fft=n_fft, 
-                hop_length=hop_length, 
-                win_length=win_length,
-                window=torch.hann_window(win_length).to(predicted_audio.device),
-                return_complex=True
-            )
-            
-            # Compute STFT for target audio
-            target_stft = torch.stft(
-                target_audio, 
-                n_fft=n_fft, 
-                hop_length=hop_length, 
-                win_length=win_length,
-                window=torch.hann_window(win_length).to(target_audio.device),
-                return_complex=True
-            )
-            
-            # Compute magnitude spectrogram
-            pred_mag = torch.abs(pred_stft)
-            target_mag = torch.abs(target_stft)
-            
-            if pred_mag.shape[2] > target_mag.shape[2]:
-                predicted_mel_aligned = pred_mag[:, :, :target_mag.shape[2]]
-                target_mel_aligned = target_mag
-            elif target_mag.shape[2] > pred_mag.shape[2]:
-                target_mel_aligned = target_mag[:, :, :pred_mag.shape[2]]
-                predicted_mel_aligned = pred_mag
-            else:
-                # Shapes are already the same
-                predicted_mel_aligned = pred_mag
-                target_mel_aligned = target_mag
-
-            # Magnitude loss
-            mag_loss = self.stft_mag_criterion(predicted_mel_aligned, target_mel_aligned)
-            
-            # Spectral convergence loss
-            sc_loss = torch.norm(target_mel_aligned - predicted_mel_aligned, p='fro') / torch.norm(target_mel_aligned, p='fro')
-            
-            stft_loss += mag_loss + sc_loss
-        
-        # Average over all resolutions
-        stft_loss /= len(self.stft_n_ffts)
-        return stft_loss
-    
-    def forward(self, predicted_audio, target_audio, mel_transform):
-        """Compute combined loss"""
-        # Compute mel spectrogram from predicted and target audio
-        # Add small epsilon to avoid log(0)
-        predicted_mel = torch.log(mel_transform(predicted_audio) + 1e-7)
-        target_mel = torch.log(mel_transform(target_audio) + 1e-7)
-        
-        if predicted_mel.shape[2] > target_mel.shape[2]:
-            predicted_mel_aligned = predicted_mel[:, :, :target_mel.shape[2]]
-            target_mel_aligned = target_mel
-        elif target_mel.shape[2] > predicted_mel.shape[2]:
-            target_mel_aligned = target_mel[:, :, :predicted_mel.shape[2]]
-            predicted_mel_aligned = predicted_mel
-        else:
-            # Shapes are already the same
-            predicted_mel_aligned = predicted_mel
-            target_mel_aligned = target_mel
-
-        # Mel spectrogram loss
-        mel_loss = self.mel_criterion(predicted_mel_aligned, target_mel_aligned)
-        
-        # Multi-resolution STFT loss
-        stft_loss = self.compute_stft_loss(predicted_audio, target_audio)
-        
-        # Combined loss
-        total_loss = (self.mel_loss_weight * mel_loss + 
-                     self.stft_loss_weight * stft_loss)
-        
-        return total_loss, mel_loss, stft_loss, predicted_mel
+os.makedirs('visuals/decoder/params', exist_ok=True)  # New folder for parameter visualization
 
 def extract_audio_from_dataset(batch, device):
     """Extract original audio from dataset"""
     # Simply get the audio from the batch and move it to the device
     return batch['audio'].to(device)
 
-def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, save_dir='visuals/decoder'):
-    """Visualize model outputs"""
-    # Create figure with 3 subplots
-    fig, ax = plt.subplots(3, 1, figsize=(10, 12))
+def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, latent_mel=None, save_dir='visuals/decoder'):
+    """
+    Visualize model outputs and expressive parameters
+    
+    Args:
+        epoch: Current epoch number
+        batch_idx: Current batch index
+        mel: Original mel spectrogram
+        predicted_mel: Reconstructed mel spectrogram
+        wave: Predicted waveform
+        target_audio: Target audio waveform
+        expressive_params: Dictionary of expressive parameters
+        latent_mel: Latent mel representation from model
+        save_dir: Directory to save visualizations
+    """
+    # Determine number of subplots based on whether latent_mel is provided
+    n_plots = 5 if latent_mel is not None else 4
+    
+    # Create figure with subplots
+    fig, ax = plt.subplots(n_plots, 1, figsize=(12, 4 * n_plots), 
+                          gridspec_kw={'height_ratios': [1, 1, 1, 1.5, 1.5] if latent_mel is not None else [1, 1, 1.5, 1.5]})
     
     # Plot original mel
     if mel.dim() == 3 and mel.size(1) == N_MELS:
@@ -134,7 +53,6 @@ def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
     else:
         # [B, T, n_mels] format
         mel_plot = mel[0].transpose(0, 1).detach().cpu().numpy()
-        
     
     ax[0].imshow(mel_plot, aspect='auto', origin='lower')
     ax[0].set_title('Original Mel Spectrogram')
@@ -144,27 +62,38 @@ def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
     ax[1].imshow(predicted_mel[0].detach().cpu().numpy(), aspect='auto', origin='lower')
     ax[1].set_title('Reconstructed Mel Spectrogram')
     ax[1].set_ylabel('Mel Bin')
+
+    # Plot original mel
+    if latent_mel.dim() == 3 and latent_mel.size(1) == N_MELS:
+        # [B, n_mels, T] format
+        latent_mel_plot = latent_mel[0].detach().cpu().numpy()
+    else:
+        # [B, T, n_mels] format
+        latent_mel_plot = latent_mel[0].transpose(0, 1).detach().cpu().numpy()
     
+    ax[2].imshow(latent_mel_plot, aspect='auto', origin='lower')
+    ax[2].set_title('latent Mel Spectrogram')
+    ax[2].set_ylabel('Mel Bin')
+    
+    # Plot waveforms
     wave_predicted = wave[0].detach().cpu().numpy()
     wave_target = target_audio[0].detach().cpu().numpy()
 
     # Plot waveforms
-    time = np.arange(wave.shape[1]) / SAMPLE_RATE
-
-    # Find the minimum length       
     min_len = min(wave_predicted.shape[0], wave_target.shape[0])
     
     # Trim both arrays to the minimum length
     wave_predicted_aligned = wave_predicted[:min_len]
     wave_target_aligned = wave_target[:min_len]
-    time = time[:min_len]
+    time = np.arange(min_len) / SAMPLE_RATE
 
-    ax[2].plot(time, wave_predicted_aligned, label='Predicted')
-    ax[2].plot(time, wave_target_aligned, alpha=0.5, label='Target')
-    ax[2].set_title('Waveform Comparison')
-    ax[2].set_xlabel('Time (s)')
-    ax[2].set_ylabel('Amplitude')
-    ax[2].legend()
+    waveform_idx = 3 if latent_mel is not None else 2
+    ax[waveform_idx].plot(time, wave_predicted_aligned, label='Predicted', color='blue', alpha=0.7)
+    ax[waveform_idx].plot(time, wave_target_aligned, label='Target', color='green', alpha=0.5)
+    ax[waveform_idx].set_title('Waveform Comparison')
+    ax[waveform_idx].set_xlabel('Time (s)')
+    ax[waveform_idx].set_ylabel('Amplitude')
+    ax[waveform_idx].legend(loc='upper right')
     
     plt.tight_layout()
     plt.savefig(f'{save_dir}/epoch_{epoch}_batch_{batch_idx}.png')
@@ -173,6 +102,85 @@ def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
     # Save audio samples
     save_audio(wave[0].detach().cpu().numpy(), f'audio_samples/epoch_{epoch}_batch_{batch_idx}_pred.wav')
     save_audio(target_audio[0].detach().cpu().numpy(), f'audio_samples/epoch_{epoch}_batch_{batch_idx}_target.wav')
+
+def visualize_expressive_params_with_waveform(epoch, batch_idx, wave, params, save_dir='visuals/decoder/params'):
+    """
+    Create a dedicated visualization for expressive parameters overlaid on the waveform
+    
+    Args:
+        epoch: Current epoch number
+        batch_idx: Current batch index
+        wave: Predicted waveform
+        params: Dictionary of expressive parameters
+        save_dir: Directory to save visualizations
+    """
+    if params is None:
+        return
+    
+    # Create figure with a single plot
+    fig, ax1 = plt.subplots(figsize=(12, 8))
+    
+    # Convert waveform to numpy array
+    wave_np = wave[0].detach().cpu().numpy()
+    
+    # Create time axis for waveform
+    sample_time = np.arange(len(wave_np)) / SAMPLE_RATE
+    
+    # Plot waveform
+    ax1.plot(sample_time, wave_np, color='blue', alpha=0.4, label='Waveform')
+    ax1.set_xlabel('Time (s)')
+    ax1.set_ylabel('Amplitude', color='blue')
+    ax1.tick_params(axis='y', labelcolor='blue')
+    
+    # Create a second y-axis for parameters
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('Parameter Value', color='red')
+    ax2.tick_params(axis='y', labelcolor='red')
+    
+    # Create frame-level time axis for parameters
+    n_frames = params['vibrato_rate'].shape[1]
+    frame_time = np.arange(n_frames) * HOP_LENGTH / SAMPLE_RATE
+    
+    # Parameters to plot with colors and line styles
+    param_config = {
+        'vibrato_rate': {'color': 'red', 'linestyle': '-', 'linewidth': 2},
+        'vibrato_depth': {'color': 'orange', 'linestyle': '-', 'linewidth': 2},
+        'vibrato_phase': {'color': 'purple', 'linestyle': '--', 'linewidth': 2},
+        'breathiness': {'color': 'brown', 'linestyle': '-.', 'linewidth': 2},
+        'tension': {'color': 'magenta', 'linestyle': ':', 'linewidth': 2.5},
+        'vocal_fry': {'color': 'cyan', 'linestyle': '-', 'linewidth': 2}
+    }
+    
+    # Plot each parameter
+    for param_name, style in param_config.items():
+        if param_name in params:
+            # Extract parameter values for the first batch example
+            param_values = params[param_name][0].detach().cpu().numpy()
+            
+            # Reshape if needed
+            if len(param_values.shape) > 1:
+                param_values = param_values.flatten()
+            
+            # Use only up to n_frames points
+            display_frames = min(len(frame_time), len(param_values))
+            ax2.plot(
+                frame_time[:display_frames], 
+                param_values[:display_frames], 
+                label=param_name,
+                **style
+            )
+    
+    # Add legend for all lines
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize='medium')
+    
+    ax1.set_title(f'Expressive Parameters vs Waveform (Epoch {epoch}, Batch {batch_idx})')
+    ax1.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f'{save_dir}/params_epoch_{epoch}_batch_{batch_idx}.png')
+    plt.close()
 
 def save_audio(waveform, path, sample_rate=SAMPLE_RATE):
     """Save audio waveform to file"""
@@ -217,7 +225,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
         
         # Forward pass
         optimizer.zero_grad()
-        wave = model(mel, f0, phoneme_seq, singer_id, language_id)
+        wave, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
         
         # Compute combined loss
         loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
@@ -260,7 +268,7 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
             target_audio = extract_audio_from_dataset(batch, device)
             
             # Forward pass
-            wave = model(mel, f0, phoneme_seq, singer_id, language_id)
+            wave, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
             
             # Compute combined loss
             loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
@@ -271,7 +279,9 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
             
             # Visualize only the first batch if requested
             if visualize and batch_idx == 0:
-                visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, save_dir='visuals/decoder/val')
+                # Regular visualization with parameters and latent_mel
+                visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
+                                 latent_mel, save_dir='visuals/decoder/val')
         
         avg_loss = total_loss / len(dataloader)
         avg_mel_loss = total_mel_loss / len(dataloader)
@@ -287,20 +297,22 @@ def main():
     # Create visualization directories
     os.makedirs('visuals/decoder', exist_ok=True)
     os.makedirs('visuals/decoder/val', exist_ok=True)
+    os.makedirs('visuals/decoder/params', exist_ok=True)
     os.makedirs('checkpoints', exist_ok=True)
     
     # Load dataset
-    batch_size = 16  # Smaller batch size for complex model
-    num_epochs = 500
+    batch_size = 32  # Smaller batch size for complex model
+    num_epochs = 1000
     visualization_interval = 10  # Visualize every 5 epochs
 
     train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
         batch_size=batch_size,
-        num_workers=4,
-        train_files=50,
+        num_workers=1,
+        train_files=200,
         val_files=10,
         device=device,
-        context_window_sec=2  # 2-second window
+        context_window_sec=2,  # 2-second window
+        persistent_workers=True
     )
     
     # Get dataset parameters
@@ -309,14 +321,13 @@ def main():
     num_languages = len(train_dataset.language_map)
     
     # Create model
-    model = MelDecoder(
+    model = SVS(
         num_phonemes=num_phonemes,
         num_singers=num_singers,
         num_languages=num_languages,
         n_mels=N_MELS,
         hop_length=HOP_LENGTH,
-        sample_rate=SAMPLE_RATE,
-        num_harmonics=100
+        sample_rate=SAMPLE_RATE
     ).to(device)
     
     # Print model info
