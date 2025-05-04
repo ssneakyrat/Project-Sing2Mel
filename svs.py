@@ -5,8 +5,6 @@ import numpy as np
 
 from encoder.mel_encoder import MelEncoder
 from decoder.feature_extractor import FeatureExtractor
-from decoder.expressive_control import ExpressiveControl  # Import parameter predictor
-from decoder.signal_processor import SignalProcessor  # Import new signal processor
 from decoder.wave_generator_oscillator import WaveGeneratorOscillator
 from decoder.core import scale_function, frequency_filter, upsample
 from decoder.human_vocal_filter import vocal_frequency_filter
@@ -151,7 +149,7 @@ class SVS(nn.Module):
             formant_emphasis=True,
             vocal_range_boost=True
         )
-        
+
         signal = harmonic + noise
         
         # Return both the audio output and the expressive parameters
