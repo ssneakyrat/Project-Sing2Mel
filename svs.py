@@ -138,7 +138,9 @@ class SVS(nn.Module):
             gender="neutral",
             formant_emphasis=True,
             vocal_range_boost=True,
-            articulation=0.3
+            articulation=0.3,
+            presence_amount=0.8,
+            exciter_amount=0.8
         )
 
         # noise part

@@ -15,7 +15,9 @@ class HumanVocalFilter(nn.Module):
                  vocal_range_boost=True,
                  breathiness=0.3,
                  gender="neutral",
-                 articulation=0.5):    # 0.0 (staccato) to 1.0 (legato)
+                 articulation=0.5,    # 0.0 (staccato) to 1.0 (legato)
+                 presence_amount=0.5,  # NEW: Controls presence/brilliance (4-8kHz)
+                 exciter_amount=0.3):  # NEW: Controls harmonic excitement for high freqs
         super(HumanVocalFilter, self).__init__()
         
         self.sample_rate = sample_rate
@@ -23,7 +25,9 @@ class HumanVocalFilter(nn.Module):
         self.vocal_range_boost = vocal_range_boost
         self.breathiness = breathiness
         self.gender = gender
-        self.articulation = articulation  # New parameter for articulation control
+        self.articulation = articulation
+        self.presence_amount = presence_amount  # NEW
+        self.exciter_amount = exciter_amount    # NEW
         
         # Initialize formant regions (in Hz) - average values that can be adjusted
         # Format: (F1, F2, F3, F4)
@@ -434,19 +438,105 @@ class HumanVocalFilter(nn.Module):
         
         return smoothed_mags
     
+    # NEW: Presence/Brilliance Control implementation
+    def _apply_presence_enhancement(self, magnitudes):
+        """
+        Enhance the 'presence' range (4-8 kHz) for vocal clarity and brilliance.
+        
+        This frequency range is critical for vocal intelligibility and the perceived
+        "brightness" or "air" in the vocal. Enhancing this range can make vocals cut
+        through a mix better and sound more professional and detailed.
+        
+        Args:
+            magnitudes: Magnitude spectrum [batch, n_frames, n_frequencies]
+            
+        Returns:
+            Modified magnitude spectrum with enhanced presence
+        """
+        # Skip if presence amount is zero
+        if self.presence_amount <= 0:
+            return magnitudes
+        
+        # Get shape information
+        batch_size, n_frames, n_frequencies = magnitudes.shape
+        
+        # Create frequency axis
+        freq_axis = torch.linspace(0, self.nyquist, n_frequencies, device=magnitudes.device)
+        
+        # Create presence band emphasis - centered around 6kHz with width of 2kHz
+        # This covers the critical 4-8kHz range for vocal presence
+        presence_center = 6000  # Hz
+        presence_width = 2000   # Hz
+        
+        # Create a bell curve for the presence range using Gaussian function
+        presence_mask = torch.exp(-0.5 * ((freq_axis - presence_center) / presence_width)**2)
+        
+        # Scale by presence amount and normalize
+        presence_mask = self.presence_amount * presence_mask / presence_mask.max()
+        
+        # Add to unity gain (1.0 + boost)
+        presence_mask = 1.0 + presence_mask
+        
+        # Expand mask to match magnitudes shape
+        presence_mask = presence_mask.unsqueeze(0).unsqueeze(0).expand_as(magnitudes)
+        
+        # Apply the presence enhancement to magnitudes
+        enhanced_magnitudes = magnitudes * presence_mask
+        
+        return enhanced_magnitudes
+    
+    # NEW: Harmonic Exciter implementation
+    def _apply_harmonic_exciter(self, magnitudes):
+        """
+        Add controlled harmonic distortion for high frequencies to add "sparkle".
+        
+        This works by applying a subtle non-linear waveshaping to high frequencies,
+        which generates harmonic content and adds detail and excitement to the
+        high end of the spectrum without harshness.
+        
+        Args:
+            magnitudes: Magnitude spectrum [batch, n_frames, n_frequencies]
+            
+        Returns:
+            Modified magnitude spectrum with added harmonic excitement
+        """
+        # Skip if exciter amount is zero
+        if self.exciter_amount <= 0:
+            return magnitudes
+        
+        # Get shape information
+        batch_size, n_frames, n_frequencies = magnitudes.shape
+        
+        # Create frequency axis
+        freq_axis = torch.linspace(0, self.nyquist, n_frequencies, device=magnitudes.device)
+        
+        # Create high-frequency mask - only affect frequencies above 7kHz
+        # Use sigmoid for smooth transition
+        high_freq_mask = 1.0 / (1.0 + torch.exp(-(freq_axis - 7000) * 0.005))
+        
+        # Apply soft waveshaping (tanh) to create subtle harmonics
+        # The tanh function adds odd harmonics in a musical way
+        excitement = torch.tanh(magnitudes * 3.0) * magnitudes
+        
+        # Scale by high frequency mask and exciter amount
+        scaled_excitement = self.exciter_amount * high_freq_mask.unsqueeze(0).unsqueeze(0) * excitement
+        
+        # Blend with original signal (original + excitement)
+        excited_magnitudes = magnitudes + scaled_excitement
+        
+        return excited_magnitudes
+    
     def _enhance_magnitudes(self, magnitudes):
         """Apply all vocal enhancements to magnitude spectrum."""
-        # Apply formant emphasis
+        # Apply original enhancements
         magnitudes = self._apply_formant_emphasis(magnitudes)
-        
-        # Apply vocal range boost
         magnitudes = self._apply_vocal_range_boost(magnitudes)
-        
-        # Apply breathiness
         magnitudes = self._apply_breathiness(magnitudes)
-        
-        # Apply articulation control
         magnitudes = self._apply_articulation(magnitudes)
+        
+        # Apply new enhancements
+        magnitudes = self._apply_presence_enhancement(magnitudes)
+        magnitudes = self._apply_harmonic_exciter(magnitudes)
         
         return magnitudes
     
@@ -482,7 +572,8 @@ class HumanVocalFilter(nn.Module):
 def vocal_frequency_filter(audio, magnitudes, window_size=0, padding='same', 
                           gender="neutral", formant_emphasis=True, 
                           vocal_range_boost=True, breathiness=0.3,
-                          sample_rate=24000, articulation=0.5):
+                          sample_rate=24000, articulation=0.5,
+                          presence_amount=0.5, exciter_amount=0.3):  # NEW parameters
     """
     A drop-in replacement for frequency_filter that specializes in human vocals.
     
@@ -501,6 +592,10 @@ def vocal_frequency_filter(audio, magnitudes, window_size=0, padding='same',
                       0.0 = Very staccato (sharp, detached notes)
                       0.5 = Neutral articulation
                       1.0 = Very legato (smooth, connected notes)
+        presence_amount: Amount of presence/brilliance enhancement (0.0 to 1.0)
+                         for the 4-8kHz range. Higher values make vocals more present.
+        exciter_amount: Amount of harmonic excitement (0.0 to 1.0) for high frequencies
+                        to add "sparkle" and detail. Higher values add more harmonics.
         
     Returns:
         Filtered audio optimized for vocal characteristics.
@@ -512,7 +607,9 @@ def vocal_frequency_filter(audio, magnitudes, window_size=0, padding='same',
         vocal_range_boost=vocal_range_boost,
         breathiness=breathiness,
         gender=gender,
-        articulation=articulation
+        articulation=articulation,
+        presence_amount=presence_amount,  # NEW
+        exciter_amount=exciter_amount     # NEW
     ).to(audio.device)
     
     # Apply the filter
