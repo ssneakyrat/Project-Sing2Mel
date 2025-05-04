@@ -14,6 +14,7 @@ from dataset_decoder import get_dataloader, SAMPLE_RATE, N_MELS, HOP_LENGTH, WIN
 from svs import SVS
 
 # Create visuals folder if it doesn't exist
+os.makedirs('checkpoints', exist_ok=True)
 os.makedirs('visuals', exist_ok=True)
 os.makedirs('visuals/decoder', exist_ok=True)
 os.makedirs('audio_samples', exist_ok=True)
@@ -303,13 +304,13 @@ def main():
     # Load dataset
     batch_size = 32  # Smaller batch size for complex model
     num_epochs = 1000
-    visualization_interval = 10  # Visualize every 5 epochs
+    visualization_interval = 20  # Visualize every 5 epochs
 
     train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
         batch_size=batch_size,
         num_workers=1,
-        train_files=200,
-        val_files=10,
+        train_files=None,
+        val_files=30,
         device=device,
         context_window_sec=2,  # 2-second window
         persistent_workers=True
