@@ -8,7 +8,7 @@ from decoder.feature_extractor import FeatureExtractor
 from decoder.wave_generator_oscillator import WaveGeneratorOscillator
 from decoder.core import scale_function, frequency_filter, upsample
 from decoder.human_vocal_filter import vocal_frequency_filter
-
+from decoder.noise_generator import NoiseGenerator
 
 # Modified SVS class with MelEncoder integration
 class SVS(nn.Module):
@@ -87,6 +87,8 @@ class SVS(nn.Module):
             amplitudes=self.harmonic_amplitudes,
             ratio=self.ratio)
         
+        self.noise_generator = NoiseGenerator()
+
         # Initialize mel encoder
         self.mel_encoder = MelEncoder(
             n_mels=n_mels,
@@ -166,9 +168,9 @@ class SVS(nn.Module):
             exciter_amount=harmonic_exciter_amount,
             breathiness=harmonic_breathiness
         )
-
+        
         # noise part
-        noise = torch.rand_like(harmonic).to(noise_param) * 2 - 1
+        noise = self.noise_generator( harmonic, noise_param )#torch.rand_like(harmonic+f0).to(noise_param) * 2 - 1
         noise = vocal_frequency_filter(
             noise, 
             noise_param, 
