@@ -135,9 +135,10 @@ class SVS(nn.Module):
         harmonic = vocal_frequency_filter(
             harmonic, 
             src_param, 
-            gender="neutral",  # Or dynamically set based on singer
+            gender="neutral",
             formant_emphasis=True,
-            vocal_range_boost=True
+            vocal_range_boost=True,
+            articulation=0.3
         )
 
         # noise part
@@ -147,9 +148,10 @@ class SVS(nn.Module):
             noise_param, 
             gender="neutral",  # Or dynamically set based on singer
             formant_emphasis=True,
-            vocal_range_boost=True
+            vocal_range_boost=True,
+            articulation=0.7
         )
-
+        
         signal = harmonic + noise
         
         # Return both the audio output and the expressive parameters

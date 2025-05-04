@@ -14,7 +14,8 @@ class HumanVocalFilter(nn.Module):
                  formant_emphasis=True,
                  vocal_range_boost=True,
                  breathiness=0.3,
-                 gender="neutral"):
+                 gender="neutral",
+                 articulation=0.5):    # 0.0 (staccato) to 1.0 (legato)
         super(HumanVocalFilter, self).__init__()
         
         self.sample_rate = sample_rate
@@ -22,6 +23,7 @@ class HumanVocalFilter(nn.Module):
         self.vocal_range_boost = vocal_range_boost
         self.breathiness = breathiness
         self.gender = gender
+        self.articulation = articulation  # New parameter for articulation control
         
         # Initialize formant regions (in Hz) - average values that can be adjusted
         # Format: (F1, F2, F3, F4)
@@ -313,6 +315,125 @@ class HumanVocalFilter(nn.Module):
         
         return breathy_magnitudes
     
+    def _apply_articulation(self, magnitudes):
+        """
+        Apply articulation control to the magnitude spectrum.
+        
+        Articulation affects how notes transition and the onset/offset characteristics:
+        - Low articulation (staccato): sharper attacks, quicker decays
+        - High articulation (legato): smoother transitions, longer sustains
+        
+        Args:
+            magnitudes: Magnitude spectrum [batch, n_frames, n_frequencies]
+            
+        Returns:
+            Modified magnitude spectrum with articulation effects
+        """
+        # Skip if articulation is at neutral setting (0.5)
+        if abs(self.articulation - 0.5) < 0.01:
+            return magnitudes
+        
+        # Get shape information
+        batch_size, n_frames, n_frequencies = magnitudes.shape
+        
+        if n_frames <= 1:
+            return magnitudes  # No articulation possible with single frame
+        
+        # Create a temporal smoothing kernel based on articulation level
+        # Higher articulation (legato) = more smoothing across frames
+        kernel_size = min(n_frames, max(3, int(self.articulation * 9)))
+        if kernel_size % 2 == 0:  # Make sure kernel size is odd
+            kernel_size += 1
+            
+        # Create smoothing kernel - more weight in center for neutral articulation
+        # More uniform for legato, more centered for staccato
+        if self.articulation > 0.5:  # Legato - smoother transitions
+            # Create a smoother kernel for legato
+            alpha = (self.articulation - 0.5) * 2  # Map 0.5-1.0 to 0.0-1.0
+            sigma = 0.5 + 1.5 * alpha  # Larger sigma = more smoothing
+            
+            # Gaussian kernel for smooth transitions
+            kernel = torch.zeros(kernel_size, device=magnitudes.device)
+            center = kernel_size // 2
+            for i in range(kernel_size):
+                kernel[i] = math.exp(-0.5 * ((i - center) / sigma) ** 2)
+            kernel = kernel / kernel.sum()  # Normalize
+            
+        else:  # Staccato - sharper transitions
+            # Create a more peaked kernel for staccato
+            alpha = (0.5 - self.articulation) * 2  # Map 0.0-0.5 to 1.0-0.0
+            exponent = 1.0 + 4.0 * alpha  # Higher exponent = more peaked
+            
+            # Power function kernel for sharper transitions
+            kernel = torch.zeros(kernel_size, device=magnitudes.device)
+            center = kernel_size // 2
+            for i in range(kernel_size):
+                # Create a peaked distribution
+                norm_dist = abs(i - center) / (kernel_size // 2)
+                kernel[i] = (1.0 - norm_dist) ** exponent
+            kernel = kernel / kernel.sum()  # Normalize
+        
+        # Reshape kernel for 1D convolution along time dimension
+        kernel = kernel.view(1, 1, kernel_size)
+        
+        # Apply different smoothing strategies based on frequency bands
+        # Low frequencies (fundamentals) - preserve more attack/decay characteristics
+        # High frequencies (harmonics/transients) - more affected by articulation
+        
+        # Create frequency band weights - higher frequencies more affected by articulation
+        freq_weights = torch.linspace(0.5, 1.0, n_frequencies, device=magnitudes.device)
+        
+        # Apply temporal smoothing to each frequency band
+        smoothed_mags = torch.zeros_like(magnitudes)
+        
+        # Process each batch item separately
+        for b in range(batch_size):
+            # Prepare 3D input for conv1d: [channels, frequency, time]
+            # We process each frequency band as a separate channel
+            mag_for_conv = magnitudes[b].permute(1, 0).unsqueeze(1)  # [n_frequencies, 1, n_frames]
+            
+            # Apply 1D convolution along time dimension
+            # Use 'same' padding to maintain frame count
+            padding = kernel_size // 2
+            smoothed = F.conv1d(mag_for_conv, kernel, padding=padding)
+            
+            # Reshape back to original dimensions
+            smoothed = smoothed.squeeze(1).permute(1, 0)  # [n_frames, n_frequencies]
+            
+            # Blend original and smoothed based on frequency-dependent weights
+            # and overall articulation parameter
+            # High articulation = more smoothing, especially for high frequencies
+            blend_factor = freq_weights.unsqueeze(0)  # [1, n_frequencies]
+            
+            # Apply the articulation effect
+            smoothed_mags[b] = magnitudes[b] * (1 - blend_factor) + smoothed * blend_factor
+        
+        # Apply attack and decay modifications based on articulation
+        if self.articulation < 0.5:  # Staccato - enhance attack, shorten decay
+            # Calculate the amount of attack/decay modification
+            mod_factor = (0.5 - self.articulation) * 2  # 0.0-0.5 → 0.0-1.0
+            
+            # Create attack emphasis (first few frames)
+            attack_frames = max(1, int(n_frames * 0.1))  # Use 10% of frames for attack
+            if attack_frames > 1:
+                attack_curve = torch.linspace(1.0 + mod_factor, 1.0, attack_frames, device=magnitudes.device)
+                attack_curve = attack_curve.unsqueeze(0).unsqueeze(2)  # [1, attack_frames, 1]
+                
+                # Apply attack emphasis
+                smoothed_mags[:, :attack_frames, :] *= attack_curve
+            
+            # Create decay shortening (later frames)
+            decay_start = max(attack_frames, int(n_frames * 0.5))  # Start decay at 50% of frames
+            if decay_start < n_frames - 1:
+                decay_length = n_frames - decay_start
+                decay_curve = torch.linspace(1.0, 1.0 - 0.7 * mod_factor, decay_length, device=magnitudes.device)
+                decay_curve = decay_curve.unsqueeze(0).unsqueeze(2)  # [1, decay_length, 1]
+                
+                # Apply decay shortening
+                smoothed_mags[:, decay_start:, :] *= decay_curve
+        
+        return smoothed_mags
+    
     def _enhance_magnitudes(self, magnitudes):
         """Apply all vocal enhancements to magnitude spectrum."""
         # Apply formant emphasis
@@ -323,6 +444,9 @@ class HumanVocalFilter(nn.Module):
         
         # Apply breathiness
         magnitudes = self._apply_breathiness(magnitudes)
+        
+        # Apply articulation control
+        magnitudes = self._apply_articulation(magnitudes)
         
         return magnitudes
     
@@ -358,7 +482,7 @@ class HumanVocalFilter(nn.Module):
 def vocal_frequency_filter(audio, magnitudes, window_size=0, padding='same', 
                           gender="neutral", formant_emphasis=True, 
                           vocal_range_boost=True, breathiness=0.3,
-                          sample_rate=24000):
+                          sample_rate=24000, articulation=0.5):
     """
     A drop-in replacement for frequency_filter that specializes in human vocals.
     
@@ -373,6 +497,10 @@ def vocal_frequency_filter(audio, magnitudes, window_size=0, padding='same',
         vocal_range_boost: Whether to boost the vocal frequency range.
         breathiness: Amount of breathiness to add (0.0 to 1.0).
         sample_rate: Audio sample rate.
+        articulation: Amount of articulation control (0.0 to 1.0):
+                      0.0 = Very staccato (sharp, detached notes)
+                      0.5 = Neutral articulation
+                      1.0 = Very legato (smooth, connected notes)
         
     Returns:
         Filtered audio optimized for vocal characteristics.
@@ -383,7 +511,8 @@ def vocal_frequency_filter(audio, magnitudes, window_size=0, padding='same',
         formant_emphasis=formant_emphasis,
         vocal_range_boost=vocal_range_boost,
         breathiness=breathiness,
-        gender=gender
+        gender=gender,
+        articulation=articulation
     ).to(audio.device)
     
     # Apply the filter

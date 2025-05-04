@@ -40,13 +40,17 @@ class WaveGeneratorOscillator(nn.Module):
         phase  = torch.cumsum(2 * np.pi * f0 / self.fs, axis=1) + initial_phase
         phases = phase * torch.arange(1, self.n_harmonics + 1).to(phase)
         
+        '''
         # anti-aliasing
         amplitudes = self.amplitudes * self.ratio
         if self.is_remove_above_nyquist:
             amp = remove_above_nyquist(amplitudes.to(phase), f0, self.fs)
         else:
             amp = amplitudes.to(phase)
+        '''
         
+        amp = self.amplitudes.to(phase)
+
         # signal
         signal = (torch.sin(phases) * amp).sum(-1, keepdim=True)
         signal *= mask
