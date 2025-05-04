@@ -9,7 +9,7 @@ from decoder.expressive_control import ExpressiveControl  # Import parameter pre
 from decoder.signal_processor import SignalProcessor  # Import new signal processor
 from decoder.wave_generator_oscillator import WaveGeneratorOscillator
 from decoder.core import scale_function, frequency_filter, upsample
-
+from decoder.human_vocal_filter import vocal_frequency_filter
 
 
 # Modified SVS class with MelEncoder integration
@@ -134,15 +134,24 @@ class SVS(nn.Module):
 
         # harmonic
         harmonic, final_phase = self.harmonic_synthesizer(pitch, initial_phase)
-        harmonic = frequency_filter(
-                        harmonic,
-                        src_param)
+        harmonic = vocal_frequency_filter(
+            harmonic, 
+            src_param, 
+            gender="neutral",  # Or dynamically set based on singer
+            formant_emphasis=True,
+            vocal_range_boost=True
+        )
 
         # noise part
         noise = torch.rand_like(harmonic).to(noise_param) * 2 - 1
-        noise = frequency_filter(
-                        noise,
-                        noise_param)
+        noise = vocal_frequency_filter(
+            noise, 
+            noise_param, 
+            gender="neutral",  # Or dynamically set based on singer
+            formant_emphasis=True,
+            vocal_range_boost=True
+        )
+        
         signal = harmonic + noise
         
         # Return both the audio output and the expressive parameters
