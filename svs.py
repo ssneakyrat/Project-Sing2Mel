@@ -51,10 +51,20 @@ class SVS(nn.Module):
         self.register_buffer("sampling_rate", torch.tensor(sample_rate))
         self.register_buffer("block_size", torch.tensor(hop_length))
         
-        # Define feature extractor output splits
+        # Define feature extractor output splits with added vocal parameters
         split_map = {
             'harmonic_magnitude': num_mag_harmonic,
-            'noise_magnitude': num_mag_noise
+            'noise_magnitude': num_mag_noise,
+            # Harmonic filter parameters
+            'harmonic_articulation': 1,
+            'harmonic_presence_amount': 1,
+            'harmonic_exciter_amount': 1,
+            'harmonic_breathiness': 1,
+            # Noise filter parameters
+            'noise_articulation': 1,
+            'noise_presence_amount': 1,
+            'noise_exciter_amount': 1,
+            'noise_breathiness': 1
         }
 
         # Initialize feature extractor with proper dimensions
@@ -119,6 +129,19 @@ class SVS(nn.Module):
         # Process harmonic and noise parameters
         src_param = scale_function(ctrls['harmonic_magnitude'])
         noise_param = scale_function(ctrls['noise_magnitude'])
+        
+        # Apply sigmoid to constrain vocal filter parameters between 0 and 1
+        # Convert tensors to scalar values by taking the mean
+        # This is needed because vocal_frequency_filter expects scalar inputs
+        harmonic_articulation = torch.sigmoid(ctrls['harmonic_articulation']).mean().item()
+        harmonic_presence_amount = torch.sigmoid(ctrls['harmonic_presence_amount']).mean().item()
+        harmonic_exciter_amount = torch.sigmoid(ctrls['harmonic_exciter_amount']).mean().item() 
+        harmonic_breathiness = torch.sigmoid(ctrls['harmonic_breathiness']).mean().item()
+        
+        noise_articulation = torch.sigmoid(ctrls['noise_articulation']).mean().item()
+        noise_presence_amount = torch.sigmoid(ctrls['noise_presence_amount']).mean().item()
+        noise_exciter_amount = torch.sigmoid(ctrls['noise_exciter_amount']).mean().item()
+        noise_breathiness = torch.sigmoid(ctrls['noise_breathiness']).mean().item()
 
         # Use harmonic magnitude as conditioning for expressive control
         conditioning = ctrls['harmonic_magnitude']  # [B, T, 256]
@@ -138,9 +161,10 @@ class SVS(nn.Module):
             gender="neutral",
             formant_emphasis=True,
             vocal_range_boost=True,
-            articulation=0.3,
-            presence_amount=0.8,
-            exciter_amount=0.8
+            articulation=harmonic_articulation,
+            presence_amount=harmonic_presence_amount,
+            exciter_amount=harmonic_exciter_amount,
+            breathiness=harmonic_breathiness
         )
 
         # noise part
@@ -151,7 +175,10 @@ class SVS(nn.Module):
             gender="neutral",  # Or dynamically set based on singer
             formant_emphasis=True,
             vocal_range_boost=True,
-            articulation=0.7
+            articulation=noise_articulation,
+            presence_amount=noise_presence_amount,
+            exciter_amount=noise_exciter_amount,
+            breathiness=noise_breathiness
         )
         
         signal = harmonic + noise
