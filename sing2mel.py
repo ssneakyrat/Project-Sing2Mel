@@ -6,24 +6,10 @@ import numpy as np
 from decoder.core import upsample
 from decoder.wave_generator_oscillator import WaveGeneratorOscillator
 from encoder.mel_encoder import MelEncoder
+from encoder.noise_generator import NoiseGenerator
 
-# Noise conditioner network
-class NoiseConditioner(nn.Module):
-    def __init__(self, input_dim):
-        super(NoiseConditioner, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Sigmoid()  # Output between 0 and 1 to control noise magnitude
-        )
     
-    def forward(self, conditioning_features):
-        return self.network(conditioning_features)
-    
-# Modified SVS class with MelEncoder integration
+# Modified SVS class with MelEncoder integration and F0-conditioned noise
 class Sing2Mel(nn.Module):
     """
     Lightweight DDSP-based singing voice synthesis model with separated
@@ -83,8 +69,8 @@ class Sing2Mel(nn.Module):
             language_embed_dim=self.language_embed_dim
         )
         
-        # Initialize noise conditioner
-        self.noise_conditioner = NoiseConditioner(
+        # Initialize noise conditioner with F0 support
+        self.noise_conditioner = NoiseGenerator(
             self.phoneme_embed_dim + self.singer_embed_dim + self.language_embed_dim
         )
 
@@ -97,7 +83,6 @@ class Sing2Mel(nn.Module):
             phoneme_seq: Phoneme sequence [B, T] (indices)
             singer_id: Singer IDs [B] (indices)
             language_id: Language IDs [B] (indices)
-            mel: Optional mel-spectrogram [B, T, n_mels] (if None, it will be predicted)
             initial_phase: Optional initial phase for the harmonic oscillator
         """
         batch_size, n_frames = f0.shape[0], f0.shape[1]
@@ -124,8 +109,8 @@ class Sing2Mel(nn.Module):
         phoneme_features = phoneme_emb.mean(dim=1)  # Average over time dimension [B, phoneme_dim]
         conditioning_features = torch.cat([phoneme_features, singer_emb, language_emb], dim=1)  # [B, total_dim]
 
-        # Get noise conditioning factor
-        noise_conditioning = self.noise_conditioner(conditioning_features)  # [B, 1]
+        # Get noise conditioning factor - now passing f0 directly
+        noise_conditioning = self.noise_conditioner(conditioning_features, f0)  # [B, 1]
         
         # Generate base noise and apply conditioning
         base_noise = torch.rand_like(harmonic) * 2 - 1
