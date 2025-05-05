@@ -5,13 +5,10 @@ import numpy as np
 
 from encoder.mel_encoder import MelEncoder
 from decoder.feature_extractor import FeatureExtractor
-from decoder.expressive_control import ExpressiveControl  # Import parameter predictor
-from decoder.signal_processor import SignalProcessor  # Import new signal processor
 from decoder.wave_generator_oscillator import WaveGeneratorOscillator
 from decoder.core import scale_function, frequency_filter, upsample
-
-
-
+from decoder.enhancement_network import PhaseAwareEnhancer
+    
 # Modified SVS class with MelEncoder integration
 class SVS(nn.Module):
     """
@@ -87,6 +84,8 @@ class SVS(nn.Module):
             language_embed_dim=self.language_embed_dim
         )
 
+        self.refinemet = PhaseAwareEnhancer()
+
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
         Forward pass with separated expressive control and signal processing.
@@ -134,6 +133,9 @@ class SVS(nn.Module):
 
         # harmonic
         harmonic, final_phase = self.harmonic_synthesizer(pitch, initial_phase)
+
+        
+
         harmonic = frequency_filter(
                         harmonic,
                         src_param)
@@ -143,7 +145,9 @@ class SVS(nn.Module):
         noise = frequency_filter(
                         noise,
                         noise_param)
-        signal = harmonic + noise
-        
+        signal = harmonic + noise       
+
+        signal = self.refinemet(signal)
+
         # Return both the audio output and the expressive parameters
         return signal, predicted_mel
