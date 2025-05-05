@@ -91,6 +91,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
     model.train()
     total_loss = 0
     total_mel_loss = 0
+    total_ssim_loss = 0
     
     for batch_idx, batch in enumerate(tqdm(dataloader, desc=f'Epoch {epoch}')):
         # Move data to device
@@ -105,7 +106,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
         predicted_mel = model(f0, phoneme_seq, singer_id, language_id)
         
         # Compute combined loss
-        loss, mel_loss = criterion(predicted_mel, mel)
+        loss, mel_loss, ssim_loss = criterion(predicted_mel, mel)
         
         # Backward pass
         loss.backward()
@@ -117,17 +118,20 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
         
         total_loss += loss.item()
         total_mel_loss += mel_loss.item()
+        total_ssim_loss += ssim_loss.item()
     
     avg_loss = total_loss / len(dataloader)
     avg_mel_loss = total_mel_loss / len(dataloader)
+    avg_ssim_loss = total_ssim_loss / len(dataloader)
     
-    return avg_loss, avg_mel_loss
+    return avg_loss, avg_mel_loss, avg_ssim_loss
 
 def evaluate(model, dataloader, criterion, device, epoch, visualize=False):
     """Evaluate the model"""
     model.eval()
     total_loss = 0
     total_mel_loss = 0
+    total_ssim_loss = 0
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(dataloader, desc='Evaluating')):
@@ -142,10 +146,11 @@ def evaluate(model, dataloader, criterion, device, epoch, visualize=False):
             predicted_mel = model(f0, phoneme_seq, singer_id, language_id)
             
             # Compute combined loss
-            loss, mel_loss = criterion(predicted_mel, mel)
+            loss, mel_loss, ssim_loss = criterion(predicted_mel, mel)
             
             total_loss += loss.item()
             total_mel_loss += mel_loss.item()
+            total_ssim_loss += ssim_loss.item()
             
             # Visualize only the first batch if requested
             if visualize and batch_idx == 0:
@@ -154,8 +159,9 @@ def evaluate(model, dataloader, criterion, device, epoch, visualize=False):
         
         avg_loss = total_loss / len(dataloader)
         avg_mel_loss = total_mel_loss / len(dataloader)
+        avg_ssim_loss = total_ssim_loss / len(dataloader)
         
-        return avg_loss, avg_mel_loss
+        return avg_loss, avg_mel_loss, avg_ssim_loss
 
 def main():
     # Set device
@@ -207,9 +213,10 @@ def main():
     print(f"  Trainable parameters: {trainable_params:,}")
     print(f"  Model size: {model_size:.2f} MB")
     
-    # Create loss function
+    # Create loss function with SSIM perceptual loss
     criterion = EncoderLoss(
-        mel_loss_weight=1
+        mel_loss_weight=0.5,
+        ssim_loss_weight=0.5
     ).to(device)
     
     # Optimizer
@@ -228,13 +235,13 @@ def main():
     best_val_loss = float('inf')
     
     for epoch in range(num_epochs):
-        train_loss, train_mel_loss = train_epoch(
+        train_loss, train_mel_loss, train_ssim_loss = train_epoch(
             model, train_loader, criterion, optimizer, device, epoch
         )
         
         # Visualize during evaluation at certain intervals
         should_visualize = (epoch % visualization_interval == 0)
-        val_loss, val_mel_loss = evaluate(
+        val_loss, val_mel_loss, val_ssim_loss = evaluate(
             model, val_loader, criterion, device, epoch, visualize=should_visualize
         )
         
@@ -243,8 +250,8 @@ def main():
         
         # Print training information
         print(f"Epoch {epoch}:")
-        print(f"  Train Loss: {train_loss:.4f} (Mel: {train_mel_loss:.4f})")
-        print(f"  Val Loss: {val_loss:.4f} (Mel: {val_mel_loss:.4f})")
+        print(f"  Train Loss: {train_loss:.4f} (Mel: {train_mel_loss:.4f}, SSIM: {train_ssim_loss:.4f})")
+        print(f"  Val Loss: {val_loss:.4f} (Mel: {val_mel_loss:.4f}, SSIM: {val_ssim_loss:.4f})")
         print(f"  Current LR: {optimizer.param_groups[0]['lr']:.6f}")
         
         # Save best model
@@ -262,6 +269,10 @@ def main():
                 'scheduler_state_dict': scheduler.state_dict(),
                 'train_loss': train_loss,
                 'val_loss': val_loss,
+                'train_mel_loss': train_mel_loss,
+                'val_mel_loss': val_mel_loss,
+                'train_ssim_loss': train_ssim_loss,
+                'val_ssim_loss': val_ssim_loss,
                 'best_val_loss': best_val_loss,
             }, f'checkpoints/encoder/encoder_checkpoint_epoch_{epoch}.pth')
     
