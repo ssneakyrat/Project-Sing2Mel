@@ -215,8 +215,8 @@ def main():
     
     # Create loss function with SSIM perceptual loss
     criterion = EncoderLoss(
-        mel_loss_weight=0.5,
-        ssim_loss_weight=0.5
+        mel_loss_weight=0.7,
+        ssim_loss_weight=0.3
     ).to(device)
     
     # Optimizer
