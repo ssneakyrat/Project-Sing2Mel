@@ -7,13 +7,14 @@ from decoder.core import upsample
 from decoder.wave_generator_oscillator import WaveGeneratorOscillator
 from encoder.mel_encoder import MelEncoder
 from encoder.noise_generator import NoiseGenerator
-from encoder.mel_refinement_network import MelRefinementNetwork
+from encoder.mel_refinement_network import PerformerMelRefinementNetwork
 
-# Modified SVS class with MelEncoder integration and F0-conditioned noise
+# Modified SVS class with MelEncoder integration and LightweightConditionalUNet for refinement
 class Sing2Mel(nn.Module):
     """
     Lightweight DDSP-based singing voice synthesis model with separated
     expressive control prediction and signal processing components.
+    Using Lightweight Conditional U-Net for mel spectrogram refinement.
     """
     def __init__(self, 
                  num_phonemes, 
@@ -74,7 +75,13 @@ class Sing2Mel(nn.Module):
             self.phoneme_embed_dim + self.singer_embed_dim + self.language_embed_dim
         )
 
-        self.mel_refinement = MelRefinementNetwork(n_mels=n_mels)
+        # Replace MelRefinementNetwork with our Lightweight Conditional U-Net
+        self.mel_refinement = PerformerMelRefinementNetwork(
+            n_mels=n_mels,
+            phoneme_embed_dim=self.phoneme_embed_dim,
+            singer_embed_dim=self.singer_embed_dim,
+            language_embed_dim=self.language_embed_dim
+        )
 
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
@@ -119,11 +126,13 @@ class Sing2Mel(nn.Module):
         conditioned_noise = base_noise * noise_conditioning.view(batch_size, 1)
         
         # Add conditioned noise to harmonic
-        harmonic = harmonic + conditioned_noise
+        harmonic = harmonic + conditioned_noise * 0.3
 
+        # Generate base mel spectrogram
         predicted_mel = self.mel_encoder(harmonic, f0, phoneme_emb, singer_emb, language_emb)
 
+        # Refine mel spectrogram with our Lightweight Conditional U-Net
         refined_mel = self.mel_refinement(predicted_mel, f0, phoneme_emb, singer_emb, language_emb)
 
-        # Return audio output, latent mel and final_phase
+        # Return refined mel spectrogram
         return refined_mel
