@@ -103,85 +103,6 @@ def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
     save_audio(wave[0].detach().cpu().numpy(), f'audio_samples/epoch_{epoch}_batch_{batch_idx}_pred.wav')
     save_audio(target_audio[0].detach().cpu().numpy(), f'audio_samples/epoch_{epoch}_batch_{batch_idx}_target.wav')
 
-def visualize_expressive_params_with_waveform(epoch, batch_idx, wave, params, save_dir='visuals/decoder/params'):
-    """
-    Create a dedicated visualization for expressive parameters overlaid on the waveform
-    
-    Args:
-        epoch: Current epoch number
-        batch_idx: Current batch index
-        wave: Predicted waveform
-        params: Dictionary of expressive parameters
-        save_dir: Directory to save visualizations
-    """
-    if params is None:
-        return
-    
-    # Create figure with a single plot
-    fig, ax1 = plt.subplots(figsize=(12, 8))
-    
-    # Convert waveform to numpy array
-    wave_np = wave[0].detach().cpu().numpy()
-    
-    # Create time axis for waveform
-    sample_time = np.arange(len(wave_np)) / SAMPLE_RATE
-    
-    # Plot waveform
-    ax1.plot(sample_time, wave_np, color='blue', alpha=0.4, label='Waveform')
-    ax1.set_xlabel('Time (s)')
-    ax1.set_ylabel('Amplitude', color='blue')
-    ax1.tick_params(axis='y', labelcolor='blue')
-    
-    # Create a second y-axis for parameters
-    ax2 = ax1.twinx()
-    ax2.set_ylabel('Parameter Value', color='red')
-    ax2.tick_params(axis='y', labelcolor='red')
-    
-    # Create frame-level time axis for parameters
-    n_frames = params['vibrato_rate'].shape[1]
-    frame_time = np.arange(n_frames) * HOP_LENGTH / SAMPLE_RATE
-    
-    # Parameters to plot with colors and line styles
-    param_config = {
-        'vibrato_rate': {'color': 'red', 'linestyle': '-', 'linewidth': 2},
-        'vibrato_depth': {'color': 'orange', 'linestyle': '-', 'linewidth': 2},
-        'vibrato_phase': {'color': 'purple', 'linestyle': '--', 'linewidth': 2},
-        'breathiness': {'color': 'brown', 'linestyle': '-.', 'linewidth': 2},
-        'tension': {'color': 'magenta', 'linestyle': ':', 'linewidth': 2.5},
-        'vocal_fry': {'color': 'cyan', 'linestyle': '-', 'linewidth': 2}
-    }
-    
-    # Plot each parameter
-    for param_name, style in param_config.items():
-        if param_name in params:
-            # Extract parameter values for the first batch example
-            param_values = params[param_name][0].detach().cpu().numpy()
-            
-            # Reshape if needed
-            if len(param_values.shape) > 1:
-                param_values = param_values.flatten()
-            
-            # Use only up to n_frames points
-            display_frames = min(len(frame_time), len(param_values))
-            ax2.plot(
-                frame_time[:display_frames], 
-                param_values[:display_frames], 
-                label=param_name,
-                **style
-            )
-    
-    # Add legend for all lines
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize='medium')
-    
-    ax1.set_title(f'Expressive Parameters vs Waveform (Epoch {epoch}, Batch {batch_idx})')
-    ax1.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(f'{save_dir}/params_epoch_{epoch}_batch_{batch_idx}.png')
-    plt.close()
-
 def save_audio(waveform, path, sample_rate=SAMPLE_RATE):
     """Save audio waveform to file"""
     # Ensure waveform is in range [-1, 1]
@@ -225,7 +146,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
         
         # Forward pass
         optimizer.zero_grad()
-        wave, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
+        wave, latent_mel, _ = model(f0, phoneme_seq, singer_id, language_id)
         
         # Compute combined loss
         loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
@@ -268,7 +189,7 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
             target_audio = extract_audio_from_dataset(batch, device)
             
             # Forward pass
-            wave, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
+            wave, latent_mel, final_phase = model(f0, phoneme_seq, singer_id, language_id)
             
             # Compute combined loss
             loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
@@ -308,8 +229,8 @@ def main():
     train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
         batch_size=batch_size,
         num_workers=1,
-        train_files=100,
-        val_files=50,
+        train_files=500,
+        val_files=10,
         device=device,
         context_window_sec=2,  # 2-second window
         persistent_workers=True
