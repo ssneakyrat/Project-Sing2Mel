@@ -10,7 +10,7 @@ from decoder.core import scale_function, frequency_filter, upsample
 from decoder.enhancement_network import PhaseAwareEnhancer
     
 # Modified SVS class with MelEncoder integration
-class SVS(nn.Module):
+class Mel2Audio(nn.Module):
     """
     Lightweight DDSP-based singing voice synthesis model with separated
     expressive control prediction and signal processing components.
@@ -26,7 +26,7 @@ class SVS(nn.Module):
                  num_mag_harmonic=256,
                  num_mag_noise=80,
                  ):
-        super(SVS, self).__init__()
+        super(Mel2Audio, self).__init__()
         
         # Basic parameters
         self.n_mels = n_mels
