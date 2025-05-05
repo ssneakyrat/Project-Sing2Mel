@@ -7,8 +7,8 @@ from decoder.core import upsample
 from decoder.wave_generator_oscillator import WaveGeneratorOscillator
 from encoder.mel_encoder import MelEncoder
 from encoder.noise_generator import NoiseGenerator
+from encoder.mel_refinement_network import MelRefinementNetwork
 
-    
 # Modified SVS class with MelEncoder integration and F0-conditioned noise
 class Sing2Mel(nn.Module):
     """
@@ -74,6 +74,8 @@ class Sing2Mel(nn.Module):
             self.phoneme_embed_dim + self.singer_embed_dim + self.language_embed_dim
         )
 
+        self.mel_refinement = MelRefinementNetwork(n_mels=n_mels)
+
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
         Forward pass with separated expressive control and signal processing.
@@ -121,5 +123,7 @@ class Sing2Mel(nn.Module):
 
         predicted_mel = self.mel_encoder(harmonic, f0, phoneme_emb, singer_emb, language_emb)
 
+        refined_mel = self.mel_refinement(predicted_mel, f0, phoneme_emb, singer_emb, language_emb)
+
         # Return audio output, latent mel and final_phase
-        return predicted_mel
+        return refined_mel
