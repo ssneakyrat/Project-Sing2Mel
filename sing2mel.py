@@ -6,6 +6,22 @@ import numpy as np
 from decoder.core import upsample
 from decoder.wave_generator_oscillator import WaveGeneratorOscillator
 from encoder.mel_encoder import MelEncoder
+
+# Noise conditioner network
+class NoiseConditioner(nn.Module):
+    def __init__(self, input_dim):
+        super(NoiseConditioner, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()  # Output between 0 and 1 to control noise magnitude
+        )
+    
+    def forward(self, conditioning_features):
+        return self.network(conditioning_features)
     
 # Modified SVS class with MelEncoder integration
 class Sing2Mel(nn.Module):
@@ -66,6 +82,11 @@ class Sing2Mel(nn.Module):
             singer_embed_dim=self.singer_embed_dim,
             language_embed_dim=self.language_embed_dim
         )
+        
+        # Initialize noise conditioner
+        self.noise_conditioner = NoiseConditioner(
+            self.phoneme_embed_dim + self.singer_embed_dim + self.language_embed_dim
+        )
 
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
@@ -99,7 +120,20 @@ class Sing2Mel(nn.Module):
         # harmonic
         harmonic, final_phase = self.harmonic_synthesizer(pitch, initial_phase)
         
-        # Generate mel spectrogram if not provided
+        # Get global conditioning features for noise
+        phoneme_features = phoneme_emb.mean(dim=1)  # Average over time dimension [B, phoneme_dim]
+        conditioning_features = torch.cat([phoneme_features, singer_emb, language_emb], dim=1)  # [B, total_dim]
+
+        # Get noise conditioning factor
+        noise_conditioning = self.noise_conditioner(conditioning_features)  # [B, 1]
+        
+        # Generate base noise and apply conditioning
+        base_noise = torch.rand_like(harmonic) * 2 - 1
+        conditioned_noise = base_noise * noise_conditioning.view(batch_size, 1)
+        
+        # Add conditioned noise to harmonic
+        harmonic = harmonic + conditioned_noise
+
         predicted_mel = self.mel_encoder(harmonic, f0, phoneme_emb, singer_emb, language_emb)
 
         # Return audio output, latent mel and final_phase
