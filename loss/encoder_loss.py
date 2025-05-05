@@ -89,12 +89,12 @@ class EncoderLoss(nn.Module):
     
     def forward(self, predicted_mel, target_mel):
         """Compute combined loss"""
-        
-        if predicted_mel.shape[2] > target_mel.shape[2]:
-            predicted_mel_aligned = predicted_mel[:, :, :target_mel.shape[2]]
+                
+        if predicted_mel.shape[1] > target_mel.shape[1]:
+            predicted_mel_aligned = predicted_mel[:, :target_mel.shape[1],:]
             target_mel_aligned = target_mel
-        elif target_mel.shape[2] > predicted_mel.shape[2]:
-            target_mel_aligned = target_mel[:, :, :predicted_mel.shape[2]]
+        elif target_mel.shape[1] > predicted_mel.shape[1]:
+            target_mel_aligned = target_mel[:, :predicted_mel.shape[1],:]
             predicted_mel_aligned = predicted_mel
         else:
             # Shapes are already the same

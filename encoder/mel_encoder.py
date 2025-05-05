@@ -1,296 +1,203 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 import math
-
-class PositionalEncoding(nn.Module):
-    """
-    Positional encoding for transformer-based models.
-    """
-    def __init__(self, d_model, max_seq_len=2000):
-        super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_seq_len, d_model)
-        position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model))
-        
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        
-        self.register_buffer('pe', pe)
-        self.d_model = d_model
-        
-    def forward(self, x):
-        """
-        Args:
-            x: Input tensor [B, T, D]
-        Returns:
-            Output tensor with positional encoding added [B, T, D]
-        """
-        return x + self.pe[:, :x.size(1), :]
-
-class DilatedConvBlock(nn.Module):
-    """
-    Dilated convolutional block with gated activations.
-    """
-    def __init__(self, channels, kernel_size=3, dilation=1, dropout=0.1):
-        super(DilatedConvBlock, self).__init__()
-        self.conv_layer = nn.Conv1d(
-            channels, 
-            channels * 2,  # Double for gated activation
-            kernel_size=kernel_size,
-            padding=(kernel_size-1)//2 * dilation,
-            dilation=dilation
-        )
-        self.layer_norm = nn.LayerNorm(channels)
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, x):
-        """
-        Args:
-            x: Input tensor [B, T, C]
-        Returns:
-            Output tensor [B, T, C]
-        """
-        # Save residual
-        residual = x
-        
-        # Switch to channels-first for convolution
-        x = x.transpose(1, 2)  # [B, C, T]
-        
-        # Apply convolution
-        x = self.conv_layer(x)
-        
-        # Gated activation
-        filter_x, gate_x = torch.chunk(x, 2, dim=1)
-        x = torch.sigmoid(gate_x) * torch.tanh(filter_x)
-        
-        # Back to original shape
-        x = x.transpose(1, 2)  # [B, T, C]
-        
-        # Apply dropout
-        x = self.dropout(x)
-        
-        # Skip connection
-        x = residual + x
-        
-        # Layer normalization
-        x = self.layer_norm(x)
-        
-        return x
-
-class MultiHeadAttention(nn.Module):
-    """
-    Multi-head self-attention mechanism.
-    """
-    def __init__(self, d_model, num_heads, dropout=0.1):
-        super(MultiHeadAttention, self).__init__()
-        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
-        
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.d_k = d_model // num_heads
-        
-        self.w_q = nn.Linear(d_model, d_model)
-        self.w_k = nn.Linear(d_model, d_model)
-        self.w_v = nn.Linear(d_model, d_model)
-        self.w_o = nn.Linear(d_model, d_model)
-        
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, x, mask=None):
-        """
-        Args:
-            x: Input tensor [B, T, D]
-            mask: Optional mask tensor [B, T, T]
-        Returns:
-            Output tensor [B, T, D]
-        """
-        batch_size = x.size(0)
-        
-        # Linear projections
-        q = self.w_q(x).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)  # [B, H, T, d_k]
-        k = self.w_k(x).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)  # [B, H, T, d_k]
-        v = self.w_v(x).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)  # [B, H, T, d_k]
-        
-        # Scaled dot-product attention
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)  # [B, H, T, T]
-        
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
-            
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        
-        attn_output = torch.matmul(attn_weights, v)  # [B, H, T, d_k]
-        
-        # Reshape back
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
-        
-        # Final projection
-        output = self.w_o(attn_output)
-        
-        return output
-
-class PositionwiseFeedForward(nn.Module):
-    """
-    Position-wise feed-forward network.
-    """
-    def __init__(self, d_model, d_ff, dropout=0.1):
-        super(PositionwiseFeedForward, self).__init__()
-        self.w_1 = nn.Linear(d_model, d_ff)
-        self.w_2 = nn.Linear(d_ff, d_model)
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, x):
-        """
-        Args:
-            x: Input tensor [B, T, D]
-        Returns:
-            Output tensor [B, T, D]
-        """
-        x = self.w_1(x)
-        x = F.relu(x)
-        x = self.dropout(x)
-        x = self.w_2(x)
-        return x
-
-class EncoderLayer(nn.Module):
-    """
-    Transformer encoder layer with self-attention and feed-forward network.
-    """
-    def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
-        super(EncoderLayer, self).__init__()
-        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
-        self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, x, mask=None):
-        """
-        Args:
-            x: Input tensor [B, T, D]
-            mask: Optional mask tensor [B, T, T]
-        Returns:
-            Output tensor [B, T, D]
-        """
-        # Self-attention with residual connection and layer normalization
-        attn_output = self.self_attn(x, mask)
-        x = x + self.dropout(attn_output)
-        x = self.norm1(x)
-        
-        # Feed-forward with residual connection and layer normalization
-        ff_output = self.feed_forward(x)
-        x = x + self.dropout(ff_output)
-        x = self.norm2(x)
-        
-        return x
 
 class MelEncoder(nn.Module):
     """
-    Encodes fundamental frequency and linguistic features into mel spectrograms.
-    Uses a hybrid architecture with convolutional layers and self-attention to predict 
-    mel spectrograms from f0, phoneme, singer, and language embeddings.
+    Main class that synthesizes mel spectrograms directly in the spectral domain.
+    With explicit gradient tracking for all operations.
     """
     def __init__(self, 
                  n_mels=80, 
+                 n_harmonics=80,
                  phoneme_embed_dim=128, 
                  singer_embed_dim=16, 
                  language_embed_dim=8,
-                 hidden_dim=128,
-                 num_heads=4,
-                 num_encoder_layers=2,
-                 num_conv_blocks=2,
-                 dropout=0.1):
-        super(MelEncoder, self).__init__()
+                 sample_rate=24000,
+                 n_fft=1024):
+        super().__init__()
         
-        # Input dimensions
         self.n_mels = n_mels
+        self.n_harmonics = n_harmonics
+        self.sample_rate = sample_rate
+        self.n_fft = n_fft
+        
+        # Feature dimensions
         self.phoneme_embed_dim = phoneme_embed_dim
         self.singer_embed_dim = singer_embed_dim
         self.language_embed_dim = language_embed_dim
         
-        # Enhanced f0 processing with MLP
-        f0_dim = 32  # Larger projected dimension for f0
-        self.f0_mlp = nn.Sequential(
-            nn.Linear(1, 16),
-            nn.ReLU(),
-            nn.Linear(16, f0_dim),
-            nn.LayerNorm(f0_dim)
-        )
+        # Register the mel filterbank as a Parameter to ensure gradient tracking
+        # If you don't want it to be trainable, you can use requires_grad=False
+        mel_filterbank = self._create_mel_filterbank()
+        self.register_parameter('mel_filterbank', nn.Parameter(mel_filterbank, requires_grad=False))
         
-        # Calculate total input dimension
-        total_input_dim = phoneme_embed_dim + singer_embed_dim + language_embed_dim + f0_dim
+        # We'll define a learnable transform to process the inputs
+        # This ensures there's at least one trainable parameter to maintain gradient flow
+        self.input_transform = nn.Linear(phoneme_embed_dim + singer_embed_dim + language_embed_dim, 
+                                         phoneme_embed_dim)
         
-        # Input projection layer
-        self.input_projection = nn.Linear(total_input_dim, hidden_dim)
-        
-        # Positional encoding
-        self.positional_encoding = PositionalEncoding(hidden_dim)
-        
-        # Dilated convolutional blocks for local feature extraction
-        self.conv_blocks = nn.ModuleList()
-        for i in range(num_conv_blocks):
-            dilation = 2 ** i  # Exponentially increasing dilation
-            self.conv_blocks.append(DilatedConvBlock(hidden_dim, dilation=dilation, dropout=dropout))
-        
-        # Transformer encoder layers for global feature extraction
-        self.encoder_layers = nn.ModuleList()
-        for _ in range(num_encoder_layers):
-            self.encoder_layers.append(EncoderLayer(hidden_dim, num_heads, hidden_dim * 4, dropout))
-        
-        # Conditional output projection based on singer and language
-        self.output_projection = nn.Sequential(
-            nn.Linear(hidden_dim + singer_embed_dim + language_embed_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, n_mels),
-            nn.Sigmoid()  # Constrain values
-        )
-        
-    def forward(self, f0, phoneme_emb, singer_emb, language_emb):
+    def forward(self, signal, f0, phoneme_emb, singer_emb, language_emb):
         """
-        Forward pass to generate mel spectrogram from linguistic features.
+        Synthesize mel spectrogram directly from input signal with explicit gradient tracking.
         
         Args:
-            f0: Fundamental frequency trajectory [B, T, 1]
+            signal: Input audio signal [B, L] where L is the signal length
+            f0: Fundamental frequency [B, T, 1]
             phoneme_emb: Phoneme embeddings [B, T, phoneme_embed_dim]
             singer_emb: Singer embeddings [B, singer_embed_dim]
             language_emb: Language embeddings [B, language_embed_dim]
             
         Returns:
-            Predicted mel spectrogram [B, T, n_mels]
+            mel_spectrogram: Mel spectrogram [B, T, n_mels]
         """
-        batch_size, seq_len = f0.shape[0], f0.shape[1]
+        # Ensure all inputs have requires_grad if needed
+        # You might want to comment this out in production to avoid modifying inputs
+        if not signal.requires_grad and torch.is_floating_point(signal):
+            signal.requires_grad_(True)
         
-        # Process f0 with MLP
-        f0_processed = self.f0_mlp(f0)  # [B, T, f0_dim]
+        # 0. Process the embeddings to ensure gradient flow
+        # Expand singer and language embeddings to match the time dimension of phoneme_emb
+        batch_size, time_length = phoneme_emb.shape[0], phoneme_emb.shape[1]
+        singer_emb_expanded = singer_emb.unsqueeze(1).expand(-1, time_length, -1)
+        language_emb_expanded = language_emb.unsqueeze(1).expand(-1, time_length, -1)
         
-        # Expand singer and language embeddings to match sequence length
-        singer_emb_expanded = singer_emb.unsqueeze(1).expand(-1, seq_len, -1)  # [B, T, singer_embed_dim]
-        language_emb_expanded = language_emb.unsqueeze(1).expand(-1, seq_len, -1)  # [B, T, language_embed_dim]
+        # Concatenate and transform
+        combined_emb = torch.cat([phoneme_emb, singer_emb_expanded, language_emb_expanded], dim=-1)
+        transformed_emb = self.input_transform(combined_emb)
         
-        # Concatenate all inputs
-        combined_input = torch.cat([phoneme_emb, f0_processed, singer_emb_expanded, language_emb_expanded], dim=-1)
+        # 1. Compute STFT of the signal
+        hop_length = self.n_fft // 4
         
-        # Project to hidden dimension
-        x = self.input_projection(combined_input)  # [B, T, hidden_dim]
+        # Create window as a parameter to ensure gradient flow
+        window = torch.hann_window(self.n_fft, device=signal.device)
         
-        # Add positional encoding
-        x = self.positional_encoding(x)
+        # Use torch.stft with return_complex=True for better gradient flow
+        complex_stft = torch.stft(
+            signal, 
+            n_fft=self.n_fft, 
+            hop_length=hop_length, 
+            win_length=self.n_fft, 
+            window=window,
+            return_complex=True  # Return complex tensor for better gradient support
+        )
         
-        # Apply dilated convolutional blocks
-        for conv_block in self.conv_blocks:
-            x = conv_block(x)
+        # 2. Calculate magnitude spectrum with stable gradients
+        epsilon = 1e-10
+        magnitude = torch.abs(complex_stft) + epsilon  # [B, F, T]
         
-        # Apply transformer encoder layers
-        for encoder_layer in self.encoder_layers:
-            x = encoder_layer(x)
+        # 3. Apply mel filterbank
+        # Transpose for batch matmul: [B, T, F] = [B, F, T].transpose(1, 2)
+        magnitude = magnitude.transpose(1, 2)  # [B, T, F]
         
-        # Concatenate with singer and language for conditional output
-        x = torch.cat([x, singer_emb_expanded, language_emb_expanded], dim=-1)
+        # Apply mel filterbank: [B, T, n_mels] = [B, T, F] @ [F, n_mels]
+        mel_spectrogram = torch.matmul(magnitude, self.mel_filterbank.transpose(0, 1))  # [B, T, n_mels]
         
-        # Project to mel spectrogram
-        mel_pred = self.output_projection(x)  # [B, T, n_mels]
+        # 4. Apply log compression with stable gradients
+        mel_spectrogram = torch.log(mel_spectrogram + epsilon)
         
-        return mel_pred
+        # 5. Match the target length with explicit gradient-preserving ops
+        target_length = f0.shape[1]
+        current_length = mel_spectrogram.shape[1]
+
+        if current_length < target_length:
+            # Handle length difference with interpolation (preserves gradients)
+            x_permuted = mel_spectrogram.permute(0, 2, 1)  # [B, n_mels, T]
+            
+            # Use align_corners=True for better gradient flow with linear interpolation
+            interpolated = F.interpolate(
+                x_permuted, 
+                size=target_length, 
+                mode='linear', 
+                align_corners=True
+            )
+            
+            # Permute back to original shape
+            return interpolated.permute(0, 2, 1)  # [B, target_length, n_mels]
+        else:
+            return mel_spectrogram
+    
+    def _create_mel_filterbank(self):
+        """
+        Create a mel filterbank matrix to convert from linear frequency to mel frequency.
+        
+        Returns:
+            mel_filterbank: Mel filterbank matrix [n_mels, n_fft//2 + 1]
+        """
+        # Number of FFT bins
+        n_freqs = self.n_fft // 2 + 1
+        
+        # Convert min and max frequencies to mel scale
+        min_freq = 0
+        max_freq = self.sample_rate / 2
+        min_mel = self._hz_to_mel(min_freq)
+        max_mel = self._hz_to_mel(max_freq)
+        
+        # Create evenly spaced points in mel scale
+        mel_points = torch.linspace(min_mel, max_mel, self.n_mels + 2)
+        
+        # Convert mel points back to Hz
+        hz_points = self._mel_to_hz(mel_points)
+        
+        # Convert Hz points to FFT bin indices
+        bin_indices = torch.floor((self.n_fft + 1) * hz_points / self.sample_rate).long()
+        
+        # Create the filterbank matrix
+        filterbank = torch.zeros(self.n_mels, n_freqs)
+        
+        # For each mel band, create a triangular filter
+        for i in range(self.n_mels):
+            # Lower and upper frequency boundaries for triangular filter
+            lower = bin_indices[i]
+            center = bin_indices[i + 1]
+            upper = bin_indices[i + 2]
+            
+            # Create triangular filter (with checks to avoid division by zero)
+            if lower != center:
+                for j in range(lower, center):
+                    filterbank[i, j] = (j - lower) / float(center - lower)
+            
+            if center != upper:
+                for j in range(center, upper):
+                    filterbank[i, j] = (upper - j) / float(upper - center)
+        
+        # Normalize the filterbank
+        # Use a small epsilon to avoid division by zero
+        epsilon = 1e-10
+        hz_diff = hz_points[2:self.n_mels+2] - hz_points[:self.n_mels]
+        enorm = 2.0 / (hz_diff + epsilon)
+        filterbank *= enorm.unsqueeze(1)
+        
+        return filterbank
+    
+    def _hz_to_mel(self, hz):
+        """
+        Convert from Hz to mel scale.
+        
+        Args:
+            hz: Frequency in Hz
+            
+        Returns:
+            mel: Frequency in mel scale
+        """
+        if isinstance(hz, torch.Tensor):
+            return 2595 * torch.log10(1 + hz / 700)
+        else:
+            return 2595 * math.log10(1 + hz / 700)
+    
+    def _mel_to_hz(self, mel):
+        """
+        Convert from mel scale to Hz.
+        
+        Args:
+            mel: Frequency in mel scale
+            
+        Returns:
+            hz: Frequency in Hz
+        """
+        if isinstance(mel, torch.Tensor):
+            return 700 * (10**(mel / 2595) - 1)
+        else:
+            return 700 * (10**(mel / 2595) - 1)

@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+from decoder.core import upsample
+from decoder.wave_generator_oscillator import WaveGeneratorOscillator
 from encoder.mel_encoder import MelEncoder
     
 # Modified SVS class with MelEncoder integration
@@ -24,6 +26,8 @@ class Sing2Mel(nn.Module):
                  ):
         super(Sing2Mel, self).__init__()
         
+        self.register_buffer("block_size", torch.tensor(hop_length))
+        
         # Basic parameters
         self.n_mels = n_mels
         self.hop_length = hop_length
@@ -42,9 +46,22 @@ class Sing2Mel(nn.Module):
         self.singer_embed = nn.Embedding(num_singers, self.singer_embed_dim)
         self.language_embed = nn.Embedding(num_languages, self.language_embed_dim)   
         
+        # Harmonic Synthesizer parameters
+        self.harmonic_amplitudes = nn.Parameter(
+            1. / torch.arange(1, num_harmonics + 1).float(), requires_grad=False)
+        self.ratio = nn.Parameter(torch.tensor([0.4]).float(), requires_grad=False)
+
+        # Initialize harmonic synthesizer
+        self.harmonic_synthesizer = WaveGeneratorOscillator(
+            sample_rate,
+            amplitudes=self.harmonic_amplitudes,
+            ratio=self.ratio)
+
         # Initialize mel encoder
         self.mel_encoder = MelEncoder(
             n_mels=n_mels,
+            n_harmonics=num_harmonics,
+            sample_rate=sample_rate,
             phoneme_embed_dim=self.phoneme_embed_dim,
             singer_embed_dim=self.singer_embed_dim,
             language_embed_dim=self.language_embed_dim
@@ -71,9 +88,19 @@ class Sing2Mel(nn.Module):
 
         # Prepare f0 for mel encoder
         f0_unsqueeze = f0.unsqueeze(2)  # [B, T, 1]
+
+        # Process F0 - make sure it's in Hz and properly shaped
+        f0_unsqueeze = torch.clamp(f0_unsqueeze, min=0.0, max=1000.0)
+        f0_unsqueeze[f0_unsqueeze < 80] = 0 + 1e-7  # Set unvoiced regions to 0
+
+        # upsample
+        pitch = upsample(f0_unsqueeze, self.block_size)
+
+        # harmonic
+        harmonic, final_phase = self.harmonic_synthesizer(pitch, initial_phase)
         
         # Generate mel spectrogram if not provided
-        predicted_mel = self.mel_encoder(f0_unsqueeze, phoneme_emb, singer_emb, language_emb)
+        predicted_mel = self.mel_encoder(harmonic, f0, phoneme_emb, singer_emb, language_emb)
 
         # Return audio output, latent mel and final_phase
         return predicted_mel
