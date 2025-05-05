@@ -3,38 +3,35 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from encoder.mel_encoder import MelEncoder
-from decoder.feature_extractor import FeatureExtractor
+from direct_feature_encoder import DirectFeatureEncoder
 from decoder.wave_generator_oscillator import WaveGeneratorOscillator
 from decoder.core import scale_function, frequency_filter, upsample
 from decoder.enhancement_network import PhaseAwareEnhancer
     
-# Modified SVS class with MelEncoder integration
-class Mel2Audio(nn.Module):
+class DirectAudio(nn.Module):
     """
-    Lightweight DDSP-based singing voice synthesis model with separated
-    expressive control prediction and signal processing components.
+    Lightweight DDSP-based singing voice synthesis model with a unified
+    neural network for direct control parameter generation.
     """
     def __init__(self, 
                  num_phonemes, 
                  num_singers, 
                  num_languages,
-                 n_mels=80, 
                  hop_length=240, 
                  sample_rate=24000,
                  num_harmonics=80, 
                  num_mag_harmonic=256,
                  num_mag_noise=80,
-                 ):
-        super(Mel2Audio, self).__init__()
+                 hidden_dim=256,
+                 num_heads=4,
+                 num_transformer_layers=3,
+                 num_conv_blocks=3):
+        super(DirectAudio, self).__init__()
         
         # Basic parameters
-        self.n_mels = n_mels
         self.hop_length = hop_length
         self.sample_rate = sample_rate
         self.num_harmonics = num_harmonics
-        self.num_mag_harmonic = num_mag_harmonic
-        self.num_mag_noise = num_mag_noise
         
         # Define embedding dimensions
         self.phoneme_embed_dim = 128
@@ -50,19 +47,22 @@ class Mel2Audio(nn.Module):
         self.register_buffer("sampling_rate", torch.tensor(sample_rate))
         self.register_buffer("block_size", torch.tensor(hop_length))
         
-        # Define feature extractor output splits
-        split_map = {
+        # Define control parameter output configuration
+        self.output_splits = {
             'harmonic_magnitude': num_mag_harmonic,
             'noise_magnitude': num_mag_noise
         }
 
-        # Initialize feature extractor with proper dimensions
-        self.feature_extractor = FeatureExtractor(
-            input_channel=n_mels,
-            output_splits=split_map,
-            phoneme_dim=self.phoneme_embed_dim,
-            singer_dim=self.singer_embed_dim,
-            language_dim=self.language_embed_dim
+        # Initialize the unified DirectFeatureEncoder
+        self.direct_encoder = DirectFeatureEncoder(
+            output_splits=self.output_splits,
+            phoneme_embed_dim=self.phoneme_embed_dim,
+            singer_embed_dim=self.singer_embed_dim,
+            language_embed_dim=self.language_embed_dim,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            num_transformer_layers=num_transformer_layers,
+            num_conv_blocks=num_conv_blocks
         )
 
         # Harmonic Synthesizer parameters
@@ -75,31 +75,23 @@ class Mel2Audio(nn.Module):
             sample_rate,
             amplitudes=self.harmonic_amplitudes,
             ratio=self.ratio)
-        
-        # Initialize mel encoder
-        self.mel_encoder = MelEncoder(
-            n_mels=n_mels,
-            phoneme_embed_dim=self.phoneme_embed_dim,
-            singer_embed_dim=self.singer_embed_dim,
-            language_embed_dim=self.language_embed_dim
-        )
 
-        self.refinemet = PhaseAwareEnhancer()
+        # Audio enhancement network
+        self.refinement = PhaseAwareEnhancer()
 
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
-        Forward pass with separated expressive control and signal processing.
+        Forward pass with direct control parameter generation.
         
         Args:
             f0: Fundamental frequency trajectory [B, T]
             phoneme_seq: Phoneme sequence [B, T] (indices)
             singer_id: Singer IDs [B] (indices)
             language_id: Language IDs [B] (indices)
-            mel: Optional mel-spectrogram [B, T, n_mels] (if None, it will be predicted)
             initial_phase: Optional initial phase for the harmonic oscillator
             
         Returns:
-            Audio signal [B, T*hop_length], expressive parameters dict
+            Audio signal [B, T*hop_length], control parameters dict
         """
         batch_size, n_frames = f0.shape[0], f0.shape[1]
         
@@ -108,44 +100,38 @@ class Mel2Audio(nn.Module):
         singer_emb = self.singer_embed(singer_id)      # [B, singer_dim]
         language_emb = self.language_embed(language_id) # [B, language_dim]
 
-        # Prepare f0 for mel encoder
+        # Ensure f0 has correct shape
         f0_unsqueeze = f0.unsqueeze(2)  # [B, T, 1]
         
-        # Generate mel spectrogram if not provided
-        predicted_mel = self.mel_encoder(f0_unsqueeze, phoneme_emb, singer_emb, language_emb)
-
-        # Get control parameters from feature extractor
-        ctrls = self.feature_extractor(predicted_mel, f0, phoneme_emb, singer_emb, language_emb)
+        # Get control parameters directly from the unified encoder
+        ctrls = self.direct_encoder(f0_unsqueeze, phoneme_emb, singer_emb, language_emb)
 
         # Process harmonic and noise parameters
         src_param = scale_function(ctrls['harmonic_magnitude'])
         noise_param = scale_function(ctrls['noise_magnitude'])
 
-        # Use harmonic magnitude as conditioning for expressive control
-        conditioning = ctrls['harmonic_magnitude']  # [B, T, 256]
-
         # Process F0 - make sure it's in Hz and properly shaped
         f0_unsqueeze = torch.clamp(f0_unsqueeze, min=0.0, max=1000.0)
         f0_unsqueeze[f0_unsqueeze < 80] = 0 + 1e-7  # Set unvoiced regions to 0
 
-        # upsample
+        # Upsample f0 to match audio sample rate
         pitch = upsample(f0_unsqueeze, self.block_size)
 
-        # harmonic
+        # Generate harmonic component
         harmonic, final_phase = self.harmonic_synthesizer(pitch, initial_phase)
         
-        harmonic = frequency_filter(
-                        harmonic,
-                        src_param)
+        # Apply frequency filtering to harmonic component
+        harmonic = frequency_filter(harmonic, src_param)
 
-        # noise part
+        # Generate and filter noise component
         noise = torch.rand_like(harmonic).to(noise_param) * 2 - 1
-        noise = frequency_filter(
-                        noise,
-                        noise_param)
+        noise = frequency_filter(noise, noise_param)
+        
+        # Combine harmonic and noise components
         signal = harmonic + noise       
 
-        signal = self.refinemet(signal)
+        # Apply refinement network
+        signal = self.refinement(signal)
 
-        # Return audio output, latent mel and final_phase
-        return signal, predicted_mel, final_phase
+        # Return audio output and control parameters
+        return signal, final_phase
