@@ -8,7 +8,7 @@ from tqdm import tqdm
 import torchaudio
 import soundfile as sf
 
-from loss import DecoderLoss
+from loss.decoder_loss import DecoderLoss
 from dataset_decoder import get_dataloader, SAMPLE_RATE, N_MELS, HOP_LENGTH, WIN_LENGTH
 
 from mel2audio import Mel2Audio
@@ -17,7 +17,6 @@ from mel2audio import Mel2Audio
 os.makedirs('visuals', exist_ok=True)
 os.makedirs('visuals/decoder', exist_ok=True)
 os.makedirs('audio_samples', exist_ok=True)
-os.makedirs('visuals/decoder/params', exist_ok=True)  # New folder for parameter visualization
 
 def extract_audio_from_dataset(batch, device):
     """Extract original audio from dataset"""
