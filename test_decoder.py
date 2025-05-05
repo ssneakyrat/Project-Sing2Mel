@@ -225,7 +225,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
         
         # Forward pass
         optimizer.zero_grad()
-        wave, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
+        wave, latent_mel, final_phase = model(f0, phoneme_seq, singer_id, language_id)
         
         # Compute combined loss
         loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
@@ -268,7 +268,7 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
             target_audio = extract_audio_from_dataset(batch, device)
             
             # Forward pass
-            wave, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
+            wave, latent_mel, final_phase = model(f0, phoneme_seq, singer_id, language_id)
             
             # Compute combined loss
             loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)

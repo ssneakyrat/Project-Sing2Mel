@@ -133,9 +133,7 @@ class SVS(nn.Module):
 
         # harmonic
         harmonic, final_phase = self.harmonic_synthesizer(pitch, initial_phase)
-
         
-
         harmonic = frequency_filter(
                         harmonic,
                         src_param)
@@ -149,5 +147,5 @@ class SVS(nn.Module):
 
         signal = self.refinemet(signal)
 
-        # Return both the audio output and the expressive parameters
-        return signal, predicted_mel
+        # Return audio output, latent mel and final_phase
+        return signal, predicted_mel, final_phase
