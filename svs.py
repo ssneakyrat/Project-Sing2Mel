@@ -9,6 +9,7 @@ from decoder.wave_generator_oscillator import WaveGeneratorOscillator
 from decoder.core import scale_function, frequency_filter, upsample
 from decoder.human_vocal_filter import vocal_frequency_filter
 from decoder.noise_generator import NoiseGenerator
+from decoder.enhancement_network import PhaseAwareEnhancer
 
 # Modified SVS class with MelEncoder integration
 class SVS(nn.Module):
@@ -112,6 +113,8 @@ class SVS(nn.Module):
             singer_embed_dim=self.singer_embed_dim,
             language_embed_dim=self.language_embed_dim
         )
+        
+        self.refinement = PhaseAwareEnhancer()
 
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
@@ -276,5 +279,7 @@ class SVS(nn.Module):
             'vocal_range_max': ctrls['vocal_range_max']
         }
         
+        signal = self.refinement(signal)
+
         # Return audio signal, predicted mel, and vocal parameters
         return signal, predicted_mel, vocal_params
