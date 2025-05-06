@@ -16,8 +16,10 @@ class HumanVocalFilter(nn.Module):
                  breathiness=0.3,
                  gender="neutral",
                  articulation=0.5,    # 0.0 (staccato) to 1.0 (legato)
-                 presence_amount=0.5,  # NEW: Controls presence/brilliance (4-8kHz)
-                 exciter_amount=0.3):  # NEW: Controls harmonic excitement for high freqs
+                 presence_amount=0.5,  # Controls presence/brilliance (4-8kHz)
+                 exciter_amount=0.3,   # Controls harmonic excitement for high freqs
+                 custom_formants=None,  # NEW: Custom formant frequencies
+                 custom_vocal_range=None):  # NEW: Custom vocal range
         super(HumanVocalFilter, self).__init__()
         
         self.sample_rate = sample_rate
@@ -26,8 +28,10 @@ class HumanVocalFilter(nn.Module):
         self.breathiness = breathiness
         self.gender = gender
         self.articulation = articulation
-        self.presence_amount = presence_amount  # NEW
-        self.exciter_amount = exciter_amount    # NEW
+        self.presence_amount = presence_amount
+        self.exciter_amount = exciter_amount
+        self.custom_formants = custom_formants  # NEW
+        self.custom_vocal_range = custom_vocal_range  # NEW
         
         # Initialize formant regions (in Hz) - average values that can be adjusted
         # Format: (F1, F2, F3, F4)
@@ -57,9 +61,17 @@ class HumanVocalFilter(nn.Module):
     
     def _create_vocal_profile(self):
         """Create vocal profile buffers for faster computation"""
-        # Initialize formant profiles based on gender
-        formants = self.formant_regions[self.gender]
-        vocal_range = self.vocal_ranges[self.gender]
+        # Use custom formants if provided, otherwise use gender-based defaults
+        if self.custom_formants is not None:
+            formants = self.custom_formants
+        else:
+            formants = self.formant_regions[self.gender]
+        
+        # Use custom vocal range if provided, otherwise use gender-based defaults
+        if self.custom_vocal_range is not None:
+            vocal_range = self.custom_vocal_range
+        else:
+            vocal_range = self.vocal_ranges[self.gender]
         
         # Register formants as buffer
         self.register_buffer("formants", torch.tensor(formants).float())
@@ -576,7 +588,11 @@ def vocal_frequency_filter(audio, magnitudes, window_size=0, padding='same',
                           gender="neutral", formant_emphasis=True, 
                           vocal_range_boost=True, breathiness=0.3,
                           sample_rate=24000, articulation=0.5,
-                          presence_amount=0.5, exciter_amount=0.3):  # NEW parameters
+                          presence_amount=0.5, exciter_amount=0.3,
+                          # NEW parameters for custom formants and vocal range
+                          formant1_offset=0, formant2_offset=0, 
+                          formant3_offset=0, formant4_offset=0,
+                          vocal_range_min=None, vocal_range_max=None):
     """
     A drop-in replacement for frequency_filter that specializes in human vocals.
     
@@ -599,10 +615,47 @@ def vocal_frequency_filter(audio, magnitudes, window_size=0, padding='same',
                          for the 4-8kHz range. Higher values make vocals more present.
         exciter_amount: Amount of harmonic excitement (0.0 to 1.0) for high frequencies
                         to add "sparkle" and detail. Higher values add more harmonics.
+        formant1_offset: Offset in Hz to apply to the first formant frequency
+        formant2_offset: Offset in Hz to apply to the second formant frequency
+        formant3_offset: Offset in Hz to apply to the third formant frequency
+        formant4_offset: Offset in Hz to apply to the fourth formant frequency
+        vocal_range_min: Custom minimum frequency for vocal range (if None, uses gender default)
+        vocal_range_max: Custom maximum frequency for vocal range (if None, uses gender default)
         
     Returns:
         Filtered audio optimized for vocal characteristics.
     """
+    # Get base formants from gender
+    base_formants = {
+        "male": (500, 1500, 2500, 3500),
+        "female": (550, 1650, 2750, 3850),
+        "neutral": (525, 1575, 2625, 3675),
+        "child": (650, 1750, 2850, 3950)
+    }[gender]
+    
+    # Apply offsets to create custom formants
+    custom_formants = (
+        base_formants[0] + formant1_offset,
+        base_formants[1] + formant2_offset,
+        base_formants[2] + formant3_offset,
+        base_formants[3] + formant4_offset
+    )
+    
+    # Get base vocal range from gender
+    base_range = {
+        "male": (80, 700),
+        "female": (160, 1100),
+        "neutral": (100, 900),
+        "child": (200, 1200)
+    }[gender]
+    
+    # Create custom vocal range if min or max provided
+    custom_vocal_range = None
+    if vocal_range_min is not None or vocal_range_max is not None:
+        range_min = vocal_range_min if vocal_range_min is not None else base_range[0]
+        range_max = vocal_range_max if vocal_range_max is not None else base_range[1]
+        custom_vocal_range = (range_min, range_max)
+    
     # Create the vocal filter
     vocal_filter = HumanVocalFilter(
         sample_rate=sample_rate,
@@ -611,8 +664,10 @@ def vocal_frequency_filter(audio, magnitudes, window_size=0, padding='same',
         breathiness=breathiness,
         gender=gender,
         articulation=articulation,
-        presence_amount=presence_amount,  # NEW
-        exciter_amount=exciter_amount     # NEW
+        presence_amount=presence_amount,
+        exciter_amount=exciter_amount,
+        custom_formants=custom_formants,
+        custom_vocal_range=custom_vocal_range
     ).to(audio.device)
     
     # Apply the filter
