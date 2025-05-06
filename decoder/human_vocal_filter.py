@@ -337,6 +337,9 @@ class HumanVocalFilter(nn.Module):
         if abs(self.articulation - 0.5) < 0.01:
             return magnitudes
         
+        if math.isnan(self.articulation):
+            return magnitudes
+        
         # Get shape information
         batch_size, n_frames, n_frequencies = magnitudes.shape
         

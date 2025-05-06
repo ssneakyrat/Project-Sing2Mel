@@ -313,12 +313,12 @@ def main():
     # Load dataset
     batch_size = 64  # Smaller batch size for complex model
     num_epochs = 1000
-    visualization_interval = 20  # Visualize every 20 epochs
+    visualization_interval = 5  # Visualize every 20 epochs
 
     train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
         batch_size=batch_size,
         num_workers=1,
-        train_files=50,
+        train_files=950,
         val_files=50,
         device=device,
         context_window_sec=2,  # 2-second window
