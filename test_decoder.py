@@ -19,6 +19,7 @@ os.makedirs('visuals', exist_ok=True)
 os.makedirs('visuals/decoder', exist_ok=True)
 os.makedirs('audio_samples', exist_ok=True)
 os.makedirs('visuals/decoder/params', exist_ok=True)  # New folder for parameter visualization
+os.makedirs('visuals/decoder/formants', exist_ok=True)  # New folder for formant and vocal range visualization
 
 def extract_audio_from_dataset(batch, device):
     """Extract original audio from dataset"""
@@ -184,6 +185,145 @@ def visualize_expressive_params_with_waveform(epoch, batch_idx, wave, params, sa
     plt.savefig(f'{save_dir}/params_epoch_{epoch}_batch_{batch_idx}.png')
     plt.close()
 
+def visualize_formant_and_range_params(epoch, batch_idx, wave, params, save_dir='visuals/decoder/formants'):
+    """
+    Create a dedicated visualization for formant offsets and vocal range parameters
+    
+    Args:
+        epoch: Current epoch number
+        batch_idx: Current batch index
+        wave: Predicted waveform
+        params: Dictionary of vocal filter parameters
+        save_dir: Directory to save visualizations
+    """
+    if params is None:
+        return
+    
+    # Check if formant and range parameters exist
+    formant_params = [p for p in ['formant1_offset', 'formant2_offset', 'formant3_offset', 'formant4_offset',
+                                 'noise_formant1_offset', 'noise_formant2_offset', 'noise_formant3_offset', 'noise_formant4_offset'] 
+                      if p in params]
+    range_params = [p for p in ['vocal_range_min', 'vocal_range_max', 'noise_vocal_range_min', 'noise_vocal_range_max'] 
+                    if p in params]
+    
+    if not formant_params and not range_params:
+        return
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+    
+    # Convert waveform to numpy array
+    wave_np = wave[0].detach().cpu().numpy()
+    
+    # Create time axis for waveform
+    sample_time = np.arange(len(wave_np)) / SAMPLE_RATE
+    
+    # Create frame-level time axis for parameters
+    n_frames = next(iter(params.values())).shape[1]
+    frame_time = np.arange(n_frames) * HOP_LENGTH / SAMPLE_RATE
+    
+    # Plot waveform on both subplots as reference
+    for ax in axes:
+        ax.plot(sample_time, wave_np, color='blue', alpha=0.2, label='Waveform')
+        ax.set_xlabel('Time (s)')
+        ax.grid(True, alpha=0.3)
+    
+    # Configure formant subplot
+    ax_formant = axes[0]
+    ax_formant.set_title(f'Formant Offsets (Epoch {epoch}, Batch {batch_idx})')
+    ax_formant.set_ylabel('Formant Offset (Hz)')
+    
+    # Configure vocal range subplot
+    ax_range = axes[1]
+    ax_range.set_title(f'Vocal Range Parameters (Epoch {epoch}, Batch {batch_idx})')
+    ax_range.set_ylabel('Frequency (Hz)')
+    
+    # Colors for formant offsets
+    formant_colors = {
+        'formant1_offset': 'red',
+        'formant2_offset': 'green',
+        'formant3_offset': 'blue',
+        'formant4_offset': 'purple',
+        'noise_formant1_offset': 'darkred',
+        'noise_formant2_offset': 'darkgreen',
+        'noise_formant3_offset': 'darkblue',
+        'noise_formant4_offset': 'darkviolet'
+    }
+    
+    # Colors for vocal ranges
+    range_colors = {
+        'vocal_range_min': 'orange',
+        'vocal_range_max': 'red',
+        'noise_vocal_range_min': 'darkorange',
+        'noise_vocal_range_max': 'darkred'
+    }
+    
+    # Plot formant offsets
+    for param_name in formant_params:
+        # For formant offsets, transform the sigmoid output to the appropriate Hz range
+        if 'formant1' in param_name:
+            # ±100Hz range for F1
+            param_values = (torch.sigmoid(params[param_name][0]) * 2 - 1) * 100
+        elif 'formant2' in param_name:
+            # ±200Hz range for F2
+            param_values = (torch.sigmoid(params[param_name][0]) * 2 - 1) * 200
+        elif 'formant3' in param_name:
+            # ±300Hz range for F3
+            param_values = (torch.sigmoid(params[param_name][0]) * 2 - 1) * 300
+        elif 'formant4' in param_name:
+            # ±400Hz range for F4
+            param_values = (torch.sigmoid(params[param_name][0]) * 2 - 1) * 400
+            
+        param_values = param_values.detach().cpu().numpy()
+        
+        # Reshape if needed
+        if len(param_values.shape) > 1:
+            param_values = param_values.flatten()
+        
+        # Use only up to n_frames points
+        display_frames = min(len(frame_time), len(param_values))
+        ax_formant.plot(
+            frame_time[:display_frames], 
+            param_values[:display_frames], 
+            label=param_name,
+            color=formant_colors.get(param_name, 'gray'),
+            linewidth=2
+        )
+    
+    # Plot vocal range parameters
+    for param_name in range_params:
+        # For vocal range parameters, transform the sigmoid output to the appropriate Hz range
+        if 'min' in param_name:
+            # 0-300Hz range for min
+            param_values = torch.sigmoid(params[param_name][0]) * 300
+        else:  # 'max' in param_name
+            # 300-1500Hz range for max
+            param_values = 300 + torch.sigmoid(params[param_name][0]) * 1200
+            
+        param_values = param_values.detach().cpu().numpy()
+        
+        # Reshape if needed
+        if len(param_values.shape) > 1:
+            param_values = param_values.flatten()
+        
+        # Use only up to n_frames points
+        display_frames = min(len(frame_time), len(param_values))
+        ax_range.plot(
+            frame_time[:display_frames], 
+            param_values[:display_frames], 
+            label=param_name,
+            color=range_colors.get(param_name, 'gray'),
+            linewidth=2
+        )
+    
+    # Add legends
+    ax_formant.legend(loc='upper right')
+    ax_range.legend(loc='upper right')
+    
+    plt.tight_layout()
+    plt.savefig(f'{save_dir}/formant_range_epoch_{epoch}_batch_{batch_idx}.png')
+    plt.close()
+
 def save_audio(waveform, path, sample_rate=SAMPLE_RATE):
     """Save audio waveform to file"""
     # Ensure waveform is in range [-1, 1]
@@ -247,6 +387,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
         # Visualize parameters occasionally during training
         if batch_idx == 0 and epoch % 20 == 0:
             visualize_expressive_params_with_waveform(epoch, batch_idx, wave, vocal_params)
+            # Add the new formant and range visualization
+            visualize_formant_and_range_params(epoch, batch_idx, wave, vocal_params)
     
     avg_loss = total_loss / len(dataloader)
     avg_mel_loss = total_mel_loss / len(dataloader)
@@ -292,6 +434,10 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
                 # Visualize vocal parameters
                 visualize_expressive_params_with_waveform(epoch, batch_idx, wave, vocal_params, 
                                                        save_dir='visuals/decoder/params')
+                
+                # Add the new formant and range visualization
+                visualize_formant_and_range_params(epoch, batch_idx, wave, vocal_params,
+                                                save_dir='visuals/decoder/formants')
         
         avg_loss = total_loss / len(dataloader)
         avg_mel_loss = total_mel_loss / len(dataloader)
@@ -308,6 +454,7 @@ def main():
     os.makedirs('visuals/decoder', exist_ok=True)
     os.makedirs('visuals/decoder/val', exist_ok=True)
     os.makedirs('visuals/decoder/params', exist_ok=True)
+    os.makedirs('visuals/decoder/formants', exist_ok=True)  # New directory for formant visualizations
     os.makedirs('checkpoints', exist_ok=True)
     
     # Load dataset
