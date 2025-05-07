@@ -207,13 +207,13 @@ def main():
     # Load dataset
     batch_size = 32  # Smaller batch size for complex model
     num_epochs = 1000
-    visualization_interval = 10  # Visualize every 5 epochs
+    visualization_interval = 50  # Visualize every 5 epochs
 
     train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
         batch_size=batch_size,
         num_workers=1,
-        train_files=100,
-        val_files=10,
+        train_files=None,
+        val_files=20,
         device=device,
         context_window_sec=2,  # 2-second window
         persistent_workers=True
@@ -306,7 +306,7 @@ def main():
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), 'best_decoder_model.pth')
+            torch.save(model.state_dict(), 'best_encoder_model.pth')
             print(f"  Saved best model with val loss: {val_loss:.4f}")
         
         # Also save regular checkpoints
@@ -319,7 +319,7 @@ def main():
                 'train_loss': train_loss,
                 'val_loss': val_loss,
                 'best_val_loss': best_val_loss,
-            }, f'checkpoints/decoder_checkpoint_epoch_{epoch}.pth')
+            }, f'checkpoints/encoder_checkpoint_epoch_{epoch}.pth')
     
     print("\nTraining completed!")
     print(f"Best validation loss: {best_val_loss:.4f}")

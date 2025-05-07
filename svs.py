@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+from mel_synth import MelSynth
 from encoder.mel_encoder import MelEncoder
 from decoder.feature_extractor import FeatureExtractor
 from decoder.wave_generator_oscillator import WaveGeneratorOscillator
@@ -26,6 +27,7 @@ class SVS(nn.Module):
                  num_harmonics=80, 
                  num_mag_harmonic=256,
                  num_mag_noise=80,
+                 encoder_path=None
                  ):
         super(SVS, self).__init__()
         
@@ -96,6 +98,19 @@ class SVS(nn.Module):
             singer_embed_dim=self.singer_embed_dim,
             language_embed_dim=self.language_embed_dim
         )
+
+        if encoder_path is not None:
+            # Create model
+            model = MelSynth(
+                num_phonemes=num_phonemes,
+                num_singers=num_singers,
+                num_languages=num_languages,
+                n_mels=n_mels,
+                hop_length=hop_length,
+                sample_rate=sample_rate
+            )
+            model.load_state_dict(torch.load(encoder_path))
+            self.mel_encoder = model.mel_encoder
 
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """

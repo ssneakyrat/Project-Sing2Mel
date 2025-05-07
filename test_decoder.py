@@ -40,11 +40,11 @@ def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
         save_dir: Directory to save visualizations
     """
     # Determine number of subplots based on whether latent_mel is provided
-    n_plots = 5 if latent_mel is not None else 4
+    n_plots = 4
     
     # Create figure with subplots
     fig, ax = plt.subplots(n_plots, 1, figsize=(12, 4 * n_plots), 
-                          gridspec_kw={'height_ratios': [1, 1, 1, 1.5, 1.5] if latent_mel is not None else [1, 1, 1.5, 1.5]})
+                          gridspec_kw={'height_ratios': [1, 1, 1, 1.5] })
     
     # Plot original mel
     if mel.dim() == 3 and mel.size(1) == N_MELS:
@@ -303,12 +303,12 @@ def main():
     # Load dataset
     batch_size = 32  # Smaller batch size for complex model
     num_epochs = 1000
-    visualization_interval = 10  # Visualize every 5 epochs
+    visualization_interval = 5  # Visualize every 5 epochs
 
     train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
         batch_size=batch_size,
         num_workers=1,
-        train_files=200,
+        train_files=None,
         val_files=10,
         device=device,
         context_window_sec=2,  # 2-second window
@@ -327,7 +327,8 @@ def main():
         num_languages=num_languages,
         n_mels=N_MELS,
         hop_length=HOP_LENGTH,
-        sample_rate=SAMPLE_RATE
+        sample_rate=SAMPLE_RATE,
+        encoder_path='best_encoder_model.pth'
     ).to(device)
     
     # Print model info
