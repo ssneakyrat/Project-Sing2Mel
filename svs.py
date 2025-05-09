@@ -4,8 +4,9 @@ import torch.nn.functional as F
 import torchaudio
 import numpy as np
 from dsp.stft_generator import STFTGenerator
+from dsp.parameter_predictor import ParameterPredictor
+from dsp.vocal_filter import VocalFilter
 
-# Modified SVS class with MelEncoder and STFTGenerator integration
 class SVS(nn.Module):
     def __init__(self, 
                  num_phonemes, 
@@ -58,60 +59,91 @@ class SVS(nn.Module):
             ).float()
         )
         
-    # This is the modified section of the forward method in svs.py
+        # Add parameter predictor
+        self.parameter_predictor = ParameterPredictor(
+            phoneme_dim=self.phoneme_embed_dim,
+            singer_dim=self.singer_embed_dim,
+            language_dim=self.language_embed_dim,
+            hidden_dim=256,
+            num_formants=5,
+            use_lstm=True
+        )
+        
+        # Add vocal filter
+        self.vocal_filter = VocalFilter(
+            n_fft=self.n_fft,
+            sample_rate=self.sample_rate,
+            use_parallel_filters=True,
+            filter_mode='resonator'
+        )
+        
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
-        Forward pass with simplified STFT generation.
+        Forward pass with formant filtering.
         
         Args:
             f0: Fundamental frequency trajectory [B, T]
             phoneme_seq: Phoneme sequence [B, T] (indices)
             singer_id: Singer IDs [B] (indices)
             language_id: Language IDs [B] (indices)
-            initial_phase: Optional initial phase (not used in this simplified version)
+            initial_phase: Optional initial phase
             
         Returns:
-            Audio signal [B, T*hop_length], mel-spectrogram [B, T, n_mels], STFT [B, F, T]
+            Dictionary containing:
+                'signal': Audio signal [B, T_audio]
+                'mel': Mel-spectrogram [B, T, n_mels]
+                'stft_original': Original STFT [B, F, T]
+                'stft_filtered': Filtered STFT [B, F, T]
+                'filter_params': Filter parameters dict
         """
         batch_size, n_frames = f0.shape[0], f0.shape[1]
+        device = f0.device
         
-        # Apply embeddings (kept for future conditioning)
+        # Apply embeddings
         phoneme_emb = self.phoneme_embed(phoneme_seq)  # [B, T, phoneme_dim]
         singer_emb = self.singer_embed(singer_id)      # [B, singer_dim]
         language_emb = self.language_embed(language_id) # [B, language_dim]
         
-        # Generate STFT using simplified STFTGenerator (using only f0)
-        predicted_stft = self.stft_generator(f0)
+        # Generate STFT using STFTGenerator (using only f0)
+        original_stft = self.stft_generator(f0)
         
-        # Convert STFT to audio using torch's inverse STFT
+        # Predict formant filter parameters
+        filter_params = self.parameter_predictor(
+            f0, 
+            phoneme_emb, 
+            singer_emb, 
+            language_emb
+        )
+        
+        # Apply formant filtering to the STFT
+        filtered_stft = self.vocal_filter(original_stft, filter_params)
+        
+        # Convert filtered STFT to audio using torch's inverse STFT
+        window = torch.hann_window(self.win_length).to(device)
         signal = torch.istft(
-            predicted_stft, 
+            filtered_stft, 
             n_fft=self.n_fft, 
             hop_length=self.hop_length,
             win_length=self.win_length,
-            window=torch.hann_window(self.win_length).to(f0.device),
+            window=window,
             return_complex=False
         )
         
-        # Get magnitude of STFT for mel conversion
-        stft_mag = torch.abs(predicted_stft)  # Shape should be [B, F, T]
+        # Get magnitude of filtered STFT for mel conversion
+        stft_mag = torch.abs(filtered_stft)  # Shape: [B, F, T]
         
-        # Reshape if stft_mag is flattened (this fixes the dimension mismatch)
-        if stft_mag.dim() == 2:
-            F = self.n_fft // 2 + 1  # n_freqs
-            B = batch_size
-            T = stft_mag.shape[1]  # n_frames
-            stft_mag = stft_mag.view(B, F, T)  # Reshape to [B, F, T]
+        # Apply mel transformation
+        mel_basis = self.mel_basis.to(device).transpose(0, 1)  # Shape: [F, M]
         
-        # Transpose mel_basis from [M, F] to [F, M] for correct multiplication
-        mel_basis = self.mel_basis.to(f0.device).transpose(0, 1)  # Shape [F, M]
-        
-        # Apply matrix multiplication for each batch element
+        # Apply matrix multiplication using einsum for better clarity
         # [B, F, T] x [F, M] -> [B, M, T]
-        # Use einsum for clearer dimension handling
         predicted_mel = torch.einsum('bft,fm->bmt', stft_mag, mel_basis)
         
         # Apply log transformation for better dynamic range
         predicted_mel = torch.log(torch.clamp(predicted_mel, min=1e-5))
         
-        return signal, predicted_mel, predicted_stft
+        # Transpose mel to expected [B, T, M] shape
+        predicted_mel = predicted_mel.transpose(1, 2)
+        
+        # Return all relevant outputs
+        return signal, predicted_mel, filtered_stft
