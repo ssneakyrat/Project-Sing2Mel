@@ -40,11 +40,11 @@ def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
         save_dir: Directory to save visualizations
     """
     # Determine number of subplots based on whether latent_mel is provided
-    n_plots = 5 if latent_mel is not None else 4
+    n_plots = 4
     
     # Create figure with subplots
     fig, ax = plt.subplots(n_plots, 1, figsize=(12, 4 * n_plots), 
-                          gridspec_kw={'height_ratios': [1, 1, 1, 1.5, 1.5] if latent_mel is not None else [1, 1, 1.5, 1.5]})
+                          gridspec_kw={'height_ratios': [1, 1, 1.5, 1.5]})
     
     # Plot original mel
     if mel.dim() == 3 and mel.size(1) == N_MELS:
@@ -225,7 +225,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
         
         # Forward pass
         optimizer.zero_grad()
-        wave, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
+        wave, latent_mel, _ = model(f0, phoneme_seq, singer_id, language_id)
         
         # Compute combined loss
         loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
@@ -268,7 +268,7 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
             target_audio = extract_audio_from_dataset(batch, device)
             
             # Forward pass
-            wave, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
+            wave, latent_mel, _ = model(f0, phoneme_seq, singer_id, language_id)
             
             # Compute combined loss
             loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
