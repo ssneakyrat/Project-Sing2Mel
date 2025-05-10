@@ -13,12 +13,6 @@ from dataset_decoder import get_dataloader, SAMPLE_RATE, N_MELS, HOP_LENGTH, WIN
 
 from svs import SVS
 
-# Create visuals folder if it doesn't exist
-os.makedirs('visuals', exist_ok=True)
-os.makedirs('visuals/decoder', exist_ok=True)
-os.makedirs('audio_samples', exist_ok=True)
-os.makedirs('visuals/decoder/params', exist_ok=True)  # New folder for parameter visualization
-
 def extract_audio_from_dataset(batch, device):
     """Extract original audio from dataset"""
     # Simply get the audio from the batch and move it to the device
@@ -297,9 +291,13 @@ def main():
     # Create visualization directories
     os.makedirs('visuals/decoder', exist_ok=True)
     os.makedirs('visuals/decoder/val', exist_ok=True)
-    os.makedirs('visuals/decoder/params', exist_ok=True)
+    os.makedirs('audio_samples', exist_ok=True)
     os.makedirs('checkpoints', exist_ok=True)
     
+    # torch stuff
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+
     # Load dataset
     batch_size = 32  # Smaller batch size for complex model
     num_epochs = 500

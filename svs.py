@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 import numpy as np
-from dsp.stft_generator import STFTGenerator
+from dsp.harmonic_generator import HarmonicGenerator
 from dsp.parameter_predictor import ParameterPredictor
 from dsp.vocal_filter import VocalFilter
 
@@ -40,7 +40,7 @@ class SVS(nn.Module):
         self.language_embed = nn.Embedding(num_languages, self.language_embed_dim)
         
         # STFT Generator with specified number of harmonics
-        self.stft_generator = STFTGenerator(
+        self.stft_generator = HarmonicGenerator(
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             win_length=self.win_length,

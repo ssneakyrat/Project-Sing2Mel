@@ -3,23 +3,20 @@ import torch.nn as nn
 import torchaudio
 import math
 
-class STFTGenerator(nn.Module):
+class HarmonicGenerator(nn.Module):
     def __init__(self, 
                  n_fft=1024, 
                  hop_length=240, 
                  win_length=1024, 
                  sample_rate=24000,
-                 n_harmonics=8):
-        super(STFTGenerator, self).__init__()
+                 n_harmonics=80):
+        super(HarmonicGenerator, self).__init__()
         # STFT parameters
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.win_length = win_length
         self.sample_rate = sample_rate
         self.n_harmonics = n_harmonics
-        
-        # Noise level parameter
-        self.noise_level = nn.Parameter(torch.tensor(0.1), requires_grad=False)
         
         # Pre-compute harmonic multipliers
         self.register_buffer('harmonic_multipliers', 
@@ -55,8 +52,8 @@ class STFTGenerator(nn.Module):
         audio = self._generate_harmonics_vectorized(f0, harmonic_amplitudes)
         
         # 2. Add noise if desired
-        if self.noise_level > 0:
-            audio = audio + torch.randn_like(audio) * self.noise_level
+        #if self.noise_level > 0:
+        #    audio = audio + torch.randn_like(audio) * self.noise_level
         
         # 3. Convert to STFT domain
         stft = torch.stft(
