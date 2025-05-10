@@ -59,7 +59,7 @@ class ParameterPredictor(nn.Module):
         singer_dim=16,
         language_dim=8,
         hidden_dim=256,
-        num_formants=5,
+        num_formants=8,  # Increased from 5 to 8 to capture higher formants
         num_harmonics=8,
         n_noise_bands=8,
         use_lstm=True
@@ -116,33 +116,33 @@ class ParameterPredictor(nn.Module):
         # Define learnable register-dependent formant parameters
         # For each register (chest, mixed, head), define base parameters
         
-        # Initial formant base frequencies - now learnable Parameters
-        chest_formants_init = torch.tensor([500.0, 1500.0, 2500.0, 3500.0, 4500.0][:num_formants])
-        mixed_formants_init = torch.tensor([550.0, 1650.0, 2550.0, 3550.0, 4550.0][:num_formants])
-        head_formants_init = torch.tensor([600.0, 1800.0, 2600.0, 3600.0, 4600.0][:num_formants])
+        # Initial formant base frequencies - MODIFIED: extended to include higher formants
+        chest_formants_init = torch.tensor([500.0, 1500.0, 2500.0, 3500.0, 4500.0, 6000.0, 8000.0, 10000.0][:num_formants])
+        mixed_formants_init = torch.tensor([550.0, 1650.0, 2550.0, 3550.0, 4800.0, 6500.0, 8500.0, 11000.0][:num_formants])
+        head_formants_init = torch.tensor([600.0, 1800.0, 2600.0, 3800.0, 5200.0, 7000.0, 9000.0, 12000.0][:num_formants])
         
         # Learnable parameters for each register's formant frequencies
         self.chest_formant_freqs = nn.Parameter(chest_formants_init, requires_grad=True)
         self.mixed_formant_freqs = nn.Parameter(mixed_formants_init, requires_grad=True)
         self.head_formant_freqs = nn.Parameter(head_formants_init, requires_grad=True)
         
-        # Initial bandwidth bases - now learnable Parameters
-        chest_bw_init = torch.tensor([80.0, 100.0, 120.0, 150.0, 200.0][:num_formants])
-        mixed_bw_init = torch.tensor([100.0, 120.0, 140.0, 170.0, 220.0][:num_formants])
-        head_bw_init = torch.tensor([120.0, 150.0, 180.0, 200.0, 250.0][:num_formants])
+        # Initial bandwidth bases - adjusted for higher formants
+        chest_bw_init = torch.tensor([80.0, 100.0, 120.0, 150.0, 200.0, 300.0, 400.0, 500.0][:num_formants])
+        mixed_bw_init = torch.tensor([100.0, 120.0, 140.0, 170.0, 220.0, 350.0, 450.0, 550.0][:num_formants])
+        head_bw_init = torch.tensor([120.0, 150.0, 180.0, 200.0, 250.0, 400.0, 500.0, 600.0][:num_formants])
         
         # Learnable parameters for each register's bandwidth bases
         self.chest_bandwidth_base = nn.Parameter(chest_bw_init, requires_grad=True)
         self.mixed_bandwidth_base = nn.Parameter(mixed_bw_init, requires_grad=True)
         self.head_bandwidth_base = nn.Parameter(head_bw_init, requires_grad=True)
         
-        # Maximum deviations are still fixed buffers since they represent physical constraints
+        # Maximum deviations - MODIFIED: increased for higher formants and to allow more variation
         self.register_buffer('formant_max_deviation', 
-                          torch.tensor([300.0, 800.0, 1000.0, 1000.0, 1000.0][:num_formants]))
+                          torch.tensor([300.0, 800.0, 1000.0, 1200.0, 1500.0, 1800.0, 2000.0, 2000.0][:num_formants]))
         
-        # Bandwidth scaling is still a fixed buffer
+        # Bandwidth scaling - MODIFIED: adjusted for higher formants
         self.register_buffer('bandwidth_scaling', 
-                          torch.tensor([100.0, 150.0, 200.0, 250.0, 300.0][:num_formants]))
+                          torch.tensor([100.0, 150.0, 200.0, 250.0, 350.0, 450.0, 550.0, 650.0][:num_formants]))
         
         # Output layers for formant parameters
         # For each formant: frequency deviation, bandwidth, and amplitude
@@ -173,15 +173,16 @@ class ParameterPredictor(nn.Module):
             device = formants.device
             
             # Minimum spacing between adjacent formants (Hz) - move to correct device
-            min_spacing = torch.tensor([500.0, 500.0, 500.0, 500.0][:self.num_formants-1], device=device)
+            # MODIFIED: adjusted for higher formants
+            min_spacing = torch.tensor([500.0, 500.0, 600.0, 700.0, 800.0, 1000.0, 1200.0][:self.num_formants-1], device=device)
             
             # Check spacing between adjacent formants
             formant_diffs = formants[1:] - formants[:-1]
             spacing_loss = torch.relu(min_spacing - formant_diffs).sum()
             
-            # Check absolute formant ranges - move to correct device
-            min_formant_values = torch.tensor([300.0, 800.0, 1800.0, 2800.0, 3800.0][:self.num_formants], device=device)
-            max_formant_values = torch.tensor([1000.0, 2500.0, 3500.0, 4500.0, 5500.0][:self.num_formants], device=device)
+            # Check absolute formant ranges - MODIFIED: extended to higher formants and increased range
+            min_formant_values = torch.tensor([300.0, 800.0, 1800.0, 2800.0, 3800.0, 5000.0, 7000.0, 9000.0][:self.num_formants], device=device)
+            max_formant_values = torch.tensor([1000.0, 2500.0, 3500.0, 5000.0, 7000.0, 9000.0, 12000.0, 15000.0][:self.num_formants], device=device)
             
             range_loss_min = torch.relu(min_formant_values - formants).sum()
             range_loss_max = torch.relu(formants - max_formant_values).sum()
@@ -266,7 +267,8 @@ class ParameterPredictor(nn.Module):
             x, _ = self.lstm(x)  # [B, T, hidden_dim]
         
         # Calculate phoneme-specific formant adjustments
-        phoneme_adjust = torch.tanh(self.phoneme_formant_adjust(phoneme_emb)) * 200.0  # Scale to reasonable range
+        # MODIFIED: increased the adjustment range for more expression
+        phoneme_adjust = torch.tanh(self.phoneme_formant_adjust(phoneme_emb)) * 400.0  # Scale to larger range
         
         # Get formant parameters using separate projection layers
         # Frequency deviations (to be added to base frequencies)

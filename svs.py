@@ -65,13 +65,13 @@ class SVS(nn.Module):
             ).float()
         )
         
-        # Updated parameter predictor with register awareness
+        # Updated parameter predictor with register awareness and more formants
         self.parameter_predictor = ParameterPredictor(
             phoneme_dim=self.phoneme_embed_dim,
             singer_dim=self.singer_embed_dim,
             language_dim=self.language_embed_dim,
             hidden_dim=256,
-            num_formants=5,
+            num_formants=8,  # Increased from 5 to 8 to model higher formants
             num_harmonics=self.n_harmonics,
             n_noise_bands=self.n_noise_bands,
             use_lstm=True
@@ -97,7 +97,7 @@ class SVS(nn.Module):
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
         Forward pass with dynamic harmonic amplitudes, formant filtering, and noise components.
-        Now with register-aware formant adaptation.
+        Now with register-aware formant adaptation and enhanced high-frequency modeling.
         
         Args:
             f0: Fundamental frequency trajectory [B, T]

@@ -22,11 +22,24 @@ class HarmonicGenerator(nn.Module):
         self.register_buffer('harmonic_multipliers', 
                              torch.arange(1, n_harmonics + 1).float())
         
-        # Pre-compute default harmonic amplitudes
-        default_distribution = torch.tensor([
-            1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125
-        ][:self.n_harmonics])
-        self.register_buffer('default_harmonic_amps', default_distribution)
+        # MODIFIED: Pre-compute improved harmonic amplitudes with more gradual falloff
+        # and a "singer's formant" boost in the relevant frequency region
+        improved_distribution = torch.zeros(n_harmonics)
+        
+        # More gradual falloff for all harmonics (exponential decay)
+        improved_distribution = torch.exp(-0.1 * torch.arange(n_harmonics))
+        
+        # Add a "singer's formant" bump around harmonics that would hit 2-4kHz
+        # For a typical pitch of 250-300Hz, harmonics 8-16 would be in this range
+        improved_distribution[8:16] *= 1.5  # Boost in this region
+        
+        # Add some energy to higher harmonics for brightness
+        improved_distribution[20:40] *= 1.3  # Boost higher harmonics
+        
+        # Normalize the distribution
+        improved_distribution = improved_distribution / improved_distribution[0]
+        
+        self.register_buffer('default_harmonic_amps', improved_distribution)
         
     def forward(self, f0, harmonic_amplitudes=None):
         """
@@ -47,6 +60,16 @@ class HarmonicGenerator(nn.Module):
         if harmonic_amplitudes is None:
             harmonic_amplitudes = self.default_harmonic_amps.view(1, 1, -1).expand(
                 batch_size, n_frames, self.n_harmonics)
+        # If harmonic amplitudes are provided but for fewer harmonics than we support,
+        # pad with the default distribution (scaled appropriately)
+        elif harmonic_amplitudes.shape[2] < self.n_harmonics:
+            provided_harmonics = harmonic_amplitudes.shape[2]
+            padding = self.default_harmonic_amps[provided_harmonics:].view(1, 1, -1).expand(
+                batch_size, n_frames, self.n_harmonics - provided_harmonics)
+            # Scale padding based on the last provided harmonic amplitude
+            scale_factor = harmonic_amplitudes[:, :, -1:] / self.default_harmonic_amps[provided_harmonics-1]
+            padding = padding * scale_factor
+            harmonic_amplitudes = torch.cat([harmonic_amplitudes, padding], dim=2)
         
         # 1. Generate time-domain signal
         audio = self._generate_harmonics_vectorized(f0, harmonic_amplitudes)
@@ -110,6 +133,12 @@ class HarmonicGenerator(nn.Module):
         f0_interp = f0_prev + interp_weights * (f0_next - f0_prev)
         f0_interp = torch.clamp(f0_interp, min=0.0)
         
+        # MODIFIED: Add slight jitter to f0 for more realistic high-frequency content
+        # This simulates the micro-fluctuations in pitch that contribute to natural voice timbre
+        jitter_amount = 0.003  # 0.3% jitter - enough to add texture without affecting pitch perception
+        jitter = 1.0 + jitter_amount * (torch.rand_like(f0_interp) - 0.5)
+        f0_interp = f0_interp * jitter
+
         # Calculate phase by integrating frequency
         phase = torch.cumsum(2 * math.pi * f0_interp / self.sample_rate, dim=1)
         
@@ -119,6 +148,12 @@ class HarmonicGenerator(nn.Module):
         h_amps_prev = harmonic_amplitudes[:, prev_frame_idx, :]
         h_amps_next = harmonic_amplitudes[:, next_frame_idx, :]
         h_amps_interp = h_amps_prev + interp_weights.unsqueeze(-1) * (h_amps_next - h_amps_prev)
+        
+        # MODIFIED: Add slight amplitude shimmer for more realistic high-frequency content
+        # This simulates the micro-fluctuations in amplitude that contribute to natural voice timbre
+        shimmer_amount = 0.02  # 2% shimmer
+        shimmer = 1.0 + shimmer_amount * (torch.rand_like(h_amps_interp) - 0.5)
+        h_amps_interp = h_amps_interp * shimmer
         
         # Vectorized harmonic synthesis - calculate all harmonics at once
         # We use broadcasting to create all harmonic phases
