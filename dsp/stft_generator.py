@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torchaudio
+import math
 
 class STFTGenerator(nn.Module):
     def __init__(self, 
@@ -17,13 +18,22 @@ class STFTGenerator(nn.Module):
         self.sample_rate = sample_rate
         self.n_harmonics = n_harmonics
         
-        # Remove fixed harmonic_distribution parameter
-        # Keep the noise level parameter
+        # Noise level parameter
         self.noise_level = nn.Parameter(torch.tensor(0.1), requires_grad=False)
+        
+        # Pre-compute harmonic multipliers
+        self.register_buffer('harmonic_multipliers', 
+                             torch.arange(1, n_harmonics + 1).float())
+        
+        # Pre-compute default harmonic amplitudes
+        default_distribution = torch.tensor([
+            1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125
+        ][:self.n_harmonics])
+        self.register_buffer('default_harmonic_amps', default_distribution)
         
     def forward(self, f0, harmonic_amplitudes=None):
         """
-        Generate simplified STFT with harmonic and noise components.
+        Generate audio by synthesizing harmonics in time domain, then converting to STFT.
         
         Args:
             f0: Fundamental frequency trajectory [B, T]
@@ -34,100 +44,152 @@ class STFTGenerator(nn.Module):
             Complex STFT representation [B, F, T] where F = n_fft//2 + 1
         """
         batch_size, n_frames = f0.shape
-        n_freqs = self.n_fft // 2 + 1
         device = f0.device
         
-        # If harmonic_amplitudes is not provided, use default falloff pattern
+        # Set up harmonic amplitudes
         if harmonic_amplitudes is None:
-            # Create default harmonic amplitudes with falloff pattern
-            default_distribution = torch.tensor(
-                [1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125][:self.n_harmonics],
-                device=device
-            )
-            # Expand to [B, T, n_harmonics]
-            harmonic_amplitudes = default_distribution.view(1, 1, -1).expand(batch_size, n_frames, -1)
+            harmonic_amplitudes = self.default_harmonic_amps.view(1, 1, -1).expand(
+                batch_size, n_frames, self.n_harmonics)
         
-        # 1. Generate harmonic components with dynamic amplitudes
-        harmonic_stft = self._generate_simple_harmonics(f0, n_freqs, harmonic_amplitudes)
+        # 1. Generate time-domain signal
+        audio = self._generate_harmonics_vectorized(f0, harmonic_amplitudes)
         
-        # 2. Generate simple noise component in frequency domain
-        noise_stft = self._generate_simple_noise(batch_size, n_frames, n_freqs)
+        # 2. Add noise if desired
+        if self.noise_level > 0:
+            audio = audio + torch.randn_like(audio) * self.noise_level
         
-        # 3. Combine components
-        combined_stft = harmonic_stft + noise_stft
+        # 3. Convert to STFT domain
+        stft = torch.stft(
+            audio,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=torch.hann_window(self.win_length, device=device),
+            return_complex=True
+        )
         
-        return combined_stft
-        
-    def _generate_simple_harmonics(self, f0, n_freqs, harmonic_amplitudes):
+        # Trim to match expected number of frames
+        return stft[:, :, :n_frames]
+    
+    def _generate_harmonics_vectorized(self, f0, harmonic_amplitudes):
         """
-        Differentiable harmonic generation using soft binning and dynamic amplitudes.
+        Fully vectorized harmonic signal generation.
         
         Args:
             f0: Fundamental frequency trajectory [B, T]
-            n_freqs: Number of frequency bins
             harmonic_amplitudes: Harmonic amplitude values [B, T, n_harmonics]
+            
+        Returns:
+            Audio waveform [B, N] where N is the number of audio samples
         """
         batch_size, n_frames = f0.shape
         device = f0.device
         
-        # Initialize empty STFT tensor
-        harmonic_stft_real = torch.zeros((batch_size, n_freqs, n_frames), device=device)
-        harmonic_stft_imag = torch.zeros((batch_size, n_freqs, n_frames), device=device)
+        # Calculate total audio samples
+        total_samples = (n_frames - 1) * self.hop_length + self.win_length
         
-        # Create meshgrid for all bin indices
-        all_bins = torch.arange(n_freqs, device=device).view(1, -1, 1)  # [1, F, 1]
+        # Create time points for each sample
+        sample_times = torch.arange(total_samples, device=device) / self.sample_rate
+        frame_times = torch.arange(n_frames, device=device) * self.hop_length / self.sample_rate
         
-        # Vectorized approach: create tensors for all harmonics at once
-        # Create harmonic numbers tensor
-        harmonic_numbers = torch.arange(1, self.n_harmonics + 1, device=device).float()
+        # Process each batch in parallel
+        audio = torch.zeros(batch_size, total_samples, device=device)
         
-        # Calculate all harmonic frequencies at once
-        # [B, T, 1] * [n_harmonics] -> [B, T, n_harmonics]
-        all_harmonic_freqs = f0.unsqueeze(-1) * harmonic_numbers.view(1, 1, -1)
+        # Vectorized interpolation for all batches at once
+        # This avoids the need for a batch loop
         
-        # Calculate bin indices for all harmonics
-        # [B, T, n_harmonics]
-        all_bin_indices = all_harmonic_freqs * self.n_fft / self.sample_rate
+        # Create indices for batch dimension to use in advanced indexing
+        batch_indices = torch.arange(batch_size, device=device)
         
-        # Process each harmonic (still need a loop, but we're more vectorized inside)
-        for h in range(self.n_harmonics):
-            # Get bin indices for this harmonic [B, T]
-            bin_indices_float = all_bin_indices[:, :, h]
-            
-            # Reshape for broadcasting
-            bin_indices_float = bin_indices_float.unsqueeze(1)  # [B, 1, T]
-            
-            # Compute distance from each bin center (soft binning)
-            distance = torch.abs(all_bins - bin_indices_float)  # [B, F, T]
-            
-            # Use a triangular window for soft binning
-            window_width = 1.0
-            weight = torch.clamp(1.0 - distance / window_width, min=0.0)
-            
-            # Apply amplitude from harmonic_amplitudes
-            # harmonic_amplitudes shape is [B, T, n_harmonics]
-            # Reshape to [B, 1, T] for broadcasting with weight [B, F, T]
-            amplitude = harmonic_amplitudes[:, :, h].unsqueeze(1)  # [B, 1, T]
-            
-            # Apply contribution
-            contribution = weight * amplitude
-            
-            # Add contribution to the STFT real part
-            harmonic_stft_real += contribution
+        # Create index tensors for sample-based lookup
+        # These allow us to map from each audio sample to the appropriate frame
+        prev_frame_idx, next_frame_idx, interp_weights = self._create_interpolation_indices(
+            frame_times, sample_times)
         
-        # Combine real and imaginary parts into complex STFT
-        harmonic_stft = torch.complex(harmonic_stft_real, harmonic_stft_imag)
-        return harmonic_stft
+        # Setup for interpolating f0 values
+        # Shape: [B, N]
+        f0_prev = f0[:, prev_frame_idx]
+        f0_next = f0[:, next_frame_idx]
+        f0_interp = f0_prev + interp_weights * (f0_next - f0_prev)
+        f0_interp = torch.clamp(f0_interp, min=0.0)
         
-    def _generate_simple_noise(self, batch_size, n_frames, n_freqs):
+        # Calculate phase by integrating frequency
+        phase = torch.cumsum(2 * math.pi * f0_interp / self.sample_rate, dim=1)
+        
+        # Get harmonic amplitudes for each sample
+        # First interpolate all harmonics at once
+        # Shape: [B, N, H]
+        h_amps_prev = harmonic_amplitudes[:, prev_frame_idx, :]
+        h_amps_next = harmonic_amplitudes[:, next_frame_idx, :]
+        h_amps_interp = h_amps_prev + interp_weights.unsqueeze(-1) * (h_amps_next - h_amps_prev)
+        
+        # Vectorized harmonic synthesis - calculate all harmonics at once
+        # We use broadcasting to create all harmonic phases
+        # Shape: [B, N, H]
+        harmonic_phases = phase.unsqueeze(-1) * self.harmonic_multipliers.view(1, 1, -1)
+        
+        # Generate all harmonics at once
+        # Shape: [B, N, H]
+        harmonic_signals = h_amps_interp * torch.sin(harmonic_phases)
+        
+        # Sum all harmonics
+        # Shape: [B, N]
+        audio = torch.sum(harmonic_signals, dim=2)
+        
+        # Normalize audio (without loop)
+        max_vals = torch.max(torch.abs(audio), dim=1, keepdim=True)[0]
+        max_vals = torch.clamp(max_vals, min=1e-7)
+        audio = audio / max_vals
+        
+        return audio
+    
+    def _create_interpolation_indices(self, frame_times, sample_times):
         """
-        Generate simple white noise in the STFT domain.
+        Create indices for efficient interpolation.
+        
+        Args:
+            frame_times: Time points for each frame [T]
+            sample_times: Time points for each sample [N]
+            
+        Returns:
+            prev_frame_idx: Index of previous frame for each sample [N]
+            next_frame_idx: Index of next frame for each sample [N]
+            interp_weights: Interpolation weights for each sample [N]
         """
-        device = next(self.parameters()).device
+        n_frames = frame_times.shape[0]
+        device = frame_times.device
         
-        # Generate random complex values for noise
-        noise_real = torch.randn(batch_size, n_freqs, n_frames, device=device) * self.noise_level
-        noise_imag = torch.randn(batch_size, n_freqs, n_frames, device=device) * self.noise_level
+        # Create sample times matrix of shape [N, 1]
+        sample_times = sample_times.unsqueeze(1)
         
-        noise_stft = torch.complex(noise_real, noise_imag)
-        return noise_stft
+        # Create frame times matrix of shape [1, T]
+        frame_times_mat = frame_times.unsqueeze(0)
+        
+        # Calculate time differences: [N, T]
+        # Each row represents all frame time differences for a single sample time
+        time_diffs = sample_times - frame_times_mat
+        
+        # Create mask of valid (non-negative) differences: [N, T]
+        # For each sample, all frames that occurred earlier or at the same time will be 1
+        valid_frames = (time_diffs >= 0).float()
+        
+        # For each sample, calculate the latest valid frame
+        # Sum valid_frames across dim 1 and subtract 1 to get the index
+        prev_frame_idx = torch.sum(valid_frames, dim=1).long() - 1
+        
+        # Handle edge cases for first and last frames
+        prev_frame_idx = torch.clamp(prev_frame_idx, 0, n_frames - 2)
+        next_frame_idx = prev_frame_idx + 1
+        
+        # Get actual frame times for interpolation
+        prev_times = frame_times[prev_frame_idx]
+        next_times = frame_times[next_frame_idx]
+        
+        # Calculate interpolation weights
+        time_deltas = next_times - prev_times
+        time_deltas = torch.clamp(time_deltas, min=1e-7)  # Avoid division by zero
+        
+        interp_weights = (sample_times.squeeze(1) - prev_times) / time_deltas
+        interp_weights = torch.clamp(interp_weights, 0.0, 1.0)
+        
+        return prev_frame_idx, next_frame_idx, interp_weights
