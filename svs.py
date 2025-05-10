@@ -13,6 +13,7 @@ class SVS(nn.Module):
                  num_singers, 
                  num_languages,
                  n_mels=80, 
+                 n_harmonics=80,  # Changed from 80 to 8 to match STFT Generator default
                  hop_length=240, 
                  win_length=1024,
                  n_fft=1024,
@@ -22,6 +23,7 @@ class SVS(nn.Module):
         
         # Basic parameters
         self.n_mels = n_mels
+        self.n_harmonics = n_harmonics
         self.hop_length = hop_length
         self.win_length = win_length
         self.n_fft = n_fft
@@ -37,12 +39,13 @@ class SVS(nn.Module):
         self.singer_embed = nn.Embedding(num_singers, self.singer_embed_dim)
         self.language_embed = nn.Embedding(num_languages, self.language_embed_dim)
         
-        # STFT Generator
+        # STFT Generator with specified number of harmonics
         self.stft_generator = STFTGenerator(
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             win_length=self.win_length,
-            sample_rate=self.sample_rate
+            sample_rate=self.sample_rate,
+            n_harmonics=self.n_harmonics
         )
         
         # Create mel transform for converting STFT to mel
@@ -59,13 +62,14 @@ class SVS(nn.Module):
             ).float()
         )
         
-        # Add parameter predictor
+        # Add parameter predictor with harmonic amplitude prediction
         self.parameter_predictor = ParameterPredictor(
             phoneme_dim=self.phoneme_embed_dim,
             singer_dim=self.singer_embed_dim,
             language_dim=self.language_embed_dim,
             hidden_dim=256,
             num_formants=5,
+            num_harmonics=self.n_harmonics,  # Pass number of harmonics
             use_lstm=True
         )
         
@@ -79,7 +83,7 @@ class SVS(nn.Module):
         
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
-        Forward pass with formant filtering.
+        Forward pass with dynamic harmonic amplitudes and formant filtering.
         
         Args:
             f0: Fundamental frequency trajectory [B, T]
@@ -89,12 +93,9 @@ class SVS(nn.Module):
             initial_phase: Optional initial phase
             
         Returns:
-            Dictionary containing:
-                'signal': Audio signal [B, T_audio]
-                'mel': Mel-spectrogram [B, T, n_mels]
-                'stft_original': Original STFT [B, F, T]
-                'stft_filtered': Filtered STFT [B, F, T]
-                'filter_params': Filter parameters dict
+            signal: Audio signal [B, T_audio]
+            predicted_mel: Mel-spectrogram [B, T, n_mels]
+            filtered_stft: Filtered STFT [B, F, T]
         """
         batch_size, n_frames = f0.shape[0], f0.shape[1]
         device = f0.device
@@ -104,16 +105,23 @@ class SVS(nn.Module):
         singer_emb = self.singer_embed(singer_id)      # [B, singer_dim]
         language_emb = self.language_embed(language_id) # [B, language_dim]
         
-        # Generate STFT using STFTGenerator (using only f0)
-        original_stft = self.stft_generator(f0)
-        
-        # Predict formant filter parameters
-        filter_params = self.parameter_predictor(
+        # Predict formant filter parameters and harmonic amplitudes
+        params = self.parameter_predictor(
             f0, 
             phoneme_emb, 
             singer_emb, 
             language_emb
         )
+        
+        # Generate STFT using STFTGenerator with dynamic harmonic amplitudes
+        original_stft = self.stft_generator(f0, params['harmonic_amplitudes'])
+        
+        # Extract formant filter parameters 
+        filter_params = {
+            'frequencies': params['frequencies'],
+            'bandwidths': params['bandwidths'],
+            'amplitudes': params['amplitudes']
+        }
         
         # Apply formant filtering to the STFT
         filtered_stft = self.vocal_filter(original_stft, filter_params)

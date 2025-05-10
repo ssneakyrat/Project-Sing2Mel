@@ -3,10 +3,11 @@ import torch.nn as nn
 
 class ParameterPredictor(nn.Module):
     """
-    Predicts formant filter parameters from input features.
+    Predicts formant filter parameters and harmonic amplitudes from input features.
     
     This module uses phoneme embeddings, singer embeddings, language embeddings,
-    and fundamental frequency (f0) to predict parameters for a formant filter bank.
+    and fundamental frequency (f0) to predict parameters for a formant filter bank
+    and harmonic amplitudes for the source signal.
     """
     def __init__(
         self,
@@ -15,6 +16,7 @@ class ParameterPredictor(nn.Module):
         language_dim=8,
         hidden_dim=256,
         num_formants=5,
+        num_harmonics=8,  # Add this parameter
         use_lstm=True
     ):
         """
@@ -26,11 +28,13 @@ class ParameterPredictor(nn.Module):
             language_dim: Dimension of language embeddings
             hidden_dim: Dimension of hidden layers
             num_formants: Number of formants to model
+            num_harmonics: Number of harmonics to model
             use_lstm: Whether to use LSTM for temporal modeling
         """
         super(ParameterPredictor, self).__init__()
         
         self.num_formants = num_formants
+        self.num_harmonics = num_harmonics
         self.use_lstm = use_lstm
         
         # Input feature dimension
@@ -75,9 +79,12 @@ class ParameterPredictor(nn.Module):
         self.bandwidth_fc = nn.Linear(hidden_dim, num_formants)
         self.amplitude_fc = nn.Linear(hidden_dim, num_formants)
         
+        # Add output layer for harmonic amplitudes
+        self.harmonic_amplitude_fc = nn.Linear(hidden_dim, num_harmonics)
+        
     def forward(self, f0, phoneme_emb, singer_emb, language_emb):
         """
-        Forward pass to predict formant filter parameters.
+        Forward pass to predict formant filter parameters and harmonic amplitudes.
         
         Args:
             f0: Fundamental frequency [B, T]
@@ -86,10 +93,11 @@ class ParameterPredictor(nn.Module):
             language_emb: Language embeddings [B, language_dim]
             
         Returns:
-            Dictionary with formant parameters:
+            Dictionary with formant and harmonic parameters:
                 'frequencies': Formant frequencies [B, T, num_formants]
                 'bandwidths': Formant bandwidths [B, T, num_formants]
                 'amplitudes': Formant amplitudes [B, T, num_formants]
+                'harmonic_amplitudes': Harmonic amplitudes [B, T, num_harmonics]
         """
         batch_size, seq_len = f0.shape
         device = f0.device
@@ -137,11 +145,16 @@ class ParameterPredictor(nn.Module):
         bandwidth_scaling = self.bandwidth_scaling.to(device).expand(batch_size, seq_len, -1)
         bandwidths = bandwidth_base + bandwidth_factors * bandwidth_scaling
         
-        # Amplitudes - values in [0, 1] range
-        amplitudes = torch.sigmoid(self.amplitude_fc(x))
+        # Formant amplitudes - values in [0, 1] range
+        formant_amplitudes = torch.sigmoid(self.amplitude_fc(x))
+        
+        # Harmonic amplitudes - values in [0, 1] range
+        # This controls the relative strength of each harmonic in the source signal
+        harmonic_amplitudes = torch.sigmoid(self.harmonic_amplitude_fc(x))
         
         return {
-            'frequencies': frequencies,  # [B, T, num_formants]
-            'bandwidths': bandwidths,    # [B, T, num_formants]
-            'amplitudes': amplitudes     # [B, T, num_formants]
+            'frequencies': frequencies,              # [B, T, num_formants]
+            'bandwidths': bandwidths,                # [B, T, num_formants]
+            'amplitudes': formant_amplitudes,        # [B, T, num_formants]
+            'harmonic_amplitudes': harmonic_amplitudes  # [B, T, num_harmonics]
         }
