@@ -6,6 +6,7 @@ import numpy as np
 from dsp.harmonic_generator import HarmonicGenerator
 from dsp.parameter_predictor import ParameterPredictor
 from dsp.vocal_filter import VocalFilter
+from dsp.noise_generator import NoiseGenerator  # Import the new NoiseGenerator
 
 class SVS(nn.Module):
     def __init__(self, 
@@ -13,7 +14,8 @@ class SVS(nn.Module):
                  num_singers, 
                  num_languages,
                  n_mels=80, 
-                 n_harmonics=80,  # Changed from 80 to 8 to match STFT Generator default
+                 n_harmonics=80,
+                 n_noise_bands=8,  # New parameter for noise bands
                  hop_length=240, 
                  win_length=1024,
                  n_fft=1024,
@@ -24,6 +26,7 @@ class SVS(nn.Module):
         # Basic parameters
         self.n_mels = n_mels
         self.n_harmonics = n_harmonics
+        self.n_noise_bands = n_noise_bands
         self.hop_length = hop_length
         self.win_length = win_length
         self.n_fft = n_fft
@@ -62,14 +65,15 @@ class SVS(nn.Module):
             ).float()
         )
         
-        # Add parameter predictor with harmonic amplitude prediction
+        # Add parameter predictor with harmonic amplitude and noise parameter prediction
         self.parameter_predictor = ParameterPredictor(
             phoneme_dim=self.phoneme_embed_dim,
             singer_dim=self.singer_embed_dim,
             language_dim=self.language_embed_dim,
             hidden_dim=256,
             num_formants=5,
-            num_harmonics=self.n_harmonics,  # Pass number of harmonics
+            num_harmonics=self.n_harmonics,
+            n_noise_bands=self.n_noise_bands,  # Pass number of noise bands
             use_lstm=True
         )
         
@@ -81,9 +85,18 @@ class SVS(nn.Module):
             filter_mode='resonator'
         )
         
+        # Add noise generator (new)
+        self.noise_generator = NoiseGenerator(
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            sample_rate=self.sample_rate,
+            n_bands=self.n_noise_bands
+        )
+        
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
-        Forward pass with dynamic harmonic amplitudes and formant filtering.
+        Forward pass with dynamic harmonic amplitudes, formant filtering, and noise components.
         
         Args:
             f0: Fundamental frequency trajectory [B, T]
@@ -95,7 +108,7 @@ class SVS(nn.Module):
         Returns:
             signal: Audio signal [B, T_audio]
             predicted_mel: Mel-spectrogram [B, T, n_mels]
-            filtered_stft: Filtered STFT [B, F, T]
+            mixed_stft: Combined harmonic and noise STFT [B, F, T]
         """
         batch_size, n_frames = f0.shape[0], f0.shape[1]
         device = f0.device
@@ -105,7 +118,7 @@ class SVS(nn.Module):
         singer_emb = self.singer_embed(singer_id)      # [B, singer_dim]
         language_emb = self.language_embed(language_id) # [B, language_dim]
         
-        # Predict formant filter parameters and harmonic amplitudes
+        # Predict parameters for both harmonic and noise components
         params = self.parameter_predictor(
             f0, 
             phoneme_emb, 
@@ -113,8 +126,8 @@ class SVS(nn.Module):
             language_emb
         )
         
-        # Generate STFT using STFTGenerator with dynamic harmonic amplitudes
-        original_stft = self.stft_generator(f0, params['harmonic_amplitudes'])
+        # Generate harmonic STFT using STFTGenerator with dynamic harmonic amplitudes
+        harmonic_stft = self.stft_generator(f0, params['harmonic_amplitudes'])
         
         # Extract formant filter parameters 
         filter_params = {
@@ -123,13 +136,30 @@ class SVS(nn.Module):
             'amplitudes': params['amplitudes']
         }
         
-        # Apply formant filtering to the STFT
-        filtered_stft = self.vocal_filter(original_stft, filter_params)
+        # Apply formant filtering to the harmonic STFT
+        filtered_stft = self.vocal_filter(harmonic_stft, filter_params)
         
-        # Convert filtered STFT to audio using torch's inverse STFT
+        # Generate noise STFT using NoiseGenerator (new)
+        noise_params = {
+            'noise_gain': params['noise_gain'],
+            'spectral_shape': params['spectral_shape'],
+            'voiced_mix': params['voiced_mix']
+        }
+        noise_stft = self.noise_generator(noise_params)
+        
+        # Mix harmonic and noise components (new)
+        # voiced_mix controls the ratio: 1 = fully voiced, 0 = fully unvoiced
+        # Note: Need to expand dimensions for broadcasting
+        voiced_mix = params['voiced_mix'].transpose(1, 2)  # [B, 1, T]
+        
+        # Mix with proper broadcasting
+        # [B, F, T] dimensions for all
+        mixed_stft = filtered_stft * voiced_mix + noise_stft * (1.0 - voiced_mix)
+        
+        # Convert mixed STFT to audio using torch's inverse STFT
         window = torch.hann_window(self.win_length).to(device)
         signal = torch.istft(
-            filtered_stft, 
+            mixed_stft,  # Use mixed STFT instead of just filtered
             n_fft=self.n_fft, 
             hop_length=self.hop_length,
             win_length=self.win_length,
@@ -137,8 +167,8 @@ class SVS(nn.Module):
             return_complex=False
         )
         
-        # Get magnitude of filtered STFT for mel conversion
-        stft_mag = torch.abs(filtered_stft)  # Shape: [B, F, T]
+        # Get magnitude of mixed STFT for mel conversion
+        stft_mag = torch.abs(mixed_stft)  # Shape: [B, F, T]
         
         # Apply mel transformation
         mel_basis = self.mel_basis.to(device).transpose(0, 1)  # Shape: [F, M]
@@ -154,4 +184,4 @@ class SVS(nn.Module):
         predicted_mel = predicted_mel.transpose(1, 2)
         
         # Return all relevant outputs
-        return signal, predicted_mel, filtered_stft
+        return signal, predicted_mel, mixed_stft
