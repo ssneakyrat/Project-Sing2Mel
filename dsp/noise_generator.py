@@ -44,35 +44,55 @@ class NoiseGenerator(nn.Module):
         # Register band edges as buffer
         self.register_buffer('band_edges', fft_bins)
         
-        # Create band filters (triangular filters in mel space)
-        # These will be used to shape the noise spectrum
-        filters = torch.zeros(n_bands, self.n_freqs)
-        
-        for i in range(n_bands):
-            # Create triangular filter for each band
-            filt = torch.zeros(self.n_freqs)
-            
-            # Rising edge
-            start, center, end = fft_bins[i], fft_bins[i+1], fft_bins[i+2]
-            
-            # Handle case where bins may be the same due to rounding
-            if center > start:
-                ramp_up = torch.linspace(0, 1, center - start)
-                filt[start:center] = ramp_up
-            
-            # Falling edge
-            if end > center:
-                ramp_down = torch.linspace(1, 0, end - center)
-                filt[center:end] = ramp_down
-            
-            filters[i] = filt
+        # Create filter bank using optimized method
+        filters = self._create_filter_bank(fft_bins, n_bands, self.n_freqs)
         
         # Register filter bank
         self.register_buffer('filter_bank', filters)
         
+        # Pre-compute and cache filter_bank expanded dimensions for forward pass (optimization 5)
+        filter_bank_expanded = filters.unsqueeze(0).unsqueeze(-1)
+        self.register_buffer('filter_bank_expanded', filter_bank_expanded)
+        
+    def _create_filter_bank(self, fft_bins, n_bands, n_freqs):
+        """
+        Create triangular filter bank in a vectorized way (optimization 2).
+        
+        Args:
+            fft_bins: Frequency bin indices for band edges
+            n_bands: Number of frequency bands
+            n_freqs: Number of frequency bins
+            
+        Returns:
+            filter_bank: Triangular filters [n_bands, n_freqs]
+        """
+        # Pre-allocate filter bank tensor
+        filters = torch.zeros(n_bands, n_freqs)
+        
+        # Create frequency bin indices tensor
+        freq_indices = torch.arange(n_freqs).unsqueeze(0).expand(n_bands, -1)
+        
+        for i in range(n_bands):
+            start, center, end = fft_bins[i], fft_bins[i+1], fft_bins[i+2]
+            
+            # Create masks for the rising and falling edges
+            rising_mask = (freq_indices[i] >= start) & (freq_indices[i] < center)
+            falling_mask = (freq_indices[i] >= center) & (freq_indices[i] < end)
+            
+            # Calculate normalized distances for rising and falling parts
+            if center > start:
+                rising_norm = (freq_indices[i][rising_mask] - start) / float(center - start)
+                filters[i, rising_mask] = rising_norm
+                
+            if end > center:
+                falling_norm = 1.0 - (freq_indices[i][falling_mask] - center) / float(end - center)
+                filters[i, falling_mask] = falling_norm
+        
+        return filters
+        
     def forward(self, noise_params):
         """
-        Generate spectrally shaped noise in STFT domain.
+        Generate spectrally shaped noise in STFT domain (optimized version 1).
         
         Args:
             noise_params: Dictionary containing:
@@ -87,45 +107,35 @@ class NoiseGenerator(nn.Module):
         n_frames = noise_params['noise_gain'].shape[1]
         device = noise_params['noise_gain'].device
         
-        # For each frame, generate white noise and shape its spectrum
-        
-        # Generate complex white noise in the frequency domain
-        # Shape: [B, F, T]
-        noise_real = torch.randn(batch_size, self.n_freqs, n_frames, device=device)
-        noise_imag = torch.randn(batch_size, self.n_freqs, n_frames, device=device)
-        noise_complex = torch.complex(noise_real, noise_imag)
+        # Generate complex white noise (optimization 3)
+        noise_complex = torch.randn(batch_size, self.n_freqs, n_frames, 2, device=device)
+        noise_complex = torch.view_as_complex(noise_complex)
         
         # Apply spectral shaping using the filter bank
         spectral_shape = noise_params['spectral_shape'].transpose(1, 2)  # [B, n_bands, T]
         
-        # Reshape for matrix multiplication
-        # Filters: [n_bands, F], Spectral shape: [B, n_bands, T]
-        # Target: [B, F, T]
+        # Vectorized approach - reshape dimensions for broadcasting (optimization 1)
+        # Use pre-computed filter_bank_expanded: [1, n_bands, F, 1]
         
-        # Step 1: Apply each band filter to the whole spectrum
-        # For each band, we have a filter shape [F] that we apply to the noise
-        shaped_noise = torch.zeros_like(noise_complex)
+        # [B, n_bands, T] -> [B, n_bands, 1, T]
+        spectral_shape = spectral_shape.unsqueeze(2)
         
-        # Iterate through bands and apply spectral shaping
-        for b in range(self.n_bands):
-            # Get the filter for this band [F]
-            band_filter = self.filter_bank[b].unsqueeze(0).unsqueeze(-1)  # [1, F, 1]
-            
-            # Get the gain for this band across all frames [B, 1, T]
-            band_gain = spectral_shape[:, b:b+1, :]  # [B, 1, T]
-            
-            # Apply the filter with its gain to the noise
-            # [1, F, 1] * [B, 1, T] -> [B, F, T]
-            shaped_band = noise_complex * (band_filter * band_gain)
-            
-            # Add to the total shaped noise
-            shaped_noise = shaped_noise + shaped_band
+        # [B, F, T] -> [B, 1, F, T]
+        noise_complex = noise_complex.unsqueeze(1)
+        
+        # Apply all filters at once through broadcasting
+        # [B, 1, F, T] * ([1, n_bands, F, 1] * [B, n_bands, 1, T]) -> [B, n_bands, F, T]
+        shaped_bands = noise_complex * (self.filter_bank_expanded * spectral_shape)
+        
+        # Sum across the band dimension
+        # [B, n_bands, F, T] -> [B, F, T]
+        shaped_noise = shaped_bands.sum(dim=1)
         
         # Apply overall noise gain
         # [B, T, 1] -> [B, 1, T]
         noise_gain = noise_params['noise_gain'].transpose(1, 2)
         
-        # Scale noise by gain - broadcasting will apply to each frequency bin
+        # Scale noise by gain
         scaled_noise = shaped_noise * noise_gain
         
         return scaled_noise
@@ -157,7 +167,7 @@ class NoiseGenerator(nn.Module):
         sample_times = torch.arange(total_samples, device=device) / self.sample_rate
         frame_times = torch.arange(n_frames, device=device) * self.hop_length / self.sample_rate
         
-        # Create interpolation indices
+        # Create interpolation indices (optimization 4)
         prev_frame_idx, next_frame_idx, interp_weights = self._create_interpolation_indices(
             frame_times, sample_times)
         
@@ -178,8 +188,7 @@ class NoiseGenerator(nn.Module):
     
     def _create_interpolation_indices(self, frame_times, sample_times):
         """
-        Create indices for efficient interpolation between frames.
-        Identical to the method in HarmonicGenerator.
+        Create indices for efficient interpolation between frames (optimization 4).
         
         Args:
             frame_times: Time points for each frame [T]
@@ -191,39 +200,26 @@ class NoiseGenerator(nn.Module):
             interp_weights: Interpolation weights for each sample [N]
         """
         n_frames = frame_times.shape[0]
-        device = frame_times.device
+        n_samples = sample_times.shape[0]
         
-        # Create sample times matrix of shape [N, 1]
-        sample_times = sample_times.unsqueeze(1)
+        # Find the index of the last frame that is <= each sample time
+        # This is more efficient than creating the full time difference matrix
+        prev_frame_idx = torch.searchsorted(frame_times, sample_times) - 1
         
-        # Create frame times matrix of shape [1, T]
-        frame_times_mat = frame_times.unsqueeze(0)
-        
-        # Calculate time differences: [N, T]
-        # Each row represents all frame time differences for a single sample time
-        time_diffs = sample_times - frame_times_mat
-        
-        # Create mask of valid (non-negative) differences: [N, T]
-        # For each sample, all frames that occurred earlier or at the same time will be 1
-        valid_frames = (time_diffs >= 0).float()
-        
-        # For each sample, calculate the latest valid frame
-        # Sum valid_frames across dim 1 and subtract 1 to get the index
-        prev_frame_idx = torch.sum(valid_frames, dim=1).long() - 1
-        
-        # Handle edge cases for first and last frames
+        # Handle edge cases
         prev_frame_idx = torch.clamp(prev_frame_idx, 0, n_frames - 2)
         next_frame_idx = prev_frame_idx + 1
         
-        # Get actual frame times for interpolation
+        # Get frame times for interpolation
         prev_times = frame_times[prev_frame_idx]
         next_times = frame_times[next_frame_idx]
         
         # Calculate interpolation weights
         time_deltas = next_times - prev_times
-        time_deltas = torch.clamp(time_deltas, min=1e-7)  # Avoid division by zero
+        # Add small epsilon to avoid division by zero
+        time_deltas = torch.clamp(time_deltas, min=1e-7)
         
-        interp_weights = (sample_times.squeeze(1) - prev_times) / time_deltas
+        interp_weights = (sample_times - prev_times) / time_deltas
         interp_weights = torch.clamp(interp_weights, 0.0, 1.0)
         
         return prev_frame_idx, next_frame_idx, interp_weights
