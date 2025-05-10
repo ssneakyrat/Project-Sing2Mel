@@ -6,7 +6,7 @@ import numpy as np
 from dsp.harmonic_generator import HarmonicGenerator
 from dsp.parameter_predictor import ParameterPredictor
 from dsp.vocal_filter import VocalFilter
-from dsp.noise_generator import NoiseGenerator  # Import the new NoiseGenerator
+from dsp.noise_generator import NoiseGenerator
 
 class SVS(nn.Module):
     def __init__(self, 
@@ -15,7 +15,7 @@ class SVS(nn.Module):
                  num_languages,
                  n_mels=80, 
                  n_harmonics=80,
-                 n_noise_bands=8,  # New parameter for noise bands
+                 n_noise_bands=8,
                  hop_length=240, 
                  win_length=1024,
                  n_fft=1024,
@@ -65,7 +65,7 @@ class SVS(nn.Module):
             ).float()
         )
         
-        # Add parameter predictor with harmonic amplitude and noise parameter prediction
+        # Updated parameter predictor with register awareness
         self.parameter_predictor = ParameterPredictor(
             phoneme_dim=self.phoneme_embed_dim,
             singer_dim=self.singer_embed_dim,
@@ -73,7 +73,7 @@ class SVS(nn.Module):
             hidden_dim=256,
             num_formants=5,
             num_harmonics=self.n_harmonics,
-            n_noise_bands=self.n_noise_bands,  # Pass number of noise bands
+            n_noise_bands=self.n_noise_bands,
             use_lstm=True
         )
         
@@ -85,7 +85,7 @@ class SVS(nn.Module):
             filter_mode='resonator'
         )
         
-        # Add noise generator (new)
+        # Add noise generator
         self.noise_generator = NoiseGenerator(
             n_fft=self.n_fft,
             hop_length=self.hop_length,
@@ -97,6 +97,7 @@ class SVS(nn.Module):
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
         Forward pass with dynamic harmonic amplitudes, formant filtering, and noise components.
+        Now with register-aware formant adaptation.
         
         Args:
             f0: Fundamental frequency trajectory [B, T]
@@ -109,6 +110,7 @@ class SVS(nn.Module):
             signal: Audio signal [B, T_audio]
             predicted_mel: Mel-spectrogram [B, T, n_mels]
             mixed_stft: Combined harmonic and noise STFT [B, F, T]
+            model_params: Dictionary with model parameters and losses
         """
         batch_size, n_frames = f0.shape[0], f0.shape[1]
         device = f0.device
@@ -119,6 +121,7 @@ class SVS(nn.Module):
         language_emb = self.language_embed(language_id) # [B, language_dim]
         
         # Predict parameters for both harmonic and noise components
+        # Now includes register classification and formant regularization
         params = self.parameter_predictor(
             f0, 
             phoneme_emb, 
@@ -139,7 +142,7 @@ class SVS(nn.Module):
         # Apply formant filtering to the harmonic STFT
         filtered_stft = self.vocal_filter(harmonic_stft, filter_params)
         
-        # Generate noise STFT using NoiseGenerator (new)
+        # Generate noise STFT using NoiseGenerator
         noise_params = {
             'noise_gain': params['noise_gain'],
             'spectral_shape': params['spectral_shape'],
@@ -147,19 +150,17 @@ class SVS(nn.Module):
         }
         noise_stft = self.noise_generator(noise_params)
         
-        # Mix harmonic and noise components (new)
+        # Mix harmonic and noise components
         # voiced_mix controls the ratio: 1 = fully voiced, 0 = fully unvoiced
-        # Note: Need to expand dimensions for broadcasting
         voiced_mix = params['voiced_mix'].transpose(1, 2)  # [B, 1, T]
         
         # Mix with proper broadcasting
-        # [B, F, T] dimensions for all
         mixed_stft = filtered_stft * voiced_mix + noise_stft * (1.0 - voiced_mix)
         
         # Convert mixed STFT to audio using torch's inverse STFT
         window = torch.hann_window(self.win_length).to(device)
         signal = torch.istft(
-            mixed_stft,  # Use mixed STFT instead of just filtered
+            mixed_stft,
             n_fft=self.n_fft, 
             hop_length=self.hop_length,
             win_length=self.win_length,
@@ -174,7 +175,6 @@ class SVS(nn.Module):
         mel_basis = self.mel_basis.to(device).transpose(0, 1)  # Shape: [F, M]
         
         # Apply matrix multiplication using einsum for better clarity
-        # [B, F, T] x [F, M] -> [B, M, T]
         predicted_mel = torch.einsum('bft,fm->bmt', stft_mag, mel_basis)
         
         # Apply log transformation for better dynamic range
@@ -183,5 +183,14 @@ class SVS(nn.Module):
         # Transpose mel to expected [B, T, M] shape
         predicted_mel = predicted_mel.transpose(1, 2)
         
+        # Create a dictionary of model parameters for analysis and visualization
+        model_params = {
+            'register_weights': params['register_weights'],
+            'formant_frequencies': params['frequencies'],
+            'formant_bandwidths': params['bandwidths'],
+            'formant_amplitudes': params['amplitudes'],
+            'regularization_loss': params['regularization_loss']
+        }
+        
         # Return all relevant outputs
-        return signal, predicted_mel, mixed_stft
+        return signal, predicted_mel, mixed_stft, model_params
