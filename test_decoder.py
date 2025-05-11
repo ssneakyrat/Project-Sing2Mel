@@ -306,7 +306,7 @@ def main():
     train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
         batch_size=batch_size,
         num_workers=1,
-        train_files=1000,
+        train_files=None,
         val_files=10,
         device=device,
         context_window_sec=2,  # 2-second window
@@ -362,8 +362,7 @@ def main():
         optimizer, 
         mode='min', 
         factor=0.5, 
-        patience=50,
-        verbose=True
+        patience=50
     )
     
     # Training loop    

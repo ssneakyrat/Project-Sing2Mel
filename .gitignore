@@ -2,6 +2,7 @@
 *.wav
 *.png
 *.log
+*.zip
 datasets/
 phone_maps/
 cache/
