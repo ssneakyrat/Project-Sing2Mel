@@ -51,11 +51,130 @@ MIN_PHONE = 5
 MIN_DURATION_MS = 10
 ENABLE_ALIGNMENT_PLOTS = False
 
+def collect_global_audio_statistics(file_tasks, sample_rate, max_files=None):
+    """
+    Collect global audio statistics from a subset of files for normalization.
+    
+    Args:
+        file_tasks: List of FileMetadata objects
+        sample_rate: Target sample rate
+        max_files: Maximum number of files to analyze (None for all)
+    
+    Returns:
+        Dictionary with global audio statistics
+    """
+    import random
+    import numpy as np
+    import soundfile as sf
+    import torch
+    import torchaudio
+    from tqdm import tqdm
+    
+    if max_files is not None and max_files < len(file_tasks):
+        # Randomly sample files to analyze
+        file_sample = random.sample(file_tasks, max_files)
+    else:
+        file_sample = file_tasks
+        
+    logger.info(f"Collecting audio statistics from {len(file_sample)} files")
+    
+    # Initialize stats
+    max_peak = 0.0
+    total_rms_squared = 0.0
+    file_count = 0
+    
+    # Process each file
+    for task in tqdm(file_sample, desc="Analyzing audio statistics"):
+        try:
+            # Load audio
+            audio, sr = sf.read(task.wav_file, dtype='float32')
+            
+            # Convert to mono if stereo
+            if len(audio.shape) > 1 and audio.shape[1] > 1:
+                audio = audio.mean(axis=1)
+            
+            # Resample if needed
+            if sr != sample_rate:
+                audio_tensor = torch.FloatTensor(audio).unsqueeze(0)
+                resampler = torchaudio.transforms.Resample(
+                    orig_freq=sr, new_freq=sample_rate
+                )
+                audio_tensor = resampler(audio_tensor)
+                audio = audio_tensor.squeeze(0).numpy()
+            
+            # Calculate statistics
+            file_peak = np.max(np.abs(audio))
+            file_rms_squared = np.mean(audio**2)
+            
+            # Update global statistics
+            max_peak = max(max_peak, file_peak)
+            total_rms_squared += file_rms_squared
+            file_count += 1
+            
+        except Exception as e:
+            logger.warning(f"Error analyzing {task.wav_file}: {str(e)}")
+            continue
+    
+    # Calculate global RMS
+    if file_count > 0:
+        global_rms = np.sqrt(total_rms_squared / file_count)
+    else:
+        global_rms = 0.0
+        
+    logger.info(f"Global statistics: Max peak = {max_peak}, Average RMS = {global_rms}")
+    
+    return {
+        'max_peak': max_peak,
+        'global_rms': global_rms,
+        'file_count': file_count
+    }
+
+def combined_global_normalize(audio, global_stats, target_peak_db=-3.0, 
+                             rms_weight=0.5, peak_weight=0.5):
+    """
+    Apply combined global peak and RMS normalization.
+    
+    Args:
+        audio: Input audio array
+        global_stats: Dictionary with global audio statistics
+        target_peak_db: Target peak level in dB (negative value)
+        rms_weight: Weight for RMS normalization (0.0 to 1.0)
+        peak_weight: Weight for peak normalization (0.0 to 1.0)
+    
+    Returns:
+        Normalized audio
+    """
+    import numpy as np
+    
+    # Convert target peak from dB to linear
+    target_peak = 10 ** (target_peak_db / 20.0)
+    
+    # Calculate peak scaling factor
+    global_peak = global_stats['max_peak']
+    peak_factor = target_peak / global_peak if global_peak > 0 else 1.0
+    
+    # Calculate current file RMS
+    file_rms = np.sqrt(np.mean(audio**2))
+    
+    # Calculate RMS scaling factor relative to global RMS
+    global_rms = global_stats['global_rms']
+    relative_rms = file_rms / global_rms if global_rms > 0 else 1.0
+    
+    # If file RMS is higher than global, reduce it; otherwise keep as is
+    rms_factor = 1.0 / relative_rms if relative_rms > 1.0 else 1.0
+    
+    # Combine factors with weights
+    assert peak_weight + rms_weight <= 1.0, "Weights must sum to 1.0 or less"
+    combined_factor = (peak_weight * peak_factor + rms_weight * rms_factor)
+    
+    # Apply normalization
+    return audio * combined_factor
+
 # Stage 1: File gathering and initial processing
-def stage1_process_file(file_metadata, phone_map, sample_rate, max_audio_length, max_mel_frames, hop_length):
+def stage1_process_file(file_metadata, phone_map, sample_rate, max_audio_length, max_mel_frames, hop_length, global_audio_stats=None):
     """
     Process a single audio/lab file pair and perform initial processing.
-    Now includes chunking to max_audio_length and padding of final chunk.
+    Now includes global normalization, chunking to max_audio_length and padding of final chunk.
     """
     try:
         # Extract phones and timing information using utility function
@@ -84,6 +203,16 @@ def stage1_process_file(file_metadata, phone_map, sample_rate, max_audio_length,
             audio = audio_tensor.squeeze(0).numpy()
             sr = sample_rate
         
+        # Apply global normalization if stats are provided
+        if global_audio_stats is not None:
+            audio = combined_global_normalize(
+                audio, 
+                global_audio_stats, 
+                target_peak_db=-3.0,  # -3dB peak target as requested
+                rms_weight=0.5, 
+                peak_weight=0.5
+            )
+        
         audio_length = len(audio)
         audio_duration_sec = audio_length / sr
         
@@ -99,8 +228,8 @@ def stage1_process_file(file_metadata, phone_map, sample_rate, max_audio_length,
             start_times = [int(t * audio_length / max_time) for t in start_times]
             end_times = [int(t * audio_length / max_time) for t in end_times]
         
+        # The rest of the function remains the same (chunking logic, etc.)
         # Create chunks based on max_audio_length
-        # Each chunk except possibly the last will be exactly max_audio_length
         chunks = []
         for i in range(0, audio_length, max_audio_length):
             end_idx = min(i + max_audio_length, audio_length)
@@ -138,8 +267,6 @@ def stage1_process_file(file_metadata, phone_map, sample_rate, max_audio_length,
                 padding_size = max_audio_length - (end_idx - i)
                 padded_chunk = np.pad(chunk_audio, (0, padding_size), 'constant')
                 
-                # No need to adjust phone timing as they're already relative to chunk start
-                
                 chunks.append({
                     'audio': padded_chunk,
                     'phones': chunk_phones,
@@ -149,7 +276,7 @@ def stage1_process_file(file_metadata, phone_map, sample_rate, max_audio_length,
                     'durations': chunk_durations,
                     'is_padded': True,
                     'original_length': end_idx - i,
-                    'mel_frames': max_mel_frames,  # Use max_mel_frames for consistency
+                    'mel_frames': max_mel_frames,
                     'chunk_idx': len(chunks)
                 })
             else:
@@ -174,7 +301,7 @@ def stage1_process_file(file_metadata, phone_map, sample_rate, max_audio_length,
         # Return preprocessed data with chunks
         return AudioData(
             metadata=file_metadata,
-            audio=None,  # Don't store the full audio anymore
+            audio=None,
             sr=sr,
             phones=phones,
             phone_indices=phone_indices,
@@ -184,7 +311,7 @@ def stage1_process_file(file_metadata, phone_map, sample_rate, max_audio_length,
             audio_length=audio_length,
             audio_duration_sec=audio_duration_sec,
             phone_counts=phone_counts,
-            chunks=chunks  # New field to store chunks
+            chunks=chunks
         )
             
     except Exception as e:
@@ -194,8 +321,11 @@ def stage1_process_file(file_metadata, phone_map, sample_rate, max_audio_length,
 # Wrapper function for multiprocessing
 def process_file_for_mp(args):
     """Wrapper function that can be pickled for multiprocessing."""
-    file_metadata, phone_map, sample_rate, max_audio_length, max_mel_frames, hop_length = args
-    return stage1_process_file(file_metadata, phone_map, sample_rate, max_audio_length, max_mel_frames, hop_length)
+    file_metadata, phone_map, sample_rate, max_audio_length, max_mel_frames, hop_length, global_audio_stats = args
+    return stage1_process_file(
+        file_metadata, phone_map, sample_rate, max_audio_length, 
+        max_mel_frames, hop_length, global_audio_stats
+    )
 
 # Stage 2: GPU-based feature extraction
 def stage2_extract_features_batch(batch_data, hop_length, win_length, n_mels, fmin, fmax, device):
@@ -232,64 +362,65 @@ def stage2_extract_features_batch(batch_data, hop_length, win_length, n_mels, fm
         processed_chunks = []
         
         for chunk in chunks:
-            audio = chunk['audio']
-            phone_indices = chunk['phone_indices']
-            start_times = chunk['start_times']
-            end_times = chunk['end_times']
-            mel_frames = chunk['mel_frames']
-            
-            # Convert audio to torch tensor
-            audio_tensor = torch.FloatTensor(audio).to(device)
-            
-            # Extract F0 using Parselmouth (much faster than librosa.pyin)
-            # Run on CPU as it's not GPU accelerated
-            f0 = extract_f0_parselmouth(audio, SAMPLE_RATE, hop_length)
-            
-            # Extract mel spectrogram
-            if len(audio_tensor.shape) == 1:
-                audio_tensor = audio_tensor.unsqueeze(0)  # Add batch dimension
+            if chunk['is_padded'] is False:
+                audio = chunk['audio']
+                phone_indices = chunk['phone_indices']
+                start_times = chunk['start_times']
+                end_times = chunk['end_times']
+                mel_frames = chunk['mel_frames']
                 
-            # Extract mel spectrogram
-            mel_spec = mel_transform(audio_tensor)
-            mel_db = torchaudio.transforms.AmplitudeToDB()(mel_spec)
-            mel_norm = normalize_mel(mel_db)
-            
-            # Move mel to CPU and convert to numpy
-            mel_np = mel_norm.squeeze(0).cpu().numpy().T
-            
-            # Create phone sequence aligned with mel frames (downsampling)
-            phone_seq_mel = np.zeros(mel_frames)
-            for i in range(mel_frames):
-                start_idx = i * hop_length
-                end_idx = min(start_idx + hop_length, len(audio))
-                if start_idx < len(audio):
-                    # Create a temporary phone_seq for this chunk
-                    temp_phone_seq = np.zeros(len(audio))
-                    for p, start, end in zip(phone_indices, start_times, end_times):
-                        temp_phone_seq[start:end] = p
+                # Convert audio to torch tensor
+                audio_tensor = torch.FloatTensor(audio).to(device)
+                
+                # Extract F0 using Parselmouth (much faster than librosa.pyin)
+                # Run on CPU as it's not GPU accelerated
+                f0 = extract_f0_parselmouth(audio, SAMPLE_RATE, hop_length)
+                
+                # Extract mel spectrogram
+                if len(audio_tensor.shape) == 1:
+                    audio_tensor = audio_tensor.unsqueeze(0)  # Add batch dimension
                     
-                    # Use majority vote to determine phone for this frame
-                    unique_phones, counts = np.unique(temp_phone_seq[start_idx:end_idx], return_counts=True)
-                    if len(unique_phones) > 0:  # Make sure there's at least one phone
-                        phone_seq_mel[i] = unique_phones[np.argmax(counts)]
-            
-            # Make sure f0 is the right length for mel frames
-            f0_padded = np.zeros(mel_frames)
-            f0_len = min(len(f0), mel_frames)
-            f0_padded[:f0_len] = f0[:f0_len]
-            
-            # Create processed chunk with audio included
-            processed_chunks.append({
-                'phone_seq_mel': phone_seq_mel,
-                'f0': f0_padded,
-                'mel': mel_np,
-                'audio': audio,  # Save the audio to dataset
-                'singer_id': metadata.singer_idx,
-                'language_id': metadata.language_idx,
-                'filename': f"{metadata.singer_id}_{metadata.language_id}_{metadata.base_name}_{chunk['chunk_idx']}",
-                'is_padded': chunk['is_padded'],
-                'original_length': chunk['original_length']
-            })
+                # Extract mel spectrogram
+                mel_spec = mel_transform(audio_tensor)
+                mel_db = torchaudio.transforms.AmplitudeToDB()(mel_spec)
+                mel_norm = normalize_mel(mel_db)
+                
+                # Move mel to CPU and convert to numpy
+                mel_np = mel_norm.squeeze(0).cpu().numpy().T
+                
+                # Create phone sequence aligned with mel frames (downsampling)
+                phone_seq_mel = np.zeros(mel_frames)
+                for i in range(mel_frames):
+                    start_idx = i * hop_length
+                    end_idx = min(start_idx + hop_length, len(audio))
+                    if start_idx < len(audio):
+                        # Create a temporary phone_seq for this chunk
+                        temp_phone_seq = np.zeros(len(audio))
+                        for p, start, end in zip(phone_indices, start_times, end_times):
+                            temp_phone_seq[start:end] = p
+                        
+                        # Use majority vote to determine phone for this frame
+                        unique_phones, counts = np.unique(temp_phone_seq[start_idx:end_idx], return_counts=True)
+                        if len(unique_phones) > 0:  # Make sure there's at least one phone
+                            phone_seq_mel[i] = unique_phones[np.argmax(counts)]
+                
+                # Make sure f0 is the right length for mel frames
+                f0_padded = np.zeros(mel_frames)
+                f0_len = min(len(f0), mel_frames)
+                f0_padded[:f0_len] = f0[:f0_len]
+                
+                # Create processed chunk with audio included
+                processed_chunks.append({
+                    'phone_seq_mel': phone_seq_mel,
+                    'f0': f0_padded,
+                    'mel': mel_np,
+                    'audio': audio,  # Save the audio to dataset
+                    'singer_id': metadata.singer_idx,
+                    'language_id': metadata.language_idx,
+                    'filename': f"{metadata.singer_id}_{metadata.language_id}_{metadata.base_name}_{chunk['chunk_idx']}",
+                    'is_padded': chunk['is_padded'],
+                    'original_length': chunk['original_length']
+                })
         
         # Return processed data
         results.append(ProcessedFeatures(
@@ -395,7 +526,7 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
             self.generate_distribution_log(dataset_type)
     
     def build_dataset_pipeline(self):
-        """Build dataset using multi-stage pipeline approach."""
+        """Build dataset using multi-stage pipeline approach with global normalization."""
         logger.info(f"Building {'training' if self.is_train else 'validation'} dataset using multi-stage pipeline...")
         
         # Stage 0: Directory scanning and max length estimation
@@ -409,12 +540,18 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
             all_tasks, self.sample_rate, self.hop_length, max_files=100, context_window_sec=self.context_window_sec
         )
         
+        # NEW: Collect global audio statistics for normalization
+        self.global_audio_stats = collect_global_audio_statistics(
+            all_tasks, self.sample_rate, max_files=200
+        )
+        
         # Set random seed for reproducible file selection
         random.seed(self.seed)
         
         # Shuffle all tasks
         random.shuffle(all_tasks)
         
+        # Rest of the method remains the same...
         # Select files for training and validation based on counts
         total_files = len(all_tasks)
         
@@ -474,7 +611,7 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         
         # Group data into batches for GPU processing
         batches = [preprocessed_data[i:i+self.batch_size] 
-                  for i in range(0, len(preprocessed_data), self.batch_size)]
+                for i in range(0, len(preprocessed_data), self.batch_size)]
         
         # Stage 2: GPU feature extraction (single process)
         logger.info(f"Stage 2: Extracting features on {self.device}...")
@@ -524,7 +661,11 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         logger.info(f"Stage 1: Processing {len(tasks)} files with {max_workers} workers")
         
         # Prepare args for multiprocessing - must be picklable
-        mp_args = [(task, self.phone_map, self.sample_rate, self.max_audio_length, self.max_mel_frames, self.hop_length) for task in tasks]
+        mp_args = [
+            (task, self.phone_map, self.sample_rate, self.max_audio_length, 
+            self.max_mel_frames, self.hop_length, self.global_audio_stats) 
+            for task in tasks
+        ]
         
         # Use multiprocessing to process files
         with mp.Pool(max_workers) as pool:
@@ -554,6 +695,7 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
             'singer_duration': self.singer_duration,
             'language_duration': self.language_duration,
             'phone_language_stats': self.phone_language_stats,
+            'global_audio_stats': self.global_audio_stats,  # Save global stats
             'is_train': self.is_train,
             'max_audio_length': self.max_audio_length,
             'max_mel_frames': self.max_mel_frames
@@ -561,7 +703,8 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         with open(cache_path, 'wb') as f:
             pickle.dump(cache_data, f)
         logger.info(f"Dataset cached to {cache_path}")
-    
+
+    # Update the load_cache method to load global audio stats
     def load_cache(self, cache_path):
         """Load dataset from cache file."""
         logger.info(f"Loading {'training' if self.is_train else 'validation'} dataset from cache: {cache_path}")
@@ -581,13 +724,17 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         self.singer_duration = cache_data.get('singer_duration', {})
         self.language_duration = cache_data.get('language_duration', {})
         self.phone_language_stats = cache_data.get('phone_language_stats', {})
+        self.global_audio_stats = cache_data.get('global_audio_stats', None)  # Load global stats
         
         # Load max dimensions
         self.max_audio_length = cache_data.get('max_audio_length')
         self.max_mel_frames = cache_data.get('max_mel_frames')
         
         logger.info(f"Loaded {len(self.data)} segments with {len(self.singer_map)} singers, "
-                  f"{len(self.language_map)} languages, and {len(self.phone_map)} unique phones")
+                f"{len(self.language_map)} languages, and {len(self.phone_map)} unique phones")
+        if self.global_audio_stats:
+            logger.info(f"Loaded global audio statistics: Max peak = {self.global_audio_stats['max_peak']:.4f}, "
+                    f"Global RMS = {self.global_audio_stats['global_rms']:.4f}")
         logger.info(f"Max audio length: {self.max_audio_length} samples, Max mel frames: {self.max_mel_frames}")
     
     def generate_distribution_log(self, dataset_type="dataset"):
