@@ -74,8 +74,7 @@ class SVS(nn.Module):
             hidden_dim=256,
             num_formants=5,
             num_harmonics=self.n_harmonics,
-            n_noise_bands=self.n_noise_bands,  # Pass number of noise bands
-            use_lstm=True
+            n_noise_bands=self.n_noise_bands  # Pass number of noise bands
         )
         
         # Add vocal filter
