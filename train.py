@@ -236,7 +236,7 @@ def main():
     torch.set_float32_matmul_precision("high")
 
     # Load dataset
-    batch_size = 16  # Smaller batch size for complex model
+    batch_size = 32  # Smaller batch size for complex model
     num_epochs = 500
     visualization_interval = 1  # Visualize every 5 epochs
 

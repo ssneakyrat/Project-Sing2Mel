@@ -6,7 +6,7 @@ import numpy as np
 from dsp.harmonic_generator import HarmonicGenerator
 from dsp.parameter_predictor import ParameterPredictor
 from dsp.noise_generator import NoiseGenerator  # Import the new NoiseGenerator
-from dsp.enhancement_network import EnhancementNetwork
+from dsp.enhancement_network import create_moe_enhancement_network
 
 class SVS(nn.Module):
     def __init__(self, 
@@ -84,13 +84,15 @@ class SVS(nn.Module):
             sample_rate=self.sample_rate,
             n_bands=self.n_noise_bands
         )
-        
+        '''
         self.enhancement = EnhancementNetwork(
             fft_size=n_fft, 
             hop_length=240, 
             hidden_size=512,
             condition_dim=256  # Match with parameter_predictor's hidden_dim
         )
+        '''
+        self.enhancement = create_moe_enhancement_network()
 
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
@@ -144,7 +146,7 @@ class SVS(nn.Module):
         # [B, F, T] dimensions for all
         mixed_stft = harmonic_stft * voiced_mix + noise_stft * (1.0 - voiced_mix)
         
-        mixed_stft = self.enhancement(mixed_stft, params['hidden_features'])
+        mixed_stft = self.enhancement(mixed_stft, params['hidden_features'], return_aux_loss=False)
 
         # Convert mixed STFT to audio using torch's inverse STFT
         window = torch.hann_window(self.win_length).to(device)
