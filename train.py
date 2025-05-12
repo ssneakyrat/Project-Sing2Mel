@@ -126,6 +126,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
     total_loss = 0
     total_mel_loss = 0
     total_stft_loss = 0
+    total_audio_loss = 0
     
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}', leave=False)
     for batch_idx, batch in enumerate(pbar):
@@ -144,7 +145,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
         wave, latent_mel, _ = model(f0, phoneme_seq, singer_id, language_id)
         
         # Compute combined loss
-        loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
+        loss, mel_loss, stft_loss, audio_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
         
         # Backward pass
         loss.backward()
@@ -157,19 +158,22 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
         total_loss += loss.item()
         total_mel_loss += mel_loss.item()
         total_stft_loss += stft_loss.item()
+        total_audio_loss += audio_loss.item()
         
         # Update progress bar with current batch loss
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
             'mel_loss': f'{mel_loss.item():.4f}',
-            'stft_loss': f'{stft_loss.item():.4f}'
+            'stft_loss': f'{stft_loss.item():.4f}',
+            'audio_loss': f'{audio_loss.item():.4f}'
         })
 
     avg_loss = total_loss / len(dataloader)
     avg_mel_loss = total_mel_loss / len(dataloader)
     avg_stft_loss = total_stft_loss / len(dataloader)
+    avg_audio_loss = total_audio_loss / len(dataloader)
     
-    return avg_loss, avg_mel_loss, avg_stft_loss
+    return avg_loss, avg_mel_loss, avg_stft_loss, avg_audio_loss
 
 def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visualize=False):
     """Evaluate the model"""
@@ -177,6 +181,7 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
     total_loss = 0
     total_mel_loss = 0
     total_stft_loss = 0
+    total_audio_loss = 0
     
     with torch.no_grad():
         pbar = tqdm(dataloader, desc='Evaluating', leave=False)
@@ -195,17 +200,19 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
             wave, latent_mel, _ = model(f0, phoneme_seq, singer_id, language_id)
             
             # Compute combined loss
-            loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
+            loss, mel_loss, stft_loss, audio_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
             
             total_loss += loss.item()
             total_mel_loss += mel_loss.item()
             total_stft_loss += stft_loss.item()
+            total_audio_loss += audio_loss.item()
             
             # Update progress bar with current batch loss
             pbar.set_postfix({
                 'loss': f'{loss.item():.4f}',
                 'mel_loss': f'{mel_loss.item():.4f}',
-                'stft_loss': f'{stft_loss.item():.4f}'
+                'stft_loss': f'{stft_loss.item():.4f}',
+                'audio_loss': f'{audio_loss.item():.4f}'
             })
 
             # Visualize only the first batch if requested
@@ -217,8 +224,9 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
         avg_loss = total_loss / len(dataloader)
         avg_mel_loss = total_mel_loss / len(dataloader)
         avg_stft_loss = total_stft_loss / len(dataloader)
+        avg_audio_loss = total_audio_loss / len(dataloader)
         
-        return avg_loss, avg_mel_loss, avg_stft_loss
+        return avg_loss, avg_mel_loss, avg_stft_loss, avg_audio_loss
 
 def main():
     # Set device
@@ -236,9 +244,9 @@ def main():
     torch.set_float32_matmul_precision("high")
 
     # Load dataset
-    batch_size = 16  # Smaller batch size for complex model
+    batch_size = 32  # Smaller batch size for complex model
     num_epochs = 500
-    visualization_interval = 1  # Visualize every 5 epochs
+    visualization_interval = 10  # Visualize every 5 epochs
 
     train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
         batch_size=batch_size,
@@ -277,8 +285,9 @@ def main():
     
     # Create loss function
     criterion = DecoderLoss(
-        stft_loss_weight=0.7,
-        mel_loss_weight=0.3
+        stft_loss_weight=0.5,
+        mel_loss_weight=0.3,
+        audio_loss_weight=0.2  # Adding audio loss weight
     ).to(device)
     
     # Mel transform for extracting mel spectrogram from predicted audio
@@ -307,13 +316,13 @@ def main():
     
     epoch_pbar = tqdm(range(num_epochs), desc="Training Progress", leave=False)
     for epoch in epoch_pbar:
-        train_loss, train_mel_loss, train_stft_loss = train_epoch(
+        train_loss, train_mel_loss, train_stft_loss, train_audio_loss = train_epoch(
             model, train_loader, criterion, optimizer, device, epoch, mel_transform
         )
         
         # Visualize during evaluation at certain intervals
         should_visualize = (epoch % visualization_interval == 0)
-        val_loss, val_mel_loss, val_stft_loss = evaluate(
+        val_loss, val_mel_loss, val_stft_loss, val_audio_loss = evaluate(
             model, val_loader, criterion, device, epoch, mel_transform, visualize=should_visualize
         )
         
@@ -323,14 +332,15 @@ def main():
         # Print training information
         '''
         print(f"Epoch {epoch}:")
-        print(f"  Train Loss: {train_loss:.4f} (Mel: {train_mel_loss:.4f}, STFT: {train_stft_loss:.4f})")
-        print(f"  Val Loss: {val_loss:.4f} (Mel: {val_mel_loss:.4f}, STFT: {val_stft_loss:.4f})")
+        print(f"  Train Loss: {train_loss:.4f} (Mel: {train_mel_loss:.4f}, STFT: {train_stft_loss:.4f}, Audio: {train_audio_loss:.4f})")
+        print(f"  Val Loss: {val_loss:.4f} (Mel: {val_mel_loss:.4f}, STFT: {val_stft_loss:.4f}, Audio: {val_audio_loss:.4f})")
         print(f"  Current LR: {optimizer.param_groups[0]['lr']:.6f}")
         '''
         # Update epoch progress bar with loss information
         epoch_pbar.set_postfix({
             'train_loss': f'{train_loss:.4f}',
             'val_loss': f'{val_loss:.4f}',
+            'audio_loss': f'{val_audio_loss:.4f}',
             'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
         })
         # Save best model

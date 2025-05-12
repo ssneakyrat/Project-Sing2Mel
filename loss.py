@@ -2,16 +2,20 @@ import torch
 import torch.nn as nn
 
 class DecoderLoss(nn.Module):
-    """Combined loss function for mel decoder including STFT loss"""
-    def __init__(self, stft_loss_weight=0.5, mel_loss_weight=0.5, 
+    """Combined loss function for mel decoder including STFT loss and audio L1 loss"""
+    def __init__(self, stft_loss_weight=0.5, mel_loss_weight=0.5, audio_loss_weight=0.0,
                  stft_n_ffts=[512, 1024, 2048], stft_hop_lengths=[50, 120, 240], 
                  stft_win_lengths=[240, 600, 1200]):
         super().__init__()
         self.stft_loss_weight = stft_loss_weight
         self.mel_loss_weight = mel_loss_weight
+        self.audio_loss_weight = audio_loss_weight
         
         # Mel loss
         self.mel_criterion = nn.L1Loss()
+        
+        # Audio waveform loss
+        self.audio_criterion = nn.L1Loss()
         
         # Multi-resolution STFT loss components
         self.stft_n_ffts = stft_n_ffts
@@ -96,8 +100,15 @@ class DecoderLoss(nn.Module):
         # Multi-resolution STFT loss
         stft_loss = self.compute_stft_loss(predicted_audio, target_audio)
         
+        # Audio L1 loss - handle different lengths by taking the minimum
+        min_length = min(predicted_audio.size(-1), target_audio.size(-1))
+        predicted_audio_trim = predicted_audio[..., :min_length]
+        target_audio_trim = target_audio[..., :min_length]
+        audio_loss = self.audio_criterion(predicted_audio_trim, target_audio_trim)
+        
         # Combined loss
         total_loss = (self.mel_loss_weight * mel_loss + 
-                     self.stft_loss_weight * stft_loss)
+                     self.stft_loss_weight * stft_loss +
+                     self.audio_loss_weight * audio_loss)
         
-        return total_loss, mel_loss, stft_loss, predicted_mel
+        return total_loss, mel_loss, stft_loss, audio_loss, predicted_mel
