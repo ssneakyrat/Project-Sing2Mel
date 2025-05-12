@@ -97,85 +97,6 @@ def visualize_outputs(epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
     save_audio(wave[0].detach().cpu().numpy(), f'audio_samples/epoch_{epoch}_batch_{batch_idx}_pred.wav')
     save_audio(target_audio[0].detach().cpu().numpy(), f'audio_samples/epoch_{epoch}_batch_{batch_idx}_target.wav')
 
-def visualize_expressive_params_with_waveform(epoch, batch_idx, wave, params, save_dir='visuals/decoder/params'):
-    """
-    Create a dedicated visualization for expressive parameters overlaid on the waveform
-    
-    Args:
-        epoch: Current epoch number
-        batch_idx: Current batch index
-        wave: Predicted waveform
-        params: Dictionary of expressive parameters
-        save_dir: Directory to save visualizations
-    """
-    if params is None:
-        return
-    
-    # Create figure with a single plot
-    fig, ax1 = plt.subplots(figsize=(12, 8))
-    
-    # Convert waveform to numpy array
-    wave_np = wave[0].detach().cpu().numpy()
-    
-    # Create time axis for waveform
-    sample_time = np.arange(len(wave_np)) / SAMPLE_RATE
-    
-    # Plot waveform
-    ax1.plot(sample_time, wave_np, color='blue', alpha=0.4, label='Waveform')
-    ax1.set_xlabel('Time (s)')
-    ax1.set_ylabel('Amplitude', color='blue')
-    ax1.tick_params(axis='y', labelcolor='blue')
-    
-    # Create a second y-axis for parameters
-    ax2 = ax1.twinx()
-    ax2.set_ylabel('Parameter Value', color='red')
-    ax2.tick_params(axis='y', labelcolor='red')
-    
-    # Create frame-level time axis for parameters
-    n_frames = params['vibrato_rate'].shape[1]
-    frame_time = np.arange(n_frames) * HOP_LENGTH / SAMPLE_RATE
-    
-    # Parameters to plot with colors and line styles
-    param_config = {
-        'vibrato_rate': {'color': 'red', 'linestyle': '-', 'linewidth': 2},
-        'vibrato_depth': {'color': 'orange', 'linestyle': '-', 'linewidth': 2},
-        'vibrato_phase': {'color': 'purple', 'linestyle': '--', 'linewidth': 2},
-        'breathiness': {'color': 'brown', 'linestyle': '-.', 'linewidth': 2},
-        'tension': {'color': 'magenta', 'linestyle': ':', 'linewidth': 2.5},
-        'vocal_fry': {'color': 'cyan', 'linestyle': '-', 'linewidth': 2}
-    }
-    
-    # Plot each parameter
-    for param_name, style in param_config.items():
-        if param_name in params:
-            # Extract parameter values for the first batch example
-            param_values = params[param_name][0].detach().cpu().numpy()
-            
-            # Reshape if needed
-            if len(param_values.shape) > 1:
-                param_values = param_values.flatten()
-            
-            # Use only up to n_frames points
-            display_frames = min(len(frame_time), len(param_values))
-            ax2.plot(
-                frame_time[:display_frames], 
-                param_values[:display_frames], 
-                label=param_name,
-                **style
-            )
-    
-    # Add legend for all lines
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize='medium')
-    
-    ax1.set_title(f'Expressive Parameters vs Waveform (Epoch {epoch}, Batch {batch_idx})')
-    ax1.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(f'{save_dir}/params_epoch_{epoch}_batch_{batch_idx}.png')
-    plt.close()
-
 def save_audio(waveform, path, sample_rate=SAMPLE_RATE):
     """Save audio waveform to file"""
     # Ensure waveform is in range [-1, 1]
@@ -206,7 +127,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
     total_mel_loss = 0
     total_stft_loss = 0
     
-    for batch_idx, batch in enumerate(tqdm(dataloader, desc=f'Epoch {epoch}')):
+    pbar = tqdm(dataloader, desc=f'Epoch {epoch}', leave=False)
+    for batch_idx, batch in enumerate(pbar):
         # Move data to device
         mel = batch['mel'].to(device)  # This will be [B, T, n_mels]
         f0 = batch['f0'].to(device)
@@ -235,7 +157,14 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
         total_loss += loss.item()
         total_mel_loss += mel_loss.item()
         total_stft_loss += stft_loss.item()
-    
+        
+        # Update progress bar with current batch loss
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'mel_loss': f'{mel_loss.item():.4f}',
+            'stft_loss': f'{stft_loss.item():.4f}'
+        })
+
     avg_loss = total_loss / len(dataloader)
     avg_mel_loss = total_mel_loss / len(dataloader)
     avg_stft_loss = total_stft_loss / len(dataloader)
@@ -250,7 +179,8 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
     total_stft_loss = 0
     
     with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc='Evaluating')):
+        pbar = tqdm(dataloader, desc='Evaluating', leave=False)
+        for batch_idx, batch in enumerate(pbar):
             # Move data to device
             mel = batch['mel'].to(device)  # This will be [B, T, n_mels]
             f0 = batch['f0'].to(device)
@@ -271,6 +201,13 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
             total_mel_loss += mel_loss.item()
             total_stft_loss += stft_loss.item()
             
+            # Update progress bar with current batch loss
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'mel_loss': f'{mel_loss.item():.4f}',
+                'stft_loss': f'{stft_loss.item():.4f}'
+            })
+
             # Visualize only the first batch if requested
             if visualize and batch_idx == 0:
                 # Regular visualization with parameters and latent_mel
@@ -368,7 +305,8 @@ def main():
     # Training loop    
     best_val_loss = float('inf')
     
-    for epoch in range(num_epochs):
+    epoch_pbar = tqdm(range(num_epochs), desc="Training Progress", leave=False)
+    for epoch in epoch_pbar:
         train_loss, train_mel_loss, train_stft_loss = train_epoch(
             model, train_loader, criterion, optimizer, device, epoch, mel_transform
         )
@@ -383,11 +321,18 @@ def main():
         scheduler.step(val_loss)
         
         # Print training information
+        '''
         print(f"Epoch {epoch}:")
         print(f"  Train Loss: {train_loss:.4f} (Mel: {train_mel_loss:.4f}, STFT: {train_stft_loss:.4f})")
         print(f"  Val Loss: {val_loss:.4f} (Mel: {val_mel_loss:.4f}, STFT: {val_stft_loss:.4f})")
         print(f"  Current LR: {optimizer.param_groups[0]['lr']:.6f}")
-        
+        '''
+        # Update epoch progress bar with loss information
+        epoch_pbar.set_postfix({
+            'train_loss': f'{train_loss:.4f}',
+            'val_loss': f'{val_loss:.4f}',
+            'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
+        })
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss

@@ -5,7 +5,6 @@ import torchaudio
 import numpy as np
 from dsp.harmonic_generator import HarmonicGenerator
 from dsp.parameter_predictor import ParameterPredictor
-from dsp.vocal_filter import VocalFilter
 from dsp.noise_generator import NoiseGenerator  # Import the new NoiseGenerator
 from dsp.enhancement_network import EnhancementNetwork
 
@@ -77,14 +76,6 @@ class SVS(nn.Module):
             n_noise_bands=self.n_noise_bands  # Pass number of noise bands
         )
         
-        # Add vocal filter
-        self.vocal_filter = VocalFilter(
-            n_fft=self.n_fft,
-            sample_rate=self.sample_rate,
-            use_parallel_filters=True,
-            filter_mode='resonator'
-        )
-        
         # Add noise generator (new)
         self.noise_generator = NoiseGenerator(
             n_fft=self.n_fft,
@@ -97,7 +88,7 @@ class SVS(nn.Module):
         self.enhancement = EnhancementNetwork(
             fft_size=n_fft, 
             hop_length=240, 
-            hidden_size=256,
+            hidden_size=512,
             condition_dim=256  # Match with parameter_predictor's hidden_dim
         )
 
@@ -135,17 +126,6 @@ class SVS(nn.Module):
         
         # Generate harmonic STFT using STFTGenerator with dynamic harmonic amplitudes
         harmonic_stft = self.stft_generator(f0, params['harmonic_amplitudes'])
-        
-        # Extract formant filter parameters 
-        filter_params = {
-            'frequencies': params['frequencies'],
-            'bandwidths': params['bandwidths'],
-            'amplitudes': params['amplitudes']
-        }
-        
-        # Apply formant filtering to the harmonic STFT
-        #filtered_stft = self.vocal_filter(harmonic_stft, filter_params)
-        filtered_stft = harmonic_stft
 
         # Generate noise STFT using NoiseGenerator (new)
         noise_params = {
@@ -162,7 +142,7 @@ class SVS(nn.Module):
         
         # Mix with proper broadcasting
         # [B, F, T] dimensions for all
-        mixed_stft = filtered_stft * voiced_mix + noise_stft * (1.0 - voiced_mix)
+        mixed_stft = harmonic_stft * voiced_mix + noise_stft * (1.0 - voiced_mix)
         
         mixed_stft = self.enhancement(mixed_stft, params['hidden_features'])
 

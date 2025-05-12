@@ -66,22 +66,6 @@ class ParameterPredictor(nn.Module):
                 dropout=0.1
             )
         
-        # Define scaling factors for more controlled parameter ranges
-        self.register_buffer('formant_base_freqs', 
-                            torch.tensor([500.0, 1500.0, 2500.0, 3500.0, 4500.0][:num_formants]))
-        self.register_buffer('formant_max_deviation', 
-                            torch.tensor([300.0, 800.0, 1000.0, 1000.0, 1000.0][:num_formants]))
-        self.register_buffer('bandwidth_base', 
-                            torch.tensor([80.0, 100.0, 120.0, 150.0, 200.0][:num_formants]))
-        self.register_buffer('bandwidth_scaling', 
-                            torch.tensor([100.0, 150.0, 200.0, 250.0, 300.0][:num_formants]))
-        
-        # Output layers for formant parameters
-        # For each formant: frequency deviation, bandwidth, and amplitude
-        self.freq_fc = nn.Linear(hidden_dim, num_formants)
-        self.bandwidth_fc = nn.Linear(hidden_dim, num_formants)
-        self.amplitude_fc = nn.Linear(hidden_dim, num_formants)
-        
         # Output layer for harmonic amplitudes
         self.harmonic_amplitude_fc = nn.Linear(hidden_dim, num_harmonics)
         
@@ -130,35 +114,6 @@ class ParameterPredictor(nn.Module):
         if self.use_lstm:
             x, _ = self.lstm(x)  # [B, T, hidden_dim]
         
-        # Get formant parameters using separate projection layers
-        # This allows more specialized tuning for each parameter type
-        
-        # Frequency deviations (to be added to base frequencies)
-        freq_deviations = torch.tanh(self.freq_fc(x))  # Range: [-1, 1]
-        
-        # Scale deviations and add to base frequencies
-        # [B, T, num_formants] * [num_formants] -> [B, T, num_formants]
-        formant_base = self.formant_base_freqs.to(device).expand(batch_size, seq_len, -1)
-        formant_dev_scaled = freq_deviations * self.formant_max_deviation.to(device).expand(batch_size, seq_len, -1)
-        frequencies = formant_base + formant_dev_scaled
-        
-        # Make sure adjacent formants maintain proper ordering (F1 < F2 < F3 etc.)
-        # Sort formants along the last dimension
-        frequencies, _ = torch.sort(frequencies, dim=-1)
-        
-        # Bandwidths - positive values with base offset
-        # sigmoid -> [0, 1] range
-        bandwidth_factors = torch.sigmoid(self.bandwidth_fc(x))
-        
-        # Scale bandwidth factors and add base values
-        # [B, T, num_formants] * [num_formants] -> [B, T, num_formants]
-        bandwidth_base = self.bandwidth_base.to(device).expand(batch_size, seq_len, -1)
-        bandwidth_scaling = self.bandwidth_scaling.to(device).expand(batch_size, seq_len, -1)
-        bandwidths = bandwidth_base + bandwidth_factors * bandwidth_scaling
-        
-        # Formant amplitudes - values in [0, 1] range
-        formant_amplitudes = torch.sigmoid(self.amplitude_fc(x))
-        
         # Harmonic amplitudes - values in [0, 1] range
         # This controls the relative strength of each harmonic in the source signal
         harmonic_amplitudes = torch.sigmoid(self.harmonic_amplitude_fc(x))
@@ -176,9 +131,6 @@ class ParameterPredictor(nn.Module):
         voiced_mix = torch.sigmoid(self.voiced_mix_fc(x))
         
         return {
-            'frequencies': frequencies,                 # [B, T, num_formants]
-            'bandwidths': bandwidths,                   # [B, T, num_formants]
-            'amplitudes': formant_amplitudes,           # [B, T, num_formants]
             'harmonic_amplitudes': harmonic_amplitudes, # [B, T, num_harmonics]
             'noise_gain': noise_gain,                   # [B, T, 1]
             'spectral_shape': spectral_shape,           # [B, T, n_noise_bands]
