@@ -4,12 +4,13 @@ import torch.nn.functional as F
 import numpy as np
 import math
 
+
 class HarmonicGenerator(nn.Module):
     """
-    Generates harmonic content for singing voice synthesis using oscillators and ADSR envelopes.
+    Optimized version of the HarmonicGenerator for singing voice synthesis.
     
-    This module takes fundamental frequency (f0) and parameters from the ParameterPredictor
-    to generate harmonic signals with appropriate amplitude modulation over time.
+    This module takes fundamental frequency (f0) and parameters to generate harmonic signals
+    with appropriate amplitude modulation over time, with improved performance.
     """
     def __init__(self, 
                  n_harmonics=80, 
@@ -17,7 +18,7 @@ class HarmonicGenerator(nn.Module):
                  hop_length=240,
                  use_adsr=True):
         """
-        Initialize the HarmonicGenerator.
+        Initialize the OptimizedHarmonicGenerator.
         
         Args:
             n_harmonics: Number of harmonics to generate
@@ -35,15 +36,19 @@ class HarmonicGenerator(nn.Module):
         # Harmonic indices (1, 2, 3, ..., n_harmonics)
         self.register_buffer('harmonic_indices', torch.arange(1, n_harmonics + 1).float())
         
+        # Precomputed constants
+        self.register_buffer('TWO_PI', torch.tensor(2 * math.pi))
+        self.register_buffer('sample_rate_tensor', torch.tensor(sample_rate, dtype=torch.float))
+        
         # Default ADSR parameters (used when not provided by parameter predictor)
         self.default_attack = 0.01   # 10ms
         self.default_decay = 0.05    # 50ms
         self.default_sustain = 0.7   # 70% of peak
         self.default_release = 0.1   # 100ms
         
-    def generate_sine(self, frequencies, phases, duration):
+    def generate_sine_vectorized(self, frequencies, phases, duration):
         """
-        Generate sine waves for each harmonic frequency.
+        Vectorized sine wave generation for improved performance.
         
         Args:
             frequencies: Frequencies for each harmonic [B, T, n_harmonics]
@@ -56,9 +61,6 @@ class HarmonicGenerator(nn.Module):
         batch_size, n_frames, _ = frequencies.shape
         device = frequencies.device
         
-        # Time vector for the entire duration
-        t = torch.arange(0, duration, device=device).float() / self.sample_rate
-        
         # Initialize output tensor
         output = torch.zeros(batch_size, self.n_harmonics, duration, device=device)
         
@@ -66,10 +68,11 @@ class HarmonicGenerator(nn.Module):
         if phases is None:
             phases = torch.zeros(batch_size, self.n_harmonics, device=device)
         
-        # Frame positions in samples
+        # Sample indices and frame indices tensors
+        sample_indices = torch.arange(0, duration, device=device)
         frame_positions = torch.arange(0, n_frames, device=device) * self.hop_length
         
-        # For each frame, generate the corresponding part of the sine wave
+        # For each frame, determine which samples it covers
         for i in range(n_frames):
             # Current frame's frequencies
             frame_freqs = frequencies[:, i, :]  # [B, n_harmonics]
@@ -81,28 +84,32 @@ class HarmonicGenerator(nn.Module):
             if start_sample >= duration:
                 break
                 
-            # Time slice for this frame
-            t_frame = t[start_sample:end_sample].unsqueeze(0).unsqueeze(0)  # [1, 1, hop_length]
+            # Time slice for this frame (samples since start of audio)
+            t_frame = sample_indices[start_sample:end_sample].float() / self.sample_rate_tensor
             
-            # Generate sine wave for this frame
-            # 2πft + φ
-            phase_term = 2 * math.pi * frame_freqs.unsqueeze(-1) * t_frame + phases.unsqueeze(-1)
+            # Generate sine wave for this frame (vectorized across batch and harmonics)
+            # Phase term: 2πft + φ
+            t_frame_expanded = t_frame.view(1, 1, -1)  # [1, 1, samples]
+            freq_expanded = frame_freqs.unsqueeze(-1)  # [B, n_harmonics, 1]
+            phase_expanded = phases.unsqueeze(-1)  # [B, n_harmonics, 1]
+            
+            phase_term = self.TWO_PI * freq_expanded * t_frame_expanded + phase_expanded
             sine_frame = torch.sin(phase_term)
             
-            # Add to output
+            # Add to output (in-place operation)
             output[:, :, start_sample:end_sample] = sine_frame
             
             # Update phases for the next frame to ensure continuity
             if i < n_frames - 1:
                 # Calculate phase at the end of current frame
-                end_phase = 2 * math.pi * frame_freqs * (self.hop_length / self.sample_rate)
-                phases = (phases + end_phase) % (2 * math.pi)
+                end_phase = self.TWO_PI * frame_freqs * (self.hop_length / self.sample_rate)
+                phases = (phases + end_phase) % self.TWO_PI
         
         return output
     
-    def apply_adsr(self, signal, note_on_frames, note_off_frames=None, adsr_params=None):
+    def apply_adsr_vectorized(self, signal, note_on_frames, note_off_frames=None, adsr_params=None):
         """
-        Apply ADSR envelope to the signal.
+        Vectorized ADSR envelope application for improved performance.
         
         Args:
             signal: Input signal [B, n_harmonics, N]
@@ -122,6 +129,9 @@ class HarmonicGenerator(nn.Module):
         
         # Create envelope buffer
         envelope = torch.zeros(batch_size, 1, signal_length, device=device)
+        
+        # Sample indices tensor for vectorized operations
+        sample_indices = torch.arange(0, signal_length, device=device)
         
         # For each batch and note
         for b in range(batch_size):
@@ -160,33 +170,57 @@ class HarmonicGenerator(nn.Module):
                 decay_samples = int(decay * self.sample_rate)
                 release_samples = int(release * self.sample_rate)
                 
-                # Attack phase
-                attack_end = min(note_start + attack_samples, signal_length)
-                if attack_end > note_start:
-                    t_attack = torch.arange(attack_end - note_start, device=device) / (attack_samples or 1)
-                    envelope[b, 0, note_start:attack_end] = t_attack
+                # Create a sample position relative to note start
+                relative_pos = sample_indices - note_start
                 
-                # Decay phase
-                decay_end = min(attack_end + decay_samples, signal_length)
-                if decay_end > attack_end:
-                    t_decay = torch.arange(decay_end - attack_end, device=device) / (decay_samples or 1)
-                    decay_values = 1.0 - (1.0 - sustain) * t_decay
-                    envelope[b, 0, attack_end:decay_end] = decay_values
+                # Attack phase (vectorized)
+                attack_end = note_start + attack_samples
+                attack_mask = (relative_pos >= 0) & (relative_pos < attack_samples)
+                if attack_mask.any():
+                    attack_values = relative_pos.float() / (attack_samples or 1)
+                    envelope[b, 0, attack_mask] = attack_values[attack_mask]
                 
-                # Sustain phase
-                sustain_end = min(note_end, signal_length)
-                if sustain_end > decay_end:
-                    envelope[b, 0, decay_end:sustain_end] = sustain
+                # Decay phase (vectorized)
+                decay_end = attack_end + decay_samples
+                decay_mask = (relative_pos >= attack_samples) & (relative_pos < attack_samples + decay_samples)
+                if decay_mask.any():
+                    decay_pos = relative_pos[decay_mask] - attack_samples
+                    decay_values = 1.0 - (1.0 - sustain) * (decay_pos.float() / (decay_samples or 1))
+                    envelope[b, 0, decay_mask] = decay_values
                 
-                # Release phase
-                release_end = min(note_end + release_samples, signal_length)
-                if release_end > note_end:
-                    t_release = torch.arange(release_end - note_end, device=device) / (release_samples or 1)
-                    release_values = sustain * (1.0 - t_release)
-                    envelope[b, 0, note_end:release_end] = release_values
+                # Sustain phase (vectorized)
+                sustain_mask = (relative_pos >= attack_samples + decay_samples) & (relative_pos < note_end - note_start)
+                if sustain_mask.any():
+                    envelope[b, 0, sustain_mask] = sustain
+                
+                # Release phase (vectorized)
+                release_pos = sample_indices - note_end
+                release_mask = (release_pos >= 0) & (release_pos < release_samples)
+                if release_mask.any():
+                    release_values = sustain * (1.0 - (release_pos[release_mask].float() / (release_samples or 1)))
+                    envelope[b, 0, release_mask] = release_values
         
         # Apply envelope to signal
         return signal * envelope
+    
+    def fast_interpolate(self, x, target_len):
+        """
+        Fast linear interpolation for 3D tensors.
+        
+        Args:
+            x: Input tensor [B, C, T]
+            target_len: Target length
+            
+        Returns:
+            Interpolated tensor [B, C, target_len]
+        """
+        # Use F.interpolate with optimized settings
+        return F.interpolate(
+            x,
+            size=target_len,
+            mode='linear',
+            align_corners=False
+        )
     
     def forward(self, f0, params, duration=None, note_on_frames=None, note_off_frames=None, initial_phase=None):
         """
@@ -220,45 +254,32 @@ class HarmonicGenerator(nn.Module):
         # Get ADSR parameters if available
         adsr_params = params.get('adsr_params', None)  # [B, T, 4] or None
         
-        # Expand f0 to get frequencies for all harmonics
+        # Expand f0 to get frequencies for all harmonics (vectorized)
         # [B, T, 1] * [1, 1, n_harmonics] = [B, T, n_harmonics]
         harmonic_frequencies = f0.unsqueeze(-1) * self.harmonic_indices.view(1, 1, -1)
         
-        # Generate sine waves for all harmonics
-        harmonic_signals = self.generate_sine(harmonic_frequencies, initial_phase, duration)  # [B, n_harmonics, N]
+        # Generate sine waves for all harmonics (vectorized)
+        harmonic_signals = self.generate_sine_vectorized(harmonic_frequencies, initial_phase, duration)  # [B, n_harmonics, N]
         
         # Reshape harmonic amplitudes for broadcasting
         # From [B, T, n_harmonics] to [B, n_harmonics, T]
         harmonic_amps_transposed = harmonic_amplitudes.transpose(1, 2)
         
-        # Interpolate amplitudes to match signal length
+        # Interpolate amplitudes to match signal length with optimized interpolation
         # From [B, n_harmonics, T] to [B, n_harmonics, N]
-        hop_indices = torch.arange(0, n_frames, device=device) * self.hop_length
-        sample_indices = torch.arange(0, duration, device=device)
-        
-        interpolated_amps = F.interpolate(
-            harmonic_amps_transposed,
-            size=duration,
-            mode='linear',
-            align_corners=False
-        )
+        interpolated_amps = self.fast_interpolate(harmonic_amps_transposed, duration)
         
         # Similarly interpolate voiced_mix factor
         # From [B, T, 1] to [B, 1, N]
         voiced_mix_transposed = voiced_mix.transpose(1, 2)
-        interpolated_voice_mix = F.interpolate(
-            voiced_mix_transposed,
-            size=duration,
-            mode='linear',
-            align_corners=False
-        )
+        interpolated_voice_mix = self.fast_interpolate(voiced_mix_transposed, duration)
         
-        # Apply harmonic amplitudes
+        # Apply harmonic amplitudes (element-wise multiplication)
         weighted_harmonics = harmonic_signals * interpolated_amps
         
         # Apply ADSR envelope if specified
         if self.use_adsr and note_on_frames is not None:
-            weighted_harmonics = self.apply_adsr(weighted_harmonics, note_on_frames, note_off_frames, adsr_params)
+            weighted_harmonics = self.apply_adsr_vectorized(weighted_harmonics, note_on_frames, note_off_frames, adsr_params)
         
         # Sum all harmonics
         summed_harmonics = weighted_harmonics.sum(dim=1)  # [B, N]
@@ -267,3 +288,184 @@ class HarmonicGenerator(nn.Module):
         final_output = summed_harmonics * interpolated_voice_mix.squeeze(1)
         
         return final_output
+
+
+class JitOptimizedHarmonicGenerator(HarmonicGenerator):
+    """
+    Further optimized version of the HarmonicGenerator that uses TorchScript JIT compilation
+    for critical functions to improve performance.
+    """
+    
+    def __init__(self, n_harmonics=80, sample_rate=24000, hop_length=240, use_adsr=True):
+        """Initialize the JIT-optimized HarmonicGenerator."""
+        super(JitOptimizedHarmonicGenerator, self).__init__(
+            n_harmonics=n_harmonics,
+            sample_rate=sample_rate,
+            hop_length=hop_length,
+            use_adsr=use_adsr
+        )
+        
+        # Compile critical functions with TorchScript
+        self._fast_sine = torch.jit.script(self._sine_kernel)
+        
+    @staticmethod
+    def _sine_kernel(freq, phase, t, two_pi):
+        """JIT-optimized sine wave kernel."""
+        return torch.sin(two_pi * freq * t + phase)
+    
+    def generate_sine_vectorized(self, frequencies, phases, duration):
+        """
+        JIT-optimized sine wave generation.
+        """
+        batch_size, n_frames, _ = frequencies.shape
+        device = frequencies.device
+        
+        # Initialize output tensor
+        output = torch.zeros(batch_size, self.n_harmonics, duration, device=device)
+        
+        # Initialize phases if not provided
+        if phases is None:
+            phases = torch.zeros(batch_size, self.n_harmonics, device=device)
+        
+        # Sample indices and frame indices tensors
+        sample_indices = torch.arange(0, duration, device=device)
+        frame_positions = torch.arange(0, n_frames, device=device) * self.hop_length
+        
+        # For each frame, determine which samples it covers
+        for i in range(n_frames):
+            # Current frame's frequencies
+            frame_freqs = frequencies[:, i, :]  # [B, n_harmonics]
+            
+            # Start and end sample for this frame
+            start_sample = frame_positions[i]
+            end_sample = frame_positions[i] + self.hop_length if i < n_frames - 1 else duration
+            
+            if start_sample >= duration:
+                break
+                
+            # Time slice for this frame (samples since start of audio)
+            t_frame = sample_indices[start_sample:end_sample].float() / self.sample_rate_tensor
+            
+            # Generate sine wave using the JIT-optimized kernel
+            t_frame_expanded = t_frame.view(1, 1, -1)  # [1, 1, samples]
+            freq_expanded = frame_freqs.unsqueeze(-1)  # [B, n_harmonics, 1]
+            phase_expanded = phases.unsqueeze(-1)  # [B, n_harmonics, 1]
+            
+            sine_frame = self._fast_sine(freq_expanded, phase_expanded, t_frame_expanded, self.TWO_PI)
+            
+            # Add to output (in-place operation)
+            output[:, :, start_sample:end_sample] = sine_frame
+            
+            # Update phases for the next frame to ensure continuity
+            if i < n_frames - 1:
+                # Calculate phase at the end of current frame
+                end_phase = self.TWO_PI * frame_freqs * (self.hop_length / self.sample_rate)
+                phases = (phases + end_phase) % self.TWO_PI
+        
+        return output
+    
+    # Additional optimizations could be added here for forward, apply_adsr, etc.
+
+
+class ChunkedHarmonicGenerator(HarmonicGenerator):
+    """
+    Memory-efficient version of the HarmonicGenerator that processes audio in chunks
+    to handle very long sequences without excessive memory usage.
+    """
+    
+    def __init__(self, n_harmonics=80, sample_rate=24000, hop_length=240, use_adsr=True, chunk_size=24000):
+        """
+        Initialize the chunked HarmonicGenerator.
+        
+        Args:
+            n_harmonics: Number of harmonics to generate
+            sample_rate: Audio sample rate in Hz
+            hop_length: Number of samples between frames
+            use_adsr: Whether to use ADSR envelopes for amplitude shaping
+            chunk_size: Size of audio chunks to process at once (samples)
+        """
+        super(ChunkedHarmonicGenerator, self).__init__(
+            n_harmonics=n_harmonics,
+            sample_rate=sample_rate,
+            hop_length=hop_length,
+            use_adsr=use_adsr
+        )
+        self.chunk_size = chunk_size
+    
+    def forward(self, f0, params, duration=None, note_on_frames=None, note_off_frames=None, initial_phase=None):
+        """
+        Process audio in chunks to save memory for long sequences.
+        """
+        batch_size, n_frames = f0.shape
+        device = f0.device
+        
+        # Calculate duration if not provided
+        if duration is None:
+            duration = (n_frames + 1) * self.hop_length
+        
+        # For short audio, use the regular forward method
+        if duration <= self.chunk_size:
+            return super().forward(f0, params, duration, note_on_frames, note_off_frames, initial_phase)
+        
+        # For long audio, process in chunks
+        num_chunks = (duration + self.chunk_size - 1) // self.chunk_size
+        output = torch.zeros(batch_size, duration, device=device)
+        
+        # Process each chunk
+        for i in range(num_chunks):
+            chunk_start = i * self.chunk_size
+            chunk_end = min((i + 1) * self.chunk_size, duration)
+            chunk_duration = chunk_end - chunk_start
+            
+            # Find frames that correspond to this chunk
+            frame_start = chunk_start // self.hop_length
+            frame_end = min(n_frames, (chunk_end + self.hop_length - 1) // self.hop_length)
+            
+            # Extract chunk parameters
+            chunk_f0 = f0[:, frame_start:frame_end]
+            chunk_params = {
+                'harmonic_amplitudes': params['harmonic_amplitudes'][:, frame_start:frame_end],
+                'voiced_mix': params['voiced_mix'][:, frame_start:frame_end]
+            }
+            
+            if 'adsr_params' in params:
+                chunk_params['adsr_params'] = params['adsr_params'][:, frame_start:frame_end]
+            
+            # Adjust note frames to chunk-relative coordinates
+            chunk_note_on = None
+            chunk_note_off = None
+            
+            if note_on_frames is not None:
+                # Only include notes that affect this chunk
+                chunk_note_mask = (note_on_frames * self.hop_length < chunk_end) & \
+                                 ((note_off_frames * self.hop_length if note_off_frames is not None 
+                                   else torch.full_like(note_on_frames, duration)) > chunk_start)
+                
+                if chunk_note_mask.any():
+                    chunk_note_on = note_on_frames.clone()
+                    chunk_note_on = torch.max(chunk_note_on - frame_start, torch.zeros_like(chunk_note_on))
+                    
+                    if note_off_frames is not None:
+                        chunk_note_off = note_off_frames.clone()
+                        chunk_note_off = torch.max(chunk_note_off - frame_start, torch.zeros_like(chunk_note_off))
+                        chunk_note_off = torch.min(chunk_note_off, 
+                                                  torch.full_like(chunk_note_off, frame_end - frame_start))
+            
+            # Process chunk
+            # Use inherited phase if not first chunk
+            chunk_phase = initial_phase if i == 0 else current_phase
+            
+            chunk_output = super().forward(
+                chunk_f0, chunk_params, chunk_duration, 
+                chunk_note_on, chunk_note_off, chunk_phase
+            )
+            
+            # Save current phase for next chunk
+            frame_freqs = f0[:, frame_end-1].unsqueeze(1) * self.harmonic_indices.view(1, -1)
+            phase_advance = self.TWO_PI * frame_freqs * (chunk_end - (frame_end-1) * self.hop_length) / self.sample_rate
+            current_phase = (chunk_phase + phase_advance) % self.TWO_PI if chunk_phase is not None else phase_advance
+            
+            # Add chunk output to full output
+            output[:, chunk_start:chunk_end] = chunk_output
+        
+        return output

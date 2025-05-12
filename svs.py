@@ -13,7 +13,7 @@ class SVS(nn.Module):
                  num_singers, 
                  num_languages,
                  n_mels=80, 
-                 n_harmonics=80,
+                 n_harmonics=20,
                  n_noise_bands=8,
                  hop_length=240, 
                  win_length=1024,
