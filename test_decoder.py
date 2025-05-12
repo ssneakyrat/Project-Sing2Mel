@@ -308,7 +308,7 @@ def main():
     train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
         batch_size=batch_size,
         num_workers=1,
-        train_files=200,
+        train_files=None,
         val_files=10,
         device=device,
         context_window_sec=2,  # 2-second window
