@@ -119,7 +119,7 @@ class EnhancementNetwork(nn.Module):
             strength = torch.clamp(self.condition_strength, 0.0, 0.3)
             
             # Apply as a residual connection - original mag + small modulation
-            mag_delta = modulation * strength * 0.1  # Further reduce the effect
+            mag_delta = modulation * strength #* 0.1  # Further reduce the effect
             mag = mag + mag_delta  # Simple additive conditioning
         
         # Process magnitude with enhancement network (unchanged)
