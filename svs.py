@@ -3,10 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 import numpy as np
-from dsp.harmonic_generator import HarmonicGenerator
+
 from dsp.parameter_predictor import ParameterPredictor
-from dsp.noise_generator import NoiseGenerator  # Import the new NoiseGenerator
-from dsp.enhancement_network import EnhancementNetwork
+from dsp.harmonic_generator import HarmonicGenerator
 
 class SVS(nn.Module):
     def __init__(self, 
@@ -15,11 +14,12 @@ class SVS(nn.Module):
                  num_languages,
                  n_mels=80, 
                  n_harmonics=80,
-                 n_noise_bands=8,  # New parameter for noise bands
+                 n_noise_bands=8,
                  hop_length=240, 
                  win_length=1024,
                  n_fft=1024,
-                 sample_rate=24000
+                 sample_rate=24000,
+                 predict_adsr=True
                  ):
         super(SVS, self).__init__()
         
@@ -31,6 +31,7 @@ class SVS(nn.Module):
         self.win_length = win_length
         self.n_fft = n_fft
         self.sample_rate = sample_rate
+        self.predict_adsr = predict_adsr
         
         # Define embedding dimensions
         self.phoneme_embed_dim = 128
@@ -42,29 +43,6 @@ class SVS(nn.Module):
         self.singer_embed = nn.Embedding(num_singers, self.singer_embed_dim)
         self.language_embed = nn.Embedding(num_languages, self.language_embed_dim)
         
-        # STFT Generator with specified number of harmonics
-        self.stft_generator = HarmonicGenerator(
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            sample_rate=self.sample_rate,
-            n_harmonics=self.n_harmonics
-        )
-        
-        # Create mel transform for converting STFT to mel
-        self.register_buffer(
-            'mel_basis',
-            torch.from_numpy(
-                torchaudio.transforms.MelScale(
-                    n_mels=n_mels,
-                    sample_rate=sample_rate,
-                    f_min=0,
-                    f_max=sample_rate/2,
-                    n_stft=n_fft//2+1,
-                ).fb.T.numpy()
-            ).float()
-        )
-        
         # Add parameter predictor with harmonic amplitude and noise parameter prediction
         self.parameter_predictor = ParameterPredictor(
             phoneme_dim=self.phoneme_embed_dim,
@@ -73,26 +51,33 @@ class SVS(nn.Module):
             hidden_dim=256,
             num_formants=5,
             num_harmonics=self.n_harmonics,
-            n_noise_bands=self.n_noise_bands  # Pass number of noise bands
+            n_noise_bands=self.n_noise_bands,
+            predict_adsr=predict_adsr
         )
         
-        # Add noise generator (new)
-        self.noise_generator = NoiseGenerator(
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
+        # Add harmonic generator
+        self.harmonic_generator = HarmonicGenerator(
+            n_harmonics=self.n_harmonics,
             sample_rate=self.sample_rate,
-            n_bands=self.n_noise_bands
+            hop_length=self.hop_length,
+            use_adsr=True
         )
         
-        self.enhancement = EnhancementNetwork(
-            fft_size=n_fft, 
-            hop_length=240, 
-            hidden_size=512,
-            condition_dim=256  # Match with parameter_predictor's hidden_dim
+        # Mel spectrogram transform for spectral loss computation
+        self.mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=n_fft,
+            win_length=win_length,
+            hop_length=hop_length,
+            f_min=20.0,
+            f_max=sample_rate // 2,
+            n_mels=n_mels,
+            power=1.0,  # Use amplitude spectrogram, not power
+            norm="slaney",
+            mel_scale="slaney"
         )
 
-    def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
+    def forward(self, f0, phoneme_seq, singer_id, language_id, note_on_frames=None, note_off_frames=None, duration=None, initial_phase=None):
         """
         Forward pass with dynamic harmonic amplitudes, formant filtering, and noise components.
         
@@ -101,14 +86,12 @@ class SVS(nn.Module):
             phoneme_seq: Phoneme sequence [B, T] (indices)
             singer_id: Singer IDs [B] (indices)
             language_id: Language IDs [B] (indices)
+            note_on_frames: Frame indices for note onset [B, num_notes] or None
+            note_off_frames: Frame indices for note offset [B, num_notes] or None
+            duration: Optional duration in samples
             initial_phase: Optional initial phase
-            
-        Returns:
-            signal: Audio signal [B, T_audio]
-            predicted_mel: Mel-spectrogram [B, T, n_mels]
-            mixed_stft: Combined harmonic and noise STFT [B, F, T]
         """
-        batch_size, n_frames = f0.shape[0], f0.shape[1]
+        batch_size, n_frames = f0.shape
         device = f0.device
         
         # Apply embeddings
@@ -124,54 +107,63 @@ class SVS(nn.Module):
             language_emb
         )
         
-        # Generate harmonic STFT using STFTGenerator with dynamic harmonic amplitudes
-        harmonic_stft = self.stft_generator(f0, params['harmonic_amplitudes'])
-
-        # Generate noise STFT using NoiseGenerator (new)
-        noise_params = {
-            'noise_gain': params['noise_gain'],
-            'spectral_shape': params['spectral_shape'],
-            'voiced_mix': params['voiced_mix']
-        }
-        noise_stft = self.noise_generator(noise_params)
-        
-        # Mix harmonic and noise components (new)
-        # voiced_mix controls the ratio: 1 = fully voiced, 0 = fully unvoiced
-        # Note: Need to expand dimensions for broadcasting
-        voiced_mix = params['voiced_mix'].transpose(1, 2)  # [B, 1, T]
-        
-        # Mix with proper broadcasting
-        # [B, F, T] dimensions for all
-        mixed_stft = harmonic_stft * voiced_mix + noise_stft * (1.0 - voiced_mix)
-        
-        mixed_stft = self.enhancement(mixed_stft, params['hidden_features'])
-
-        # Convert mixed STFT to audio using torch's inverse STFT
-        window = torch.hann_window(self.win_length).to(device)
-        signal = torch.istft(
-            mixed_stft,  # Use mixed STFT instead of just filtered
-            n_fft=self.n_fft, 
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            window=window,
-            return_complex=False
+        # Generate harmonic component
+        harmonic_signal = self.harmonic_generator(
+            f0,
+            params,
+            duration=duration,
+            note_on_frames=note_on_frames,
+            note_off_frames=note_off_frames,
+            initial_phase=initial_phase
         )
-
-        # Get magnitude of mixed STFT for mel conversion
-        stft_mag = torch.abs(mixed_stft)  # Shape: [B, F, T]
         
-        # Apply mel transformation
-        mel_basis = self.mel_basis.to(device).transpose(0, 1)  # Shape: [F, M]
+        # TODO: Generate noise component
+        # For now, we'll just use a placeholder
+        if duration is None:
+            duration = (n_frames + 1) * self.hop_length
+            
+        noise_signal = torch.zeros_like(harmonic_signal)
         
-        # Apply matrix multiplication using einsum for better clarity
-        # [B, F, T] x [F, M] -> [B, M, T]
-        predicted_mel = torch.einsum('bft,fm->bmt', stft_mag, mel_basis)
+        # Mix harmonic and noise components based on voiced_mix parameter
+        # Since we've already applied voiced_mix in the harmonic generator,
+        # we need to apply (1 - voiced_mix) to the noise component
         
-        # Apply log transformation for better dynamic range
-        predicted_mel = torch.log(torch.clamp(predicted_mel, min=1e-5))
+        # Interpolate voiced_mix to audio sample rate
+        voiced_mix = params['voiced_mix']  # [B, T, 1]
+        voiced_mix_transposed = voiced_mix.transpose(1, 2)  # [B, 1, T]
         
-        # Transpose mel to expected [B, T, M] shape
-        predicted_mel = predicted_mel.transpose(1, 2)
+        interpolated_voice_mix = F.interpolate(
+            voiced_mix_transposed,
+            size=duration,
+            mode='linear',
+            align_corners=False
+        )  # [B, 1, duration]
+        
+        # Apply noise gain and (1 - voiced_mix) to noise
+        noise_gain = params['noise_gain']  # [B, T, 1]
+        noise_gain_transposed = noise_gain.transpose(1, 2)  # [B, 1, T]
+        
+        interpolated_noise_gain = F.interpolate(
+            noise_gain_transposed,
+            size=duration,
+            mode='linear',
+            align_corners=False
+        )  # [B, 1, duration]
+        
+        # Scale noise by gain and unvoiced factor (1 - voiced_mix)
+        scaled_noise = noise_signal * interpolated_noise_gain.squeeze(1) * (1 - interpolated_voice_mix.squeeze(1))
+        
+        # Combine harmonic and noise signals
+        signal = harmonic_signal + scaled_noise
+        
+        # Apply audio normalization to prevent clipping
+        signal = torch.tanh(signal)
+        
+        # Generate mel spectrogram for loss computation
+        with torch.no_grad():
+            predicted_mel = self.mel_transform(signal)
+            # Apply log scaling
+            predicted_mel = torch.log(torch.clamp(predicted_mel, min=1e-5))
         
         # Return all relevant outputs
-        return signal, predicted_mel, mixed_stft
+        return signal, predicted_mel
