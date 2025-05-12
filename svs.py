@@ -5,8 +5,6 @@ import numpy as np
 
 from encoder.mel_encoder import MelEncoder
 from decoder.feature_extractor import FeatureExtractor
-from decoder.expressive_control import ExpressiveControl  # Import parameter predictor
-from decoder.signal_processor import SignalProcessor  # Import new signal processor
 from decoder.wave_generator_oscillator import WaveGeneratorOscillator
 from decoder.core import scale_function, frequency_filter, upsample
 from decoder.human_vocal_filter import vocal_frequency_filter
@@ -121,9 +119,6 @@ class SVS(nn.Module):
         # Process harmonic and noise parameters
         src_param = scale_function(ctrls['harmonic_magnitude'])
         noise_param = scale_function(ctrls['noise_magnitude'])
-
-        # Use harmonic magnitude as conditioning for expressive control
-        conditioning = ctrls['harmonic_magnitude']  # [B, T, 256]
 
         # Process F0 - make sure it's in Hz and properly shaped
         f0_unsqueeze = torch.clamp(f0_unsqueeze, min=0.0, max=1000.0)
