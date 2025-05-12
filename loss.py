@@ -1,14 +1,17 @@
 import torch
 import torch.nn as nn
+from perceptual_loss import Wav2VecPerceptualLoss
 
 class DecoderLoss(nn.Module):
-    """Combined loss function for mel decoder including STFT loss"""
-    def __init__(self, stft_loss_weight=0.5, mel_loss_weight=0.5, 
+    """Combined loss function for mel decoder including STFT loss and perceptual loss"""
+    def __init__(self, stft_loss_weight=0.4, mel_loss_weight=0.4, perceptual_loss_weight=0.2,
                  stft_n_ffts=[512, 1024, 2048], stft_hop_lengths=[50, 120, 240], 
-                 stft_win_lengths=[240, 600, 1200]):
+                 stft_win_lengths=[240, 600, 1200], sample_rate=16000):
         super().__init__()
         self.stft_loss_weight = stft_loss_weight
         self.mel_loss_weight = mel_loss_weight
+        self.perceptual_loss_weight = perceptual_loss_weight
+        self.sample_rate = sample_rate
         
         # Mel loss
         self.mel_criterion = nn.L1Loss()
@@ -19,6 +22,13 @@ class DecoderLoss(nn.Module):
         self.stft_win_lengths = stft_win_lengths
         
         self.stft_mag_criterion = nn.L1Loss()
+        
+        # Perceptual loss using wav2vec 2.0
+        self.perceptual_criterion = Wav2VecPerceptualLoss(
+            model_name="facebook/wav2vec2-base-960h",
+            layers=[-4, -3, -2, -1],  # Use the last 4 layers
+            sample_rate=sample_rate
+        )
         
     def compute_stft_loss(self, predicted_audio, target_audio):
         """Compute multi-resolution STFT loss"""
@@ -96,8 +106,12 @@ class DecoderLoss(nn.Module):
         # Multi-resolution STFT loss
         stft_loss = self.compute_stft_loss(predicted_audio, target_audio)
         
+        # Perceptual loss using wav2vec 2.0
+        perceptual_loss = self.perceptual_criterion(predicted_audio, target_audio)
+        
         # Combined loss
         total_loss = (self.mel_loss_weight * mel_loss + 
-                     self.stft_loss_weight * stft_loss)
+                     self.stft_loss_weight * stft_loss +
+                     self.perceptual_loss_weight * perceptual_loss)
         
-        return total_loss, mel_loss, stft_loss, predicted_mel
+        return total_loss, mel_loss, stft_loss, predicted_mel, perceptual_loss
