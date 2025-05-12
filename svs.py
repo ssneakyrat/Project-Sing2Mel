@@ -7,7 +7,6 @@ from dsp.harmonic_generator import HarmonicGenerator
 from dsp.parameter_predictor import ParameterPredictor
 from dsp.noise_generator import NoiseGenerator  # Import the new NoiseGenerator
 from dsp.enhancement_network import EnhancementNetwork
-from dsp.signal_processor import SignalProcessor
 
 class SVS(nn.Module):
     def __init__(self, 
@@ -93,8 +92,6 @@ class SVS(nn.Module):
             condition_dim=256  # Match with parameter_predictor's hidden_dim
         )
 
-        self.signal_processor = SignalProcessor(input_dim=1, hidden_dim=128, condition_dim=256)
-
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
         Forward pass with dynamic harmonic amplitudes, formant filtering, and noise components.
@@ -159,8 +156,6 @@ class SVS(nn.Module):
             window=window,
             return_complex=False
         )
-        
-        signal = self.signal_processor(signal, params['hidden_features'])
 
         # Get magnitude of mixed STFT for mel conversion
         stft_mag = torch.abs(mixed_stft)  # Shape: [B, F, T]
