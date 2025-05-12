@@ -474,7 +474,8 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
              n_mels=N_MELS, hop_length=HOP_LENGTH, win_length=WIN_LENGTH, fmin=FMIN, fmax=FMAX,
              num_workers=8, batch_size=32, device='cuda' if torch.cuda.is_available() else 'cpu',
              context_window_sec=None,
-             is_train=True, train_files=None, val_files=None, seed=42):
+             is_train=True, train_files=None, val_files=None, seed=42,
+             shared_dataset=None):  # Added shared_dataset parameter
         """
         Initialize the SingingVoiceDataset.
         
@@ -484,6 +485,7 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         - train_files: Number of files to use for training (if None, use all available except validation files)
         - val_files: Number of files to use for validation (if None, use all available except training files)
         - seed: Random seed for reproducible file selection
+        - shared_dataset: Another SingingVoiceDataset instance to share data with (prevents duplicate processing)
         """
         self.dataset_dir = dataset_dir
         self.cache_dir = cache_dir
@@ -495,8 +497,8 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         self.seed = seed
         self.hop_length = hop_length
         self.win_length = win_length
-        self.context_window_sec = context_window_sec  # New parameter
-
+        self.context_window_sec = context_window_sec
+        
         # Parameters for mel spectrogram extraction
         self.n_mels = n_mels
         self.fmin = fmin
@@ -509,25 +511,69 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
 
         os.makedirs(cache_dir, exist_ok=True)
         
-        # Create separate cache files for training and validation
-        dataset_type = "train" if self.is_train else "val"
-        cache_path = os.path.join(
-            cache_dir, 
-            f"singing_voice_{dataset_type}_data_{sample_rate}hz_{n_mels}mels.pkl"
-        )
-        
-        logger.info(f"Initializing {'training' if is_train else 'validation'} dataset")
-        
-        if os.path.exists(cache_path) and not rebuild_cache:
-            self.load_cache(cache_path)
+        # Use shared dataset if provided
+        if shared_dataset is not None:
+            logger.info(f"Using shared dataset for {'training' if is_train else 'validation'}")
+            self.use_shared_dataset(shared_dataset)
         else:
-            self.build_dataset_pipeline()
-            self.save_cache(cache_path)
-            self.generate_distribution_log(dataset_type)
+            # Create separate cache files for training and validation
+            dataset_type = "train" if self.is_train else "val"
+            cache_path = os.path.join(
+                cache_dir, 
+                f"singing_voice_{dataset_type}_data_{sample_rate}hz_{n_mels}mels.pkl"
+            )
+            
+            logger.info(f"Initializing {'training' if is_train else 'validation'} dataset")
+            
+            if os.path.exists(cache_path) and not rebuild_cache:
+                self.load_cache(cache_path)
+            else:
+                self.build_dataset_pipeline()
+                self.save_cache(cache_path)
+                self.generate_distribution_log(dataset_type)
     
+    def use_shared_dataset(self, source_dataset):
+        """
+        Use data from another dataset instance instead of building from scratch.
+        This allows validation to use the exact same data as training.
+        """
+        # Copy all necessary attributes from the source dataset
+        source_data = source_dataset.data
+        self.phone_map = source_dataset.phone_map
+        self.inv_phone_map = source_dataset.inv_phone_map
+        self.singer_map = source_dataset.singer_map
+        self.inv_singer_map = source_dataset.inv_singer_map
+        self.language_map = source_dataset.language_map
+        self.inv_language_map = source_dataset.inv_language_map
+        self.singer_language_stats = source_dataset.singer_language_stats
+        self.singer_duration = source_dataset.singer_duration
+        self.language_duration = source_dataset.language_duration
+        self.phone_language_stats = source_dataset.phone_language_stats
+        self.global_audio_stats = source_dataset.global_audio_stats
+        self.max_audio_length = source_dataset.max_audio_length
+        self.max_mel_frames = source_dataset.max_mel_frames
+        
+        # Apply val_files limit if specified
+        if not self.is_train and self.val_files is not None and self.val_files < len(source_data):
+            # Set random seed for reproducible sampling
+            random.seed(self.seed)
+            # Sample val_files items from the source dataset
+            self.data = random.sample(source_data, self.val_files)
+            logger.info(f"Shared dataset initialized with {len(self.data)} segments (sampled from {len(source_data)} total segments)")
+        else:
+            # Use all data
+            self.data = source_data
+            logger.info(f"Shared dataset initialized with all {len(self.data)} segments")
+        
     def build_dataset_pipeline(self):
         """Build dataset using multi-stage pipeline approach with global normalization."""
-        logger.info(f"Building {'training' if self.is_train else 'validation'} dataset using multi-stage pipeline...")
+        # Determine if this is a training dataset that will be used for shared validation
+        is_shared_training = self.is_train and hasattr(self, '_is_shared_for_validation') and self._is_shared_for_validation
+        
+        if is_shared_training:
+            logger.info("Building training dataset for shared validation (will use all files)")
+        else:
+            logger.info(f"Building {'training' if self.is_train else 'validation'} dataset using multi-stage pipeline...")
         
         # Stage 0: Directory scanning and max length estimation
         self.scan_dataset_structure()
@@ -551,11 +597,14 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         # Shuffle all tasks
         random.shuffle(all_tasks)
         
-        # Rest of the method remains the same...
         # Select files for training and validation based on counts
         total_files = len(all_tasks)
         
-        if self.is_train:
+        if is_shared_training:
+            # When using shared validation, training should use all files
+            processing_tasks = all_tasks
+            logger.info(f"Using all {len(processing_tasks)} files for training with shared validation")
+        elif self.is_train:
             # For training dataset
             if self.train_files is not None:
                 # Use specified number of training files
@@ -823,7 +872,8 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
 
 def get_dataloader(batch_size=16, num_workers=4, pin_memory=True, persistent_workers=True, 
                   train_files=None, val_files=None, device='cuda', collate_fn=None, 
-                    context_window_sec=None, seed=42, create_val=True):
+                  context_window_sec=None, seed=42, create_val=True, 
+                  shared_validation=True):  # Added shared_validation parameter
     """
     Get dataloaders for the singing voice dataset.
     
@@ -832,13 +882,14 @@ def get_dataloader(batch_size=16, num_workers=4, pin_memory=True, persistent_wor
         num_workers: Number of workers for the DataLoader
         pin_memory: Whether to pin memory in DataLoader
         persistent_workers: Whether to keep workers alive between epochs
-        train_files: Number of files to use for training (if None, use all except validation)
+        train_files: Number of files to use for training (if None, use all available except validation)
         val_files: Number of files to use for validation (if None, use all except training)
         device: Device to use for GPU acceleration ('cuda' or 'cpu')
         collate_fn: Custom collate function (if None, use the standardized one)
         context_window_sec: Context window size in seconds, used for chunking audio
         seed: Random seed for reproducible file selection
         create_val: Whether to create a validation dataloader
+        shared_validation: Whether validation should share the same data as training
         
     Returns:
         If create_val=True: (train_loader, val_loader, train_dataset, val_dataset)
@@ -848,7 +899,16 @@ def get_dataloader(batch_size=16, num_workers=4, pin_memory=True, persistent_wor
     if collate_fn is None:
         collate_fn = standardized_collate_fn
     
+    # If we're using shared validation, train should use all available files
+    # (we'll sample from these for validation later)
+    effective_train_files = None if shared_validation else train_files
+    effective_val_files = None if shared_validation else val_files
+    
     logger.info("Creating training dataset...")
+    if shared_validation and create_val:
+        logger.info("Using shared validation - training dataset will use all available files")
+        
+    # Create a training dataset that will potentially be shared
     train_dataset = SingingVoiceDataset(
         rebuild_cache=False,
         n_mels=N_MELS,
@@ -858,12 +918,16 @@ def get_dataloader(batch_size=16, num_workers=4, pin_memory=True, persistent_wor
         fmax=FMAX,
         num_workers=8,
         device=device,
-        context_window_sec=context_window_sec,  # Pass context window parameter
+        context_window_sec=context_window_sec,
         is_train=True,
-        train_files=train_files,
-        val_files=val_files,
+        train_files=effective_train_files,
+        val_files=effective_val_files,
         seed=seed
     )
+    
+    # Mark the dataset as shared if needed
+    if shared_validation and create_val:
+        train_dataset._is_shared_for_validation = True
     
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -877,6 +941,11 @@ def get_dataloader(batch_size=16, num_workers=4, pin_memory=True, persistent_wor
     
     if create_val:
         logger.info("Creating validation dataset...")
+        if shared_validation:
+            logger.info(f"Using shared validation - will sample from training data (val_files={val_files})")
+        
+        # When using shared validation, we want to ensure val_files is respected
+        # This determines how many segments from the training set are used for validation
         val_dataset = SingingVoiceDataset(
             rebuild_cache=False,
             n_mels=N_MELS,
@@ -886,11 +955,12 @@ def get_dataloader(batch_size=16, num_workers=4, pin_memory=True, persistent_wor
             fmax=FMAX,
             num_workers=num_workers,
             device=device,
-            context_window_sec=context_window_sec,  # Pass context window parameter
+            context_window_sec=context_window_sec,
             is_train=False,
             train_files=train_files,
-            val_files=val_files,
-            seed=seed
+            val_files=val_files,  # This will limit validation segments when shared_dataset is used
+            seed=seed,
+            shared_dataset=train_dataset if shared_validation else None  # Use shared data if requested
         )
         
         val_loader = torch.utils.data.DataLoader(

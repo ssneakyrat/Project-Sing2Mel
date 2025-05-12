@@ -7,7 +7,7 @@ from dsp.harmonic_generator import HarmonicGenerator
 from dsp.parameter_predictor import ParameterPredictor
 from dsp.vocal_filter import VocalFilter
 from dsp.noise_generator import NoiseGenerator  # Import the new NoiseGenerator
-from dsp.enhancement_network import PhaseAwareEnhancer
+from dsp.enhancement_network import EnhancementNetwork
 
 class SVS(nn.Module):
     def __init__(self, 
@@ -94,7 +94,12 @@ class SVS(nn.Module):
             n_bands=self.n_noise_bands
         )
         
-        self.enhancement = PhaseAwareEnhancer()
+        self.enhancement = EnhancementNetwork(
+            fft_size=n_fft, 
+            hop_length=240, 
+            hidden_size=256,
+            condition_dim=256  # Match with parameter_predictor's hidden_dim
+        )
 
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
@@ -139,8 +144,9 @@ class SVS(nn.Module):
         }
         
         # Apply formant filtering to the harmonic STFT
-        filtered_stft = self.vocal_filter(harmonic_stft, filter_params)
-        
+        #filtered_stft = self.vocal_filter(harmonic_stft, filter_params)
+        filtered_stft = harmonic_stft
+
         # Generate noise STFT using NoiseGenerator (new)
         noise_params = {
             'noise_gain': params['noise_gain'],
@@ -158,7 +164,7 @@ class SVS(nn.Module):
         # [B, F, T] dimensions for all
         mixed_stft = filtered_stft * voiced_mix + noise_stft * (1.0 - voiced_mix)
         
-        mixed_stft = self.enhancement( mixed_stft )
+        mixed_stft = self.enhancement(mixed_stft, params['hidden_features'])
 
         # Convert mixed STFT to audio using torch's inverse STFT
         window = torch.hann_window(self.win_length).to(device)

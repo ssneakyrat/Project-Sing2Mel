@@ -182,5 +182,6 @@ class ParameterPredictor(nn.Module):
             'harmonic_amplitudes': harmonic_amplitudes, # [B, T, num_harmonics]
             'noise_gain': noise_gain,                   # [B, T, 1]
             'spectral_shape': spectral_shape,           # [B, T, n_noise_bands]
-            'voiced_mix': voiced_mix                    # [B, T, 1]
+            'voiced_mix': voiced_mix,                   # [B, T, 1]
+            'hidden_features': x                        # [B, T, hidden_dim]
         }
