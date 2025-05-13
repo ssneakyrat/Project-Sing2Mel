@@ -14,7 +14,11 @@ class HumanVocalFilter(nn.Module):
                  formant_emphasis=True,
                  vocal_range_boost=True,
                  breathiness=0.3,
-                 gender="neutral"):
+                 gender="neutral",
+                 multi_resolution=False,
+                 frame_sizes=[512, 1024, 2048],
+                 hop_ratios=[0.25, 0.5, 0.75],
+                 resolution_weights=[0.3, 0.4, 0.3]):
         super(HumanVocalFilter, self).__init__()
         
         self.sample_rate = sample_rate
@@ -22,6 +26,12 @@ class HumanVocalFilter(nn.Module):
         self.vocal_range_boost = vocal_range_boost
         self.breathiness = breathiness
         self.gender = gender
+        self.multi_resolution = multi_resolution
+        
+        # Multi-resolution parameters
+        self.frame_sizes = frame_sizes
+        self.hop_ratios = hop_ratios
+        self.resolution_weights = resolution_weights
         
         # Initialize formant regions (in Hz) - average values that can be adjusted
         # Format: (F1, F2, F3, F4)
@@ -212,6 +222,164 @@ class HumanVocalFilter(nn.Module):
         
         return output_signal[..., :frame_size * n_ir_frames]
     
+    def _resample_impulse_response(self, impulse_response, original_frames, target_frames, ir_size):
+        """Resample impulse response frames to match target number of frames."""
+        batch_size, _, _ = impulse_response.shape
+        
+        # If original and target are the same, return the original
+        if original_frames == target_frames:
+            return impulse_response
+            
+        # Reshape to [batch, original_frames, ir_size]
+        ir_reshaped = impulse_response.view(batch_size, original_frames, ir_size)
+        
+        # Create indices for linear interpolation
+        if target_frames > 1:
+            idx = torch.linspace(0, original_frames - 1, target_frames, device=impulse_response.device)
+        else:
+            idx = torch.tensor([0], device=impulse_response.device)
+        
+        # Get lower and upper indices
+        idx_low = idx.floor().long()
+        idx_high = (idx_low + 1).clamp(max=original_frames - 1)
+        
+        # Get weights for interpolation
+        weight_high = idx - idx_low.float()
+        weight_low = 1 - weight_high
+        
+        # Expand dimensions for broadcasting
+        weight_low = weight_low.view(1, -1, 1).expand(batch_size, -1, ir_size)
+        weight_high = weight_high.view(1, -1, 1).expand(batch_size, -1, ir_size)
+        
+        # Get values at indices
+        ir_low = torch.gather(ir_reshaped, 1, idx_low.view(1, -1, 1).expand(batch_size, -1, ir_size))
+        ir_high = torch.gather(ir_reshaped, 1, idx_high.view(1, -1, 1).expand(batch_size, -1, ir_size))
+        
+        # Interpolate
+        ir_resampled = ir_low * weight_low + ir_high * weight_high
+        
+        return ir_resampled
+    
+    def _multi_resolution_fft_convolve(self, audio, impulse_response, padding='same', delay_compensation=-1):
+        """Filter audio with frames of time-varying impulse responses at multiple resolutions."""
+        # Add a frame dimension to impulse response if it doesn't have one.
+        ir_shape = impulse_response.size()
+        if len(ir_shape) == 2:
+            impulse_response = impulse_response.unsqueeze(1)
+            ir_shape = impulse_response.size()
+        
+        # Get shapes of impulse response and audio.
+        batch_size_ir, n_ir_frames, ir_size = ir_shape
+        batch_size, audio_size = audio.size()
+        
+        # Validate that batch sizes match.
+        if batch_size != batch_size_ir:
+            raise ValueError(f'Batch size of audio ({batch_size}) and impulse response ({batch_size_ir}) must be the same.')
+        
+        # Process at each resolution
+        outputs = []
+        
+        for i, (frame_size, hop_ratio, weight) in enumerate(
+                zip(self.frame_sizes, self.hop_ratios, self.resolution_weights)):
+            hop_size = int(frame_size * hop_ratio)
+            
+            # Calculate number of frames for this resolution
+            n_audio_frames = max(1, int(np.ceil(audio_size / hop_size)))
+            
+            # Adjust impulse response frames to match audio frames for this resolution
+            if n_audio_frames != n_ir_frames:
+                ir_resampled = self._resample_impulse_response(
+                    impulse_response, n_ir_frames, n_audio_frames, ir_size
+                )
+            else:
+                ir_resampled = impulse_response
+            
+            # Convert audio to proper shape for frame processing
+            audio_expanded = audio.unsqueeze(1)
+            
+            # Pad audio to handle edge cases
+            padding_size = frame_size - (audio_size % hop_size)
+            if padding_size == frame_size:
+                padding_size = 0
+            audio_padded = F.pad(audio_expanded, (0, padding_size))
+            
+            # Extract frames using overlap
+            filters = torch.eye(frame_size, device=audio.device).unsqueeze(1)
+            audio_frames = F.conv1d(audio_padded, filters, stride=hop_size).transpose(1, 2)
+            
+            # Ensure we have the right number of frames
+            actual_n_audio_frames = audio_frames.size(1)
+            if actual_n_audio_frames > n_audio_frames:
+                audio_frames = audio_frames[:, :n_audio_frames, :]
+            elif actual_n_audio_frames < n_audio_frames:
+                # Should not happen with proper padding, but just in case
+                pad_frames = n_audio_frames - actual_n_audio_frames
+                audio_frames = F.pad(audio_frames, (0, 0, 0, pad_frames, 0, 0))
+            
+            # Pad and FFT the audio and impulse responses.
+            fft_size = self._get_fft_size(frame_size, ir_size, power_of_2=True)
+            
+            audio_fft = torch.fft.rfft(audio_frames, fft_size)
+            ir_fft = torch.fft.rfft(ir_resampled, fft_size)
+            
+            # Multiply the FFTs (same as convolution in time).
+            audio_ir_fft = torch.multiply(audio_fft, ir_fft)
+            
+            # Take the IFFT to resynthesize audio.
+            audio_frames_out = torch.fft.irfft(audio_ir_fft)
+            
+            # Overlap-add to reconstruct the signal
+            overlap_add_filter = torch.eye(audio_frames_out.size(-1), device=audio.device).unsqueeze(1)
+            output_signal = F.conv_transpose1d(
+                audio_frames_out.transpose(1, 2),
+                overlap_add_filter,
+                stride=hop_size,
+                padding=0
+            ).squeeze(1)
+            
+            # Apply delay compensation
+            if delay_compensation < 0:
+                local_delay = (ir_size - 1) // 2
+            else:
+                local_delay = delay_compensation
+                
+            # Crop to original audio size with delay compensation
+            if padding == 'same':
+                if output_signal.size(-1) > audio_size + local_delay:
+                    output_signal = output_signal[..., local_delay:local_delay + audio_size]
+                else:
+                    # If output is too short, pad to match
+                    output_signal = F.pad(output_signal, (0, audio_size + local_delay - output_signal.size(-1)))
+                    output_signal = output_signal[..., local_delay:local_delay + audio_size]
+            else:  # 'valid'
+                valid_size = audio_size + ir_size - 1
+                if output_signal.size(-1) > valid_size:
+                    output_signal = output_signal[..., :valid_size]
+                else:
+                    # If output is too short, pad to valid size
+                    output_signal = F.pad(output_signal, (0, valid_size - output_signal.size(-1)))
+            
+            # Ensure output matches audio size for 'same' padding
+            if padding == 'same' and output_signal.size(-1) != audio_size:
+                output_signal = output_signal[..., :audio_size]
+            
+            # Apply weight for this resolution
+            outputs.append(output_signal * weight)
+        
+        # Combine outputs from different resolutions
+        combined_output = torch.zeros_like(audio)
+        for output in outputs:
+            # Ensure the output is the right size
+            if output.size(-1) > audio_size:
+                output = output[..., :audio_size]
+            elif output.size(-1) < audio_size:
+                # Pad with zeros
+                output = F.pad(output, (0, audio_size - output.size(-1)))
+                
+            combined_output += output
+        
+        return combined_output
+    
     def _apply_formant_emphasis(self, magnitudes):
         """Apply formant emphasis to the magnitude spectrum."""
         if not self.formant_emphasis:
@@ -326,7 +494,7 @@ class HumanVocalFilter(nn.Module):
         
         return magnitudes
     
-    def forward(self, audio, magnitudes, window_size=0, padding='same'):
+    def forward(self, audio, magnitudes, window_size=0, padding='same', use_multi_resolution=None):
         """
         Filter audio with a finite impulse response filter optimized for human vocals.
         
@@ -338,10 +506,14 @@ class HumanVocalFilter(nn.Module):
                 If window_size < 1, it defaults to n_frequencies.
             padding: Either 'valid' or 'same'. For 'same' the final output
                 has the same size as the input audio.
+            use_multi_resolution: Override the default multi_resolution setting.
                 
         Returns:
             Filtered audio optimized for vocal characteristics.
         """
+        # Determine whether to use multi-resolution
+        multi_res = self.multi_resolution if use_multi_resolution is None else use_multi_resolution
+        
         # Apply vocal-specific enhancements to magnitude spectrum
         enhanced_magnitudes = self._enhance_magnitudes(magnitudes)
         
@@ -350,15 +522,18 @@ class HumanVocalFilter(nn.Module):
             enhanced_magnitudes, window_size=window_size
         )
         
-        # Apply FFT convolution
-        return self._fft_convolve(audio, impulse_response, padding=padding)
+        # Apply FFT convolution with appropriate method
+        if multi_res:
+            return self._multi_resolution_fft_convolve(audio, impulse_response, padding=padding)
+        else:
+            return self._fft_convolve(audio, impulse_response, padding=padding)
 
 
 # Function that works as a drop-in replacement for the original frequency_filter
 def vocal_frequency_filter(audio, magnitudes, window_size=0, padding='same', 
                           gender="neutral", formant_emphasis=True, 
                           vocal_range_boost=True, breathiness=0.3,
-                          sample_rate=24000):
+                          sample_rate=24000, multi_resolution=False):
     """
     A drop-in replacement for frequency_filter that specializes in human vocals.
     
@@ -373,6 +548,7 @@ def vocal_frequency_filter(audio, magnitudes, window_size=0, padding='same',
         vocal_range_boost: Whether to boost the vocal frequency range.
         breathiness: Amount of breathiness to add (0.0 to 1.0).
         sample_rate: Audio sample rate.
+        multi_resolution: Whether to use multi-resolution processing.
         
     Returns:
         Filtered audio optimized for vocal characteristics.
@@ -383,7 +559,8 @@ def vocal_frequency_filter(audio, magnitudes, window_size=0, padding='same',
         formant_emphasis=formant_emphasis,
         vocal_range_boost=vocal_range_boost,
         breathiness=breathiness,
-        gender=gender
+        gender=gender,
+        multi_resolution=multi_resolution
     ).to(audio.device)
     
     # Apply the filter
