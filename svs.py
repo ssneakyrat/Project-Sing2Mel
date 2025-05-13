@@ -132,10 +132,10 @@ class SVS(nn.Module):
             harmonic, 
             src_param, 
             gender="neutral",  # Or dynamically set based on singer
-            formant_emphasis=True,
-            vocal_range_boost=True,
-            breathiness=0.1,
-            multi_resolution=True
+            formant_emphasis=False,
+            vocal_range_boost=False,
+            breathiness=0,
+            multi_resolution=False
         )
 
         # noise part
@@ -144,9 +144,9 @@ class SVS(nn.Module):
             noise, 
             noise_param, 
             gender="neutral",  # Or dynamically set based on singer
-            formant_emphasis=True,
-            vocal_range_boost=True,
-            breathiness=0.3,
+            formant_emphasis=False,
+            vocal_range_boost=False,
+            breathiness=0,
             multi_resolution=False
         )
         
