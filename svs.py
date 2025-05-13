@@ -135,7 +135,7 @@ class SVS(nn.Module):
             formant_emphasis=True,
             vocal_range_boost=True,
             breathiness=0.1,
-            multi_resolution=True
+            multi_resolution=False
         )
 
         # noise part
