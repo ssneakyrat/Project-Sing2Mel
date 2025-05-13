@@ -8,7 +8,7 @@ from decoder.feature_extractor import FeatureExtractor
 from decoder.wave_generator_oscillator import WaveGeneratorOscillator
 from decoder.core import scale_function, frequency_filter, upsample
 from decoder.human_vocal_filter import vocal_frequency_filter
-
+from decoder.enhancement_network import PhaseAwareEnhancer
 
 # Modified SVS class with MelEncoder integration
 class SVS(nn.Module):
@@ -85,6 +85,8 @@ class SVS(nn.Module):
             language_embed_dim=self.language_embed_dim
         )
 
+        self.refiner = PhaseAwareEnhancer(fft_size=1024, hop_length=hop_length)
+
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
         Forward pass with separated expressive control and signal processing.
@@ -126,7 +128,7 @@ class SVS(nn.Module):
 
         # upsample
         pitch = upsample(f0_unsqueeze, self.block_size)
-
+        
         # harmonic
         harmonic, final_phase = self.harmonic_synthesizer(pitch, initial_phase)
         harmonic = vocal_frequency_filter(
@@ -134,7 +136,8 @@ class SVS(nn.Module):
             src_param, 
             gender="neutral",  # Or dynamically set based on singer
             formant_emphasis=True,
-            vocal_range_boost=True
+            vocal_range_boost=True,
+            breathiness=0
         )
 
         # noise part
@@ -143,11 +146,13 @@ class SVS(nn.Module):
             noise, 
             noise_param, 
             gender="neutral",  # Or dynamically set based on singer
-            formant_emphasis=True,
-            vocal_range_boost=True
+            formant_emphasis=False,
+            vocal_range_boost=False,
+            breathiness=0.7
         )
         
         signal = harmonic + noise
+        signal = self.refiner(signal)
         
         # Return both the audio output and the expressive parameters
         return signal, predicted_mel

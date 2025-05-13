@@ -232,13 +232,13 @@ def main():
     os.makedirs('checkpoints', exist_ok=True)
     
     # torch stuff
-    torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision("high")
+    #torch.backends.cudnn.benchmark = True
+    #torch.set_float32_matmul_precision("high")
 
     # Load dataset
     batch_size = 32  # Smaller batch size for complex model
     num_epochs = 500
-    visualization_interval = 1  # Visualize every 5 epochs
+    visualization_interval = 2  # Visualize every 5 epochs
 
     train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
         batch_size=batch_size,
