@@ -25,7 +25,7 @@ class SVS(nn.Module):
                  sample_rate=24000,
                  num_harmonics=150, 
                  num_mag_harmonic=256,
-                 num_mag_noise=80,
+                 num_mag_noise=128,
                  ):
         super(SVS, self).__init__()
         
@@ -84,8 +84,6 @@ class SVS(nn.Module):
             singer_embed_dim=self.singer_embed_dim,
             language_embed_dim=self.language_embed_dim
         )
-
-        self.refiner = PhaseAwareEnhancer()
 
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
@@ -147,15 +145,13 @@ class SVS(nn.Module):
             noise, 
             noise_param, 
             gender="neutral",  # Or dynamically set based on singer
-            formant_emphasis=False,
-            vocal_range_boost=False,
-            breathiness=0,
+            formant_emphasis=True,
+            vocal_range_boost=True,
+            breathiness=0.3,
             multi_resolution=False
         )
         
         signal = harmonic + noise
-
-        signal = self.refiner(signal)
 
         # Return both the audio output and the expressive parameters
         return signal, predicted_mel
