@@ -8,7 +8,7 @@ from tqdm import tqdm
 import torchaudio
 import soundfile as sf
 
-from loss import DecoderLoss
+from loss import HybridLoss
 from dataset_decoder import get_dataloader, SAMPLE_RATE, N_MELS, HOP_LENGTH, WIN_LENGTH
 
 from svs import SVS
@@ -144,7 +144,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
         wave, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
         
         # Compute combined loss
-        loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
+        loss, stft_loss = criterion(wave, target_audio)
         
         # Backward pass
         loss.backward()
@@ -155,13 +155,11 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
         optimizer.step()
         
         total_loss += loss.item()
-        total_mel_loss += mel_loss.item()
         total_stft_loss += stft_loss.item()
         
         # Update progress bar with current batch loss
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
-            'mel_loss': f'{mel_loss.item():.4f}',
             'stft_loss': f'{stft_loss.item():.4f}'
         })
 
@@ -195,19 +193,18 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
             wave, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
             
             # Compute combined loss
-            loss, mel_loss, stft_loss, predicted_mel = criterion(wave, target_audio, mel_transform)
+            loss, stft_loss = criterion(wave, target_audio)
             
             total_loss += loss.item()
-            total_mel_loss += mel_loss.item()
             total_stft_loss += stft_loss.item()
             
             # Update progress bar with current batch loss
             pbar.set_postfix({
                 'loss': f'{loss.item():.4f}',
-                'mel_loss': f'{mel_loss.item():.4f}',
                 'stft_loss': f'{stft_loss.item():.4f}'
             })
 
+            predicted_mel = torch.log(mel_transform(wave))
             # Visualize only the first batch if requested
             if visualize and batch_idx == 0:
                 # Regular visualization with parameters and latent_mel
@@ -238,7 +235,7 @@ def main():
     # Load dataset
     batch_size = 32  # Smaller batch size for complex model
     num_epochs = 500
-    visualization_interval = 2  # Visualize every 5 epochs
+    visualization_interval = 5  # Visualize every 5 epochs
 
     train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
         batch_size=batch_size,
@@ -276,9 +273,8 @@ def main():
     print(f"  Model size: {model_size:.2f} MB")
     
     # Create loss function
-    criterion = DecoderLoss(
-        stft_loss_weight=0.7,
-        mel_loss_weight=0.3
+    criterion = HybridLoss(
+        n_ffts=[1024, 512, 256, 128]
     ).to(device)
     
     # Mel transform for extracting mel spectrogram from predicted audio
