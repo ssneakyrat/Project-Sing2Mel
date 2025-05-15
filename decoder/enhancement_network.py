@@ -31,29 +31,29 @@ class SelfAttentionBlock(nn.Module):
 
 
 class PhaseAwareEnhancer(nn.Module):
-    def __init__(self, fft_size=1024, hop_length=240):
+    def __init__(self, fft_size=1024, hop_length=240, hidden_dim=256):
         super().__init__()
         self.fft_size = fft_size
         self.hop_length = hop_length
         
         # Network to enhance magnitude spectrum with attention mechanism
         self.mag_enhance = nn.Sequential(
-            nn.Conv1d(self.fft_size//2 + 1, 256, 3, padding=1),
-            nn.InstanceNorm1d(256),  # Normalization for better stability
+            nn.Conv1d(self.fft_size//2 + 1, hidden_dim, 3, padding=1),
+            nn.InstanceNorm1d(hidden_dim),  # Normalization for better stability
             nn.LeakyReLU(0.1),
-            nn.Conv1d(256, 256, 3, dilation=2, padding=2),  # Dilated convolution for wider receptive field
+            nn.Conv1d(hidden_dim, hidden_dim, 3, dilation=2, padding=2),  # Dilated convolution for wider receptive field
             nn.LeakyReLU(0.1),
-            nn.Conv1d(256, self.fft_size//2 + 1, 3, padding=1),
+            nn.Conv1d(hidden_dim, self.fft_size//2 + 1, 3, padding=1),
             nn.Sigmoid()
         )
         
         # Phase correction network (predicts phase adjustments)
         self.phase_enhance = nn.Sequential(
-            nn.Conv1d(self.fft_size//2 + 1, 128, 3, padding=1),
+            nn.Conv1d(self.fft_size//2 + 1, hidden_dim//2, 3, padding=1),
             nn.LeakyReLU(0.1),
-            nn.Conv1d(128, 128, 3, padding=1),
+            nn.Conv1d(hidden_dim//2, hidden_dim//2, 3, padding=1),
             nn.LeakyReLU(0.1),
-            nn.Conv1d(128, self.fft_size//2 + 1, 3, padding=1),
+            nn.Conv1d(hidden_dim//2, self.fft_size//2 + 1, 3, padding=1),
             nn.Tanh()  # Output range [-1, 1] for phase adjustments
         )
         
@@ -62,9 +62,9 @@ class PhaseAwareEnhancer(nn.Module):
         
         # Final projection layer to combine features
         self.final_proj = nn.Sequential(
-            nn.Conv1d(self.fft_size//2 + 1, 256, 3, padding=1),
+            nn.Conv1d(self.fft_size//2 + 1, hidden_dim, 3, padding=1),
             nn.LeakyReLU(0.1),
-            nn.Conv1d(256, self.fft_size//2 + 1, 3, padding=1),
+            nn.Conv1d(hidden_dim, self.fft_size//2 + 1, 3, padding=1),
             nn.Sigmoid()
         )
         
