@@ -499,6 +499,7 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         self.win_length = win_length
         self.context_window_sec = context_window_sec
         self.start_index = start_index
+        self.total_files = 0
 
         # Parameters for mel spectrogram extraction
         self.n_mels = n_mels
@@ -581,7 +582,8 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         
         # Create file processing tasks
         all_tasks = self.create_processing_tasks()
-        
+        self.total_files = len(all_tasks)
+
         # Estimate max audio length and mel frames
         self.max_audio_length, self.max_mel_frames = estimate_max_lengths(
             all_tasks, self.sample_rate, self.hop_length, max_files=100, context_window_sec=self.context_window_sec
@@ -973,6 +975,6 @@ def get_dataloader(batch_size=16, num_workers=4, pin_memory=True, persistent_wor
             collate_fn=collate_fn
         )
         
-        return train_loader, val_loader, train_dataset, val_dataset
+        return train_loader, val_loader, train_dataset, val_dataset, train_dataset.total_files
     else:
         return train_loader, train_dataset

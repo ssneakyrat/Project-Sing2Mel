@@ -12,6 +12,9 @@ from loss import HybridLoss
 from dataset_decoder import get_dataloader, SAMPLE_RATE, N_MELS, HOP_LENGTH, WIN_LENGTH
 
 from svs import SVS
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch.nn.utils.weight_norm")
 
 def extract_audio_from_dataset(batch, device):
     """Extract original audio from dataset"""
@@ -290,18 +293,11 @@ def main():
     
     # torch stuff
     #torch.backends.cudnn.benchmark = True
-    #torch.set_float32_matmul_precision("medium")
 
-    # stage training
     batch_size = 32 
-    current_stage = 0
-    max_stage = 3
-    stage_files = 20
-    num_epochs = 3 # per stage
-    visualization_interval = 5  # Visualize every 5 epochs
 
     # create dummy dataset to count for phonemes, singer, languages
-    train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
+    train_loader, val_loader, train_dataset, val_dataset, total_files = get_dataloader(
         batch_size=batch_size,
         num_workers=1,
         train_files=4,
@@ -313,6 +309,15 @@ def main():
         start_index=0
     )
     
+    # stage training
+    current_stage = 0    
+    stage_files = 100
+    max_stage = total_files // stage_files
+    num_epochs = 200 # per stage
+    visualization_interval = 5  # Visualize every 5 epochs
+
+    print(f"\nMax training stage: {max_stage}")
+
     # Get dataset parameters
     num_phonemes = len(train_dataset.phone_map)
     num_singers = len(train_dataset.singer_map)
@@ -368,7 +373,7 @@ def main():
     for stage in range(current_stage, max_stage + 1):
 
         # recreate dataset per stage
-        train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
+        train_loader, val_loader, train_dataset, val_dataset, _ = get_dataloader(
             batch_size=batch_size,
             num_workers=1,
             train_files=stage_files,
