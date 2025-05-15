@@ -124,8 +124,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
     """Train for one epoch"""
     model.train()
     total_loss = 0
-    total_mel_loss = 0
     total_stft_loss = 0
+    total_astft_loss = 0
     
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}', leave=False)
     for batch_idx, batch in enumerate(pbar):
@@ -144,7 +144,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
         wave, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
         
         # Compute combined loss
-        loss, stft_loss = criterion(wave, target_audio)
+        loss, stft_loss, astft_loss = criterion(wave, target_audio)
         
         # Backward pass
         loss.backward()
@@ -156,26 +156,28 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, mel_tran
         
         total_loss += loss.item()
         total_stft_loss += stft_loss.item()
-        
+        total_astft_loss += astft_loss.item()
+
         # Update progress bar with current batch loss
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
-            'stft_loss': f'{stft_loss.item():.4f}'
+            'stft_loss': f'{stft_loss.item():.4f}',
+            'astft_loss': f'{astft_loss.item():.4f}'
         })
 
     avg_loss = total_loss / len(dataloader)
-    avg_mel_loss = total_mel_loss / len(dataloader)
     avg_stft_loss = total_stft_loss / len(dataloader)
-    
-    return avg_loss, avg_mel_loss, avg_stft_loss
+    aavg_stft_loss = total_astft_loss / len(dataloader)
+
+    return avg_loss, avg_stft_loss, aavg_stft_loss
 
 def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visualize=False):
     """Evaluate the model"""
     model.eval()
     total_loss = 0
-    total_mel_loss = 0
     total_stft_loss = 0
-    
+    total_astft_loss = 0
+
     with torch.no_grad():
         pbar = tqdm(dataloader, desc='Evaluating', leave=False)
         for batch_idx, batch in enumerate(pbar):
@@ -193,15 +195,17 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
             wave, latent_mel = model(f0, phoneme_seq, singer_id, language_id)
             
             # Compute combined loss
-            loss, stft_loss = criterion(wave, target_audio)
+            loss, stft_loss, astft_loss = criterion(wave, target_audio)
             
             total_loss += loss.item()
             total_stft_loss += stft_loss.item()
+            total_astft_loss += astft_loss.item()
             
             # Update progress bar with current batch loss
             pbar.set_postfix({
                 'loss': f'{loss.item():.4f}',
-                'stft_loss': f'{stft_loss.item():.4f}'
+                'stft_loss': f'{stft_loss.item():.4f}',
+                'astft_loss': f'{astft_loss.item():.4f}'
             })
 
             predicted_mel = torch.log(mel_transform(wave))
@@ -212,10 +216,10 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
                                  latent_mel, save_dir='visuals/decoder/val')
         
         avg_loss = total_loss / len(dataloader)
-        avg_mel_loss = total_mel_loss / len(dataloader)
         avg_stft_loss = total_stft_loss / len(dataloader)
-        
-        return avg_loss, avg_mel_loss, avg_stft_loss
+        aavg_stft_loss = total_astft_loss / len(dataloader)
+
+        return avg_loss, avg_stft_loss, aavg_stft_loss
 
 def main():
     # Set device
@@ -274,7 +278,8 @@ def main():
     
     # Create loss function
     criterion = HybridLoss(
-        n_ffts=[1024, 512, 256, 128]
+        n_ffts=[1024, 512, 256, 128],
+        n_affts=[512+256, 256+128, 128+64]
     ).to(device)
     
     # Mel transform for extracting mel spectrogram from predicted audio
