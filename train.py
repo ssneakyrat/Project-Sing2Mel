@@ -368,9 +368,9 @@ def main():
         optimizer, 
         mode='min', 
         factor=0.5, 
-        patience=50
+        patience=10000,
     )
-
+    
     for stage in range(current_stage, max_stage + 1):
 
         # recreate dataset per stage
