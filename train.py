@@ -221,6 +221,62 @@ def evaluate(model, dataloader, criterion, device, epoch, mel_transform, visuali
 
         return avg_loss, avg_stft_loss, aavg_stft_loss
 
+def train_stage(device, stage, num_epochs, train_loader, val_loader, model, criterion, optimizer, scheduler, mel_transform, visualization_interval):
+    
+    print(f"starting training stage: {stage}")
+
+    # Training loop    
+    best_val_loss = float('inf')
+    
+    epoch_pbar = tqdm(range(num_epochs), desc="Training Progress", leave=False)
+    for epoch in epoch_pbar:
+        train_loss, train_mel_loss, train_stft_loss = train_epoch(
+            model, train_loader, criterion, optimizer, device, epoch, mel_transform
+        )
+        
+        # Visualize during evaluation at certain intervals
+        should_visualize = (epoch % visualization_interval == 0)
+        val_loss, val_mel_loss, val_stft_loss = evaluate(
+            model, val_loader, criterion, device, epoch, mel_transform, visualize=should_visualize
+        )
+        
+        # Update learning rate based on validation loss
+        scheduler.step(val_loss)
+        
+        # Print training information
+        '''
+        print(f"Epoch {epoch}:")
+        print(f"  Train Loss: {train_loss:.4f} (Mel: {train_mel_loss:.4f}, STFT: {train_stft_loss:.4f})")
+        print(f"  Val Loss: {val_loss:.4f} (Mel: {val_mel_loss:.4f}, STFT: {val_stft_loss:.4f})")
+        print(f"  Current LR: {optimizer.param_groups[0]['lr']:.6f}")
+        '''
+        # Update epoch progress bar with loss information
+        epoch_pbar.set_postfix({
+            'train_loss': f'{train_loss:.4f}',
+            'val_loss': f'{val_loss:.4f}',
+            'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
+        })
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), 'best_decoder_model.pth')
+            print(f"  Saved best model with val loss: {val_loss:.4f}")
+        
+        # Also save regular checkpoints
+        if epoch % 10 == 0:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'best_val_loss': best_val_loss,
+            }, f'checkpoints/decoder_checkpoint_epoch_{epoch}.pth')
+    
+    print(f"\nStage {stage} Training completed!")
+    print(f"Best validation loss: {best_val_loss:.4f}")
+
 def main():
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -234,21 +290,27 @@ def main():
     
     # torch stuff
     #torch.backends.cudnn.benchmark = True
-    #torch.set_float32_matmul_precision("high")
+    #torch.set_float32_matmul_precision("medium")
 
-    # Load dataset
-    batch_size = 32  # Smaller batch size for complex model
-    num_epochs = 500
+    # stage training
+    batch_size = 32 
+    current_stage = 0
+    max_stage = 3
+    stage_files = 20
+    num_epochs = 3 # per stage
     visualization_interval = 5  # Visualize every 5 epochs
 
+    # create dummy dataset to count for phonemes, singer, languages
     train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
         batch_size=batch_size,
         num_workers=1,
-        train_files=None,
-        val_files=10,
+        train_files=4,
+        val_files=2,
         device=device,
         context_window_sec=2,  # 2-second window
-        persistent_workers=True
+        persistent_workers=True,
+        rebuild_cache=True,
+        start_index=0
     )
     
     # Get dataset parameters
@@ -302,58 +364,25 @@ def main():
         factor=0.5, 
         patience=50
     )
-    
-    # Training loop    
-    best_val_loss = float('inf')
-    
-    epoch_pbar = tqdm(range(num_epochs), desc="Training Progress", leave=False)
-    for epoch in epoch_pbar:
-        train_loss, train_mel_loss, train_stft_loss = train_epoch(
-            model, train_loader, criterion, optimizer, device, epoch, mel_transform
+
+    for stage in range(current_stage, max_stage + 1):
+
+        # recreate dataset per stage
+        train_loader, val_loader, train_dataset, val_dataset = get_dataloader(
+            batch_size=batch_size,
+            num_workers=1,
+            train_files=stage_files,
+            val_files=20,
+            device=device,
+            context_window_sec=2,  # 2-second window
+            persistent_workers=True,
+            rebuild_cache=True,
+            start_index=stage*stage_files
         )
-        
-        # Visualize during evaluation at certain intervals
-        should_visualize = (epoch % visualization_interval == 0)
-        val_loss, val_mel_loss, val_stft_loss = evaluate(
-            model, val_loader, criterion, device, epoch, mel_transform, visualize=should_visualize
-        )
-        
-        # Update learning rate based on validation loss
-        scheduler.step(val_loss)
-        
-        # Print training information
-        '''
-        print(f"Epoch {epoch}:")
-        print(f"  Train Loss: {train_loss:.4f} (Mel: {train_mel_loss:.4f}, STFT: {train_stft_loss:.4f})")
-        print(f"  Val Loss: {val_loss:.4f} (Mel: {val_mel_loss:.4f}, STFT: {val_stft_loss:.4f})")
-        print(f"  Current LR: {optimizer.param_groups[0]['lr']:.6f}")
-        '''
-        # Update epoch progress bar with loss information
-        epoch_pbar.set_postfix({
-            'train_loss': f'{train_loss:.4f}',
-            'val_loss': f'{val_loss:.4f}',
-            'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
-        })
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), 'best_decoder_model.pth')
-            print(f"  Saved best model with val loss: {val_loss:.4f}")
-        
-        # Also save regular checkpoints
-        if epoch % 10 == 0:
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'train_loss': train_loss,
-                'val_loss': val_loss,
-                'best_val_loss': best_val_loss,
-            }, f'checkpoints/decoder_checkpoint_epoch_{epoch}.pth')
-    
-    print("\nTraining completed!")
-    print(f"Best validation loss: {best_val_loss:.4f}")
+
+        train_stage(device=device, stage=stage, num_epochs=num_epochs, train_loader=train_loader, val_loader=val_loader, optimizer=optimizer,
+                    model=model, criterion=criterion, scheduler=scheduler, mel_transform=mel_transform, visualization_interval=visualization_interval
+                    )
 
 if __name__ == "__main__":
     main()

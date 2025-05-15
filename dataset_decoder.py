@@ -475,7 +475,7 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
              num_workers=8, batch_size=32, device='cuda' if torch.cuda.is_available() else 'cpu',
              context_window_sec=None,
              is_train=True, train_files=None, val_files=None, seed=42,
-             shared_dataset=None):  # Added shared_dataset parameter
+             shared_dataset=None, start_index=0):  # Added shared_dataset parameter
         """
         Initialize the SingingVoiceDataset.
         
@@ -498,7 +498,8 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         self.hop_length = hop_length
         self.win_length = win_length
         self.context_window_sec = context_window_sec
-        
+        self.start_index = start_index
+
         # Parameters for mel spectrogram extraction
         self.n_mels = n_mels
         self.fmin = fmin
@@ -595,8 +596,11 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         random.seed(self.seed)
         
         # Shuffle all tasks
-        random.shuffle(all_tasks)
+        #random.shuffle(all_tasks)
         
+        logger.info(f"Starting file processing from index {self.start_index} out of {len(all_tasks)} files")
+        all_tasks = all_tasks[self.start_index:]
+
         # Select files for training and validation based on counts
         total_files = len(all_tasks)
         
@@ -609,9 +613,6 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
             if self.train_files is not None:
                 # Use specified number of training files
                 file_count = min(self.train_files, total_files)
-                if self.val_files is not None:
-                    # Ensure we don't overlap with validation files
-                    file_count = min(file_count, total_files - self.val_files)
                 
                 processing_tasks = all_tasks[:file_count]
                 logger.info(f"Selected {len(processing_tasks)} files for training out of {total_files} total files")
@@ -872,8 +873,8 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
 
 def get_dataloader(batch_size=16, num_workers=4, pin_memory=True, persistent_workers=True, 
                   train_files=None, val_files=None, device='cuda', collate_fn=None, 
-                  context_window_sec=None, seed=42, create_val=True, 
-                  shared_validation=True):  # Added shared_validation parameter
+                  context_window_sec=None, seed=42, create_val=True, rebuild_cache=False, 
+                  shared_validation=True, start_index=0):
     """
     Get dataloaders for the singing voice dataset.
     
@@ -899,9 +900,7 @@ def get_dataloader(batch_size=16, num_workers=4, pin_memory=True, persistent_wor
     if collate_fn is None:
         collate_fn = standardized_collate_fn
     
-    # If we're using shared validation, train should use all available files
-    # (we'll sample from these for validation later)
-    effective_train_files = None if shared_validation else train_files
+    effective_train_files = train_files
     effective_val_files = None if shared_validation else val_files
     
     logger.info("Creating training dataset...")
@@ -910,7 +909,7 @@ def get_dataloader(batch_size=16, num_workers=4, pin_memory=True, persistent_wor
         
     # Create a training dataset that will potentially be shared
     train_dataset = SingingVoiceDataset(
-        rebuild_cache=False,
+        rebuild_cache=rebuild_cache,
         n_mels=N_MELS,
         hop_length=HOP_LENGTH,
         win_length=WIN_LENGTH,
@@ -922,7 +921,8 @@ def get_dataloader(batch_size=16, num_workers=4, pin_memory=True, persistent_wor
         is_train=True,
         train_files=effective_train_files,
         val_files=effective_val_files,
-        seed=seed
+        seed=seed,
+        start_index=start_index
     )
     
     # Mark the dataset as shared if needed
