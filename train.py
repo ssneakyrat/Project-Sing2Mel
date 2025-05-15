@@ -292,8 +292,8 @@ def main():
     os.makedirs('audio_samples', exist_ok=True)
     os.makedirs('checkpoints', exist_ok=True)
     
-    # torch stuff
-    #torch.backends.cudnn.benchmark = True
+    # continue checkpoint
+    checkpoint_path = 'best_decoder_model.pth'        
 
     batch_size = 32 
 
@@ -334,6 +334,10 @@ def main():
         sample_rate=SAMPLE_RATE
     ).to(device)
     
+    # load check point
+    if checkpoint_path is not None:
+        model.load_state_dict(torch.load(checkpoint_path))
+
     # Print model info
     total_params, trainable_params = count_parameters(model)
     model_size = get_model_size(model)
@@ -370,7 +374,7 @@ def main():
         factor=0.5, 
         patience=10000,
     )
-    
+
     for stage in range(current_stage, max_stage + 1):
 
         # recreate dataset per stage
