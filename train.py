@@ -260,7 +260,7 @@ def train_stage(config, device, stage, num_epochs, train_loader, val_loader, mod
             print(f"  Saved best model with val loss: {val_loss:.4f}")
         
         # Also save regular checkpoints
-        if epoch % 10 == 0:
+        if epoch % config['training']['save_interval'] == 0:
             torch.save({
                 'epoch': epoch,
                 'stage' : stage,

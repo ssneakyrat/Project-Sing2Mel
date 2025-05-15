@@ -21,6 +21,7 @@ training:
   stage_files: 1000 #per stage files
   num_epochs: 200 #per stage epoch
   lr: 0.001
+  save_interval: 10
 
 log:
   visualization_interval: 5
