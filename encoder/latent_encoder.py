@@ -187,7 +187,7 @@ class EncoderLayer(nn.Module):
         
         return x
 
-class MelEncoder(nn.Module):
+class LatentEncoder(nn.Module):
     """
     Encodes fundamental frequency and linguistic features into mel spectrograms.
     Uses a hybrid architecture with convolutional layers and self-attention to predict 
@@ -203,7 +203,7 @@ class MelEncoder(nn.Module):
                  num_encoder_layers=2,
                  num_conv_blocks=2,
                  dropout=0.1):
-        super(MelEncoder, self).__init__()
+        super(LatentEncoder, self).__init__()
         
         # Input dimensions
         self.n_mels = n_mels

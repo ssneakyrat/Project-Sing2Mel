@@ -177,6 +177,52 @@ def load_mappings(map_file):
         'phone_map': phone_map
     }
 
+def get_total_files(dataset_dir, singer_map, language_map):
+    tasks = []
+    
+    for singer_dir in glob.glob(os.path.join(dataset_dir, "*")):
+        if not os.path.isdir(singer_dir):
+            continue
+            
+        singer_id = os.path.basename(singer_dir)
+        singer_idx = singer_map[singer_id]
+        
+        for lang_dir in glob.glob(os.path.join(singer_dir, "*")):
+            if not os.path.isdir(lang_dir):
+                continue
+                
+            language_id = os.path.basename(lang_dir)
+            language_idx = language_map[language_id]
+            
+            # Check for lab and wav directories
+            lab_dir = os.path.join(lang_dir, "lab")
+            wav_dir = os.path.join(lang_dir, "wav")
+            
+            if not os.path.exists(lab_dir) or not os.path.exists(wav_dir):
+                continue
+            
+            # List lab files
+            lab_files = glob.glob(os.path.join(lab_dir, "*.lab"))
+            
+            for lab_file in lab_files:
+                base_name = os.path.basename(lab_file).replace('.lab', '')
+                wav_file = os.path.join(wav_dir, f"{base_name}.wav")
+                
+                if not os.path.exists(wav_file):
+                    continue
+                
+                tasks.append(FileMetadata(
+                    lab_file=lab_file,
+                    wav_file=wav_file,
+                    singer_id=singer_id,
+                    language_id=language_id,
+                    singer_idx=singer_idx,
+                    language_idx=language_idx,
+                    base_name=base_name
+                ))
+    
+    return len(tasks)
+
 def create_file_tasks(dataset_dir, singer_map, language_map):
     """
     Create list of file processing tasks.

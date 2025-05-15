@@ -4,7 +4,7 @@ import numpy as np
 
 from decoder.core import remove_above_nyquist
 
-class WaveGeneratorOscillator(nn.Module):
+class HarmonicOscillator(nn.Module):
     """
         synthesize audio with a sawtooth oscillator.
         the sawtooth oscillator is synthesized by a bank of sinusoids

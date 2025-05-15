@@ -1,0 +1,26 @@
+data:
+  dataset_dir: 'datasets/'
+  map_file: 'mappings.yaml'
+
+model:
+  phone_num: 500
+  singer_num: 10
+  lang_num: 10
+  n_mels: 80
+  hop_length: 240
+  win_length: 1024
+  sample_rate: 24000
+  num_harmonics: 80
+  num_mag_harmonic: 256
+  num_mag_noise: 80
+
+training:
+  continue_ckpt: False
+  checkpoint_path: 'best_model.pth'
+  batch_size: 32
+  stage_files: 1000 #per stage files
+  num_epochs: 200 #per stage epoch
+  lr: 0.001
+
+log:
+  visualization_interval: 5

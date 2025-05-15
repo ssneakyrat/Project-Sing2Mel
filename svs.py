@@ -3,12 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from encoder.mel_encoder import MelEncoder
+from encoder.latent_encoder import LatentEncoder
 from decoder.feature_extractor import FeatureExtractor
-from decoder.wave_generator_oscillator import WaveGeneratorOscillator
+from decoder.harmonic_oscillator import HarmonicOscillator
 from decoder.core import scale_function, frequency_filter, upsample
-from decoder.human_vocal_filter import vocal_frequency_filter
-from decoder.enhancement_network import PhaseAwareEnhancer
+from decoder.vocal_filter import vocal_frequency_filter
+from decoder.phaser_network import PhaseAwareEnhancer
 
 # Modified SVS class with MelEncoder integration
 class SVS(nn.Module):
@@ -20,12 +20,12 @@ class SVS(nn.Module):
                  num_phonemes, 
                  num_singers, 
                  num_languages,
-                 n_mels=80, 
-                 hop_length=240, 
-                 sample_rate=24000,
-                 num_harmonics=80, 
-                 num_mag_harmonic=256,
-                 num_mag_noise=80,
+                 n_mels, 
+                 hop_length, 
+                 sample_rate,
+                 num_harmonics, 
+                 num_mag_harmonic,
+                 num_mag_noise,
                  ):
         super(SVS, self).__init__()
         
@@ -72,21 +72,21 @@ class SVS(nn.Module):
         self.ratio = nn.Parameter(torch.tensor([0.4]).float(), requires_grad=False)
 
         # Initialize harmonic synthesizer
-        self.harmonic_synthesizer = WaveGeneratorOscillator(
+        self.harmonic_synthesizer = HarmonicOscillator(
             sample_rate,
             amplitudes=self.harmonic_amplitudes,
             ratio=self.ratio)
         
         # Initialize mel encoder
-        self.mel_encoder = MelEncoder(
+        self.encoder = LatentEncoder(
             n_mels=n_mels,
             phoneme_embed_dim=self.phoneme_embed_dim,
             singer_embed_dim=self.singer_embed_dim,
             language_embed_dim=self.language_embed_dim
         )
 
-        self.refiner = PhaseAwareEnhancer(hidden_dim=512)
-        self.refiner2 = PhaseAwareEnhancer(hidden_dim=256)
+        self.harmonic_phaser = PhaseAwareEnhancer(hidden_dim=512)
+        self.noise_phaser = PhaseAwareEnhancer(hidden_dim=256)
 
     def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
         """
@@ -114,7 +114,7 @@ class SVS(nn.Module):
         f0_unsqueeze = f0.unsqueeze(2)  # [B, T, 1]
         
         # Generate mel spectrogram if not provided
-        predicted_mel = self.mel_encoder(f0_unsqueeze, phoneme_emb, singer_emb, language_emb)
+        predicted_mel = self.encoder(f0_unsqueeze, phoneme_emb, singer_emb, language_emb)
 
         # Get control parameters from feature extractor
         ctrls = self.feature_extractor(predicted_mel, f0, phoneme_emb, singer_emb, language_emb)
@@ -154,8 +154,8 @@ class SVS(nn.Module):
             multi_resolution=False
         )
         
-        harmonic = self.refiner(harmonic)
-        noise = self.refiner2(noise)
+        harmonic = self.harmonic_phaser(harmonic)
+        noise = self.noise_phaser(noise)
 
         signal = harmonic + noise
 
