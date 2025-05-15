@@ -1,3 +1,4 @@
+import yaml
 import os
 import torch
 import numpy as np
@@ -160,85 +161,20 @@ def extract_f0_parselmouth(audio, sample_rate, hop_length):
     
     return pitch_values
 
-def scan_directory_structure(dataset_dir):
-    """
-    Scan directory structure and create mappings for singers, languages, and phones.
-    
-    Args:
-        dataset_dir (str): Path to the dataset directory
-        
-    Returns:
-        dict: Containing singer_map, language_map, phone_map and their inverses
-    """
-    # Verify dataset directory exists
-    if not os.path.exists(dataset_dir):
-        raise ValueError(f"Dataset directory does not exist: {dataset_dir}")
-    
-    # Find all singer directories
-    singer_dirs = [d for d in glob.glob(os.path.join(dataset_dir, "*")) if os.path.isdir(d)]
-    logger.info(f"Found {len(singer_dirs)} singers: {[os.path.basename(d) for d in singer_dirs]}")
-    
-    if not singer_dirs:
-        raise ValueError(f"No singer directories found in {dataset_dir}")
-            
-    # Create singer ID mapping
-    singer_map = {os.path.basename(s): i for i, s in enumerate(sorted(singer_dirs))}
-    inv_singer_map = {i: s for s, i in singer_map.items()}
-    
-    # Find all language directories and create language mapping
-    language_dirs = []
-    for singer_dir in singer_dirs:
-        lang_dirs = [d for d in glob.glob(os.path.join(singer_dir, "*")) if os.path.isdir(d)]
-        language_dirs.extend(lang_dirs)
-    
-    unique_languages = set(os.path.basename(l) for l in language_dirs)
-    language_map = {lang: i for i, lang in enumerate(sorted(unique_languages))}
-    inv_language_map = {i: lang for lang, i in language_map.items()}
-    
-    # Scan for all phonemes
-    all_phones = set()
-    
-    for singer_dir in singer_dirs:
-        singer_id = os.path.basename(singer_dir)
-        
-        for lang_dir in glob.glob(os.path.join(singer_dir, "*")):
-            if not os.path.isdir(lang_dir):
-                continue
-                
-            language_id = os.path.basename(lang_dir)
-            
-            # Check for lab directory
-            lab_dir = os.path.join(lang_dir, "lab")
-            if not os.path.exists(lab_dir):
-                continue
-            
-            # List lab files
-            lab_files = glob.glob(os.path.join(lab_dir, "*.lab"))
-            
-            # Read phones from files
-            for lab_file in lab_files:
-                try:
-                    with open(lab_file, 'r') as f:
-                        for line in f:
-                            parts = line.strip().split()
-                            if len(parts) == 3:
-                                _, _, phone = parts
-                                all_phones.add(phone)
-                except Exception as e:
-                    logger.error(f"Error reading lab file {lab_file}: {str(e)}")
-    
-    # Create phone mapping
-    phone_map = {phone: i+1 for i, phone in enumerate(sorted(all_phones))}
-    inv_phone_map = {i: phone for phone, i in phone_map.items()}
-    logger.info(f"Found {len(phone_map)} unique phones")
-    
+def load_mappings(map_file):
+
+    with open(map_file, 'r') as file:
+        data = yaml.safe_load(file)
+
+    # Access specific mappings
+    lang_map = data['lang_map']
+    phone_map = data['phone_map']
+    singer_map = data['singer_map']
+
     return {
         'singer_map': singer_map,
-        'inv_singer_map': inv_singer_map,
-        'language_map': language_map,
-        'inv_language_map': inv_language_map,
-        'phone_map': phone_map,
-        'inv_phone_map': inv_phone_map
+        'language_map': lang_map,
+        'phone_map': phone_map
     }
 
 def create_file_tasks(dataset_dir, singer_map, language_map):

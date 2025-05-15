@@ -12,7 +12,7 @@ import argparse
 import yaml
 
 from dataset import get_dataloader
-from utils import standardized_collate_fn
+from data_utils import standardized_collate_fn
 
 def find_dataset_cache_files(cache_dir="./cache"):
     """Find all dataset cache files in the cache directory."""

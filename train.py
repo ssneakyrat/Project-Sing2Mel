@@ -293,7 +293,7 @@ def main():
     os.makedirs('checkpoints', exist_ok=True)
     
     # continue checkpoint
-    checkpoint_path = 'best_decoder_model.pth'        
+    checkpoint_path = None #'best_decoder_model.pth'        
 
     batch_size = 32 
 

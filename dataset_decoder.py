@@ -18,10 +18,10 @@ import math
 import yaml
 
 # Import utilities from utils.py
-from utils import (
+from data_utils import (
     FileMetadata, AudioData, ProcessedFeatures,
     normalize_mel, extract_f0_parselmouth,
-    scan_directory_structure, create_file_tasks, estimate_max_lengths,
+    load_mappings, create_file_tasks, estimate_max_lengths,
     process_file_metadata, standardized_collate_fn
 )
 
@@ -542,11 +542,8 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         # Copy all necessary attributes from the source dataset
         source_data = source_dataset.data
         self.phone_map = source_dataset.phone_map
-        self.inv_phone_map = source_dataset.inv_phone_map
         self.singer_map = source_dataset.singer_map
-        self.inv_singer_map = source_dataset.inv_singer_map
         self.language_map = source_dataset.language_map
-        self.inv_language_map = source_dataset.inv_language_map
         self.singer_language_stats = source_dataset.singer_language_stats
         self.singer_duration = source_dataset.singer_duration
         self.language_duration = source_dataset.language_duration
@@ -693,13 +690,10 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
     
     def scan_dataset_structure(self):
         """Scan directory structure and create mappings."""
-        mappings = scan_directory_structure(self.dataset_dir)
+        mappings = load_mappings('mappings.yaml')#scan_directory_structure(self.dataset_dir)
         self.singer_map = mappings['singer_map']
-        self.inv_singer_map = mappings['inv_singer_map']
         self.language_map = mappings['language_map']
-        self.inv_language_map = mappings['inv_language_map']
         self.phone_map = mappings['phone_map']
-        self.inv_phone_map = mappings['inv_phone_map']
     
     def create_processing_tasks(self):
         """Create list of file processing tasks."""
@@ -738,11 +732,8 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         cache_data = {
             'data': self.data,
             'phone_map': self.phone_map,
-            'inv_phone_map': self.inv_phone_map,
             'singer_map': self.singer_map,
-            'inv_singer_map': self.inv_singer_map,
             'language_map': self.language_map,
-            'inv_language_map': self.inv_language_map,
             'singer_language_stats': self.singer_language_stats,
             'singer_duration': self.singer_duration,
             'language_duration': self.language_duration,
@@ -765,11 +756,8 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         
         self.data = cache_data['data']
         self.phone_map = cache_data['phone_map']
-        self.inv_phone_map = cache_data['inv_phone_map']
         self.singer_map = cache_data['singer_map']
-        self.inv_singer_map = cache_data['inv_singer_map']
         self.language_map = cache_data['language_map']
-        self.inv_language_map = cache_data['inv_language_map']
         
         # Load statistics if available
         self.singer_language_stats = cache_data.get('singer_language_stats', {})
