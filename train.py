@@ -276,7 +276,7 @@ def train_stage(device, stage, num_epochs, train_loader, val_loader, model, crit
                 'train_loss': train_loss,
                 'val_loss': val_loss,
                 'best_val_loss': best_val_loss,
-            }, f'checkpoints/decoder_checkpoint_epoch_{epoch}.pth')
+            }, f'checkpoints/decoder_checkpoint_stage_{stage}_epoch_{epoch}.pth')
     
     print(f"\nStage {stage} Training completed!")
     print(f"Best validation loss: {best_val_loss:.4f}")
