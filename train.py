@@ -269,6 +269,7 @@ def train_stage(device, stage, num_epochs, train_loader, val_loader, model, crit
         if epoch % 10 == 0:
             torch.save({
                 'epoch': epoch,
+                'stage' : stage,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
@@ -308,7 +309,7 @@ def main():
         rebuild_cache=True,
         start_index=0
     )
-    
+
     # stage training
     current_stage = 0    
     stage_files = 100
