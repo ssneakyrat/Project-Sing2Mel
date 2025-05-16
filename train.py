@@ -23,7 +23,7 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="torch.nn.utils
 def extract_audio_from_dataset(batch, device):
     return batch['audio'].to(device)
 
-def visualize_outputs(config, epoch, batch_idx, mel, predicted_mel, wave, target_audio, latent_mel=None, 
+def visualize_outputs(config, epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
                      singer_weights=None, language_weights=None, save_dir='visuals'):
     """
     Visualize model outputs with optional singer/language mixture visualization
@@ -41,17 +41,17 @@ def visualize_outputs(config, epoch, batch_idx, mel, predicted_mel, wave, target
         save_dir: Directory to save visualizations
     """
     # Determine number of subplots based on whether we have mixture information
-    n_plots = 4
+    n_plots = 3
     if singer_weights is not None and language_weights is not None:
-        n_plots = 6
+        n_plots = 5
     
     # Create figure with subplots
-    if n_plots == 6:
+    if n_plots == 5:
         fig, ax = plt.subplots(n_plots, 1, figsize=(12, 4 * n_plots), 
-                              gridspec_kw={'height_ratios': [1, 1, 1, 1.5, 0.5, 0.5]})
+                              gridspec_kw={'height_ratios': [1, 1, 1.5, 0.5, 0.5]})
     else:
         fig, ax = plt.subplots(n_plots, 1, figsize=(12, 4 * n_plots), 
-                              gridspec_kw={'height_ratios': [1, 1, 1, 1.5]})
+                              gridspec_kw={'height_ratios': [1, 1, 1.5]})
     
     # Plot original mel
     if mel.dim() == 3 and mel.size(1) == config['model']['n_mels']:
@@ -69,19 +69,6 @@ def visualize_outputs(config, epoch, batch_idx, mel, predicted_mel, wave, target
     ax[1].imshow(predicted_mel[0].detach().cpu().numpy(), aspect='auto', origin='lower')
     ax[1].set_title('Reconstructed Mel Spectrogram')
     ax[1].set_ylabel('Mel Bin')
-
-    # Plot latent mel if provided
-    if latent_mel is not None:
-        if latent_mel.dim() == 3 and latent_mel.size(1) == config['model']['n_mels']:
-            # [B, n_mels, T] format
-            latent_mel_plot = latent_mel[0].detach().cpu().numpy()
-        else:
-            # [B, T, n_mels] format
-            latent_mel_plot = latent_mel[0].transpose(0, 1).detach().cpu().numpy()
-        
-        ax[2].imshow(latent_mel_plot, aspect='auto', origin='lower')
-        ax[2].set_title('Latent Mel Space')
-        ax[2].set_ylabel('Mel Bin')
     
     # Plot waveforms
     wave_predicted = wave[0].detach().cpu().numpy()
@@ -95,7 +82,7 @@ def visualize_outputs(config, epoch, batch_idx, mel, predicted_mel, wave, target
     wave_target_aligned = wave_target[:min_len]
     time = np.arange(min_len) / config['model']['sample_rate']
 
-    waveform_idx = 3
+    waveform_idx = 2
     ax[waveform_idx].plot(time, wave_predicted_aligned, label='Predicted', color='blue', alpha=0.7)
     ax[waveform_idx].plot(time, wave_target_aligned, label='Target', color='green', alpha=0.5)
     ax[waveform_idx].set_title('Waveform Comparison')
@@ -104,19 +91,19 @@ def visualize_outputs(config, epoch, batch_idx, mel, predicted_mel, wave, target
     ax[waveform_idx].legend(loc='upper right')
     
     # Plot singer and language weights if provided
-    if singer_weights is not None and n_plots > 4:
+    if singer_weights is not None and n_plots > 3:
         singer_weights_np = singer_weights[0].detach().cpu().numpy()
-        ax[4].bar(range(len(singer_weights_np)), singer_weights_np)
-        ax[4].set_title('Singer Mixture Weights (Inference Only)')
-        ax[4].set_xlabel('Singer ID')
-        ax[4].set_ylabel('Weight')
+        ax[3].bar(range(len(singer_weights_np)), singer_weights_np)
+        ax[3].set_title('Singer Mixture Weights (Inference Only)')
+        ax[3].set_xlabel('Singer ID')
+        ax[3].set_ylabel('Weight')
         
-    if language_weights is not None and n_plots > 4:
+    if language_weights is not None and n_plots > 3:
         language_weights_np = language_weights[0].detach().cpu().numpy()
-        ax[5].bar(range(len(language_weights_np)), language_weights_np)
-        ax[5].set_title('Language Mixture Weights (Inference Only)')
-        ax[5].set_xlabel('Language ID')
-        ax[5].set_ylabel('Weight')
+        ax[3].bar(range(len(language_weights_np)), language_weights_np)
+        ax[3].set_title('Language Mixture Weights (Inference Only)')
+        ax[3].set_xlabel('Language ID')
+        ax[3].set_ylabel('Weight')
     
     plt.tight_layout()
     plt.savefig(f'{save_dir}/epoch_{epoch}_batch_{batch_idx}.png')
@@ -301,7 +288,7 @@ def train_epoch(config, model, dataloader, criterion, optimizer, device, epoch, 
         
         # Forward pass with original IDs (no mixtures during training)
         optimizer.zero_grad()
-        wave, latent_mel = model(f0, phoneme_seq, singer_id=singer_id, language_id=language_id)
+        wave = model(f0, phoneme_seq, singer_id=singer_id, language_id=language_id)
         
         # Compute combined loss
         loss, stft_loss, astft_loss = criterion(wave, target_audio)
@@ -357,10 +344,10 @@ def evaluate(config, model, dataloader, criterion, device, epoch, mel_transform,
             if visualize and batch_idx == 0 and use_mixtures_for_viz:
                 # For visualization only, create some example mixtures
                 singer_weights, language_weights = prepare_singer_language_mixtures(batch, config, device, mixture_ratio=0.7)
-                wave, latent_mel = model(f0, phoneme_seq, singer_weights=singer_weights, language_weights=language_weights)
+                wave = model(f0, phoneme_seq, singer_weights=singer_weights, language_weights=language_weights)
             else:
                 # Normal evaluation with original IDs
-                wave, latent_mel = model(f0, phoneme_seq, singer_id=singer_id, language_id=language_id)
+                wave = model(f0, phoneme_seq, singer_id=singer_id, language_id=language_id)
             
             # Compute combined loss
             loss, stft_loss, astft_loss = criterion(wave, target_audio)
@@ -382,11 +369,11 @@ def evaluate(config, model, dataloader, criterion, device, epoch, mel_transform,
                 if use_mixtures_for_viz:
                     # Visualization with mixture weights
                     visualize_outputs(config, epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
-                                    latent_mel, singer_weights, language_weights, save_dir='visuals')
+                                    singer_weights, language_weights, save_dir='visuals')
                 else:
                     # Normal visualization without mixture weights
                     visualize_outputs(config, epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
-                                    latent_mel, save_dir='visuals')
+                                    save_dir='visuals')
         
         avg_loss = total_loss / len(dataloader)
         avg_stft_loss = total_stft_loss / len(dataloader)

@@ -3,8 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from encoder.latent_encoder import LatentEncoder
-from decoder.feature_extractor import FeatureExtractor
+from decoder.feature_processor import FeatureProcessor
 from decoder.harmonic_oscillator import HarmonicOscillator
 from decoder.core import scale_function, frequency_filter, upsample
 from decoder.vocal_filter import vocal_frequency_filter
@@ -12,20 +11,20 @@ from decoder.phaser_network import PhaseAwareEnhancer
 
 class SVS(nn.Module):
     """
-    Lightweight DDSP-based singing voice synthesis model with separated
-    expressive control prediction and signal processing components.
+    Lightweight DDSP-based singing voice synthesis model with streamlined
+    direct linguistic feature to control parameter processing.
     Enhanced with singer and language mixture capabilities.
     """
     def __init__(self, 
                  num_phonemes, 
                  num_singers, 
                  num_languages,
-                 n_mels, 
-                 hop_length, 
-                 sample_rate,
-                 num_harmonics, 
-                 num_mag_harmonic,
-                 num_mag_noise,
+                 n_mels=80, 
+                 hop_length=256, 
+                 sample_rate=44100,
+                 num_harmonics=100, 
+                 num_mag_harmonic=80,
+                 num_mag_noise=80,
                  ):
         super(SVS, self).__init__()
         
@@ -53,19 +52,16 @@ class SVS(nn.Module):
         self.register_buffer("sampling_rate", torch.tensor(sample_rate))
         self.register_buffer("block_size", torch.tensor(hop_length))
         
-        # Define feature extractor output splits
-        split_map = {
-            'harmonic_magnitude': num_mag_harmonic,
-            'noise_magnitude': num_mag_noise
-        }
-
-        # Initialize feature extractor with proper dimensions
-        self.feature_extractor = FeatureExtractor(
-            input_channel=n_mels,
-            output_splits=split_map,
-            phoneme_dim=self.phoneme_embed_dim,
-            singer_dim=self.singer_embed_dim,
-            language_dim=self.language_embed_dim
+        # Initialize the feature processor
+        self.feature_processor = FeatureProcessor(
+            phoneme_embed_dim=self.phoneme_embed_dim,
+            singer_embed_dim=self.singer_embed_dim,
+            language_embed_dim=self.language_embed_dim,
+            hidden_dim=256,
+            num_harmonics=num_harmonics,
+            num_mag_harmonic=num_mag_harmonic,
+            num_mag_noise=num_mag_noise,
+            dropout=0.1
         )
 
         # Harmonic Synthesizer parameters
@@ -78,15 +74,8 @@ class SVS(nn.Module):
             sample_rate,
             amplitudes=self.harmonic_amplitudes,
             ratio=self.ratio)
-        
-        # Initialize mel encoder
-        self.encoder = LatentEncoder(
-            n_mels=n_mels,
-            phoneme_embed_dim=self.phoneme_embed_dim,
-            singer_embed_dim=self.singer_embed_dim,
-            language_embed_dim=self.language_embed_dim
-        )
 
+        # Phase-aware enhancers for harmonic and noise components
         self.harmonic_phaser = PhaseAwareEnhancer(hidden_dim=512)
         self.noise_phaser = PhaseAwareEnhancer(hidden_dim=256)
     
@@ -140,7 +129,7 @@ class SVS(nn.Module):
             initial_phase: Optional initial phase for the harmonic oscillator
             
         Returns:
-            Audio signal [B, T*hop_length], expressive parameters dict
+            Audio signal [B, T*hop_length]
         """
         batch_size, n_frames = f0.shape[0], f0.shape[1]
         device = f0.device
@@ -178,14 +167,11 @@ class SVS(nn.Module):
         else:
             raise ValueError("Either language_id or language_weights must be provided")
 
-        # Prepare f0 for mel encoder
+        # Prepare f0 for feature processor
         f0_unsqueeze = f0.unsqueeze(2)  # [B, T, 1]
         
-        # Generate mel spectrogram
-        predicted_mel = self.encoder(f0_unsqueeze, phoneme_emb, singer_emb, language_emb)
-
-        # Get control parameters from feature extractor
-        ctrls = self.feature_extractor(predicted_mel, f0, phoneme_emb, singer_emb, language_emb)
+        # Get control parameters directly from feature processor
+        ctrls = self.feature_processor(f0_unsqueeze, phoneme_emb, singer_emb, language_emb)
 
         # Process harmonic and noise parameters
         src_param = scale_function(ctrls['harmonic_magnitude'])
@@ -222,13 +208,14 @@ class SVS(nn.Module):
             multi_resolution=False
         )
         
+        # Apply phase-aware enhancement
         harmonic = self.harmonic_phaser(harmonic)
         noise = self.noise_phaser(noise)
 
+        # Final audio signal is the sum of harmonic and noise components
         signal = harmonic + noise
 
-        # Return both the audio output and the expressive parameters
-        return signal, predicted_mel
+        return signal
         
     def get_singer_mixture(self, mixture_dict):
         """
