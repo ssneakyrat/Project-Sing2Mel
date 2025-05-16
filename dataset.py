@@ -588,7 +588,7 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         
         # NEW: Collect global audio statistics for normalization
         self.global_audio_stats = collect_global_audio_statistics(
-            all_tasks, self.sample_rate
+            all_tasks, self.sample_rate, max_files=10
         )
         
         # Set random seed for reproducible file selection

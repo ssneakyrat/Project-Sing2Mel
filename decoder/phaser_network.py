@@ -84,7 +84,7 @@ class PhaseAwareEnhancer(nn.Module):
         # Process magnitude with enhancement network
         mag_features = self.mag_enhance(mag)
         enhanced_mag = mag_features * mag  # Apply as multiplicative scaling
-        
+       
         # Process phase with correction network
         phase_adj = self.phase_enhance(mag)  # Use magnitude as input for phase adjustment
         enhanced_phase = phase + (phase_adj)  # Apply small adjustments to phase

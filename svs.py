@@ -10,11 +10,11 @@ from decoder.core import scale_function, frequency_filter, upsample
 from decoder.vocal_filter import vocal_frequency_filter
 from decoder.phaser_network import PhaseAwareEnhancer
 
-# Modified SVS class with MelEncoder integration
 class SVS(nn.Module):
     """
     Lightweight DDSP-based singing voice synthesis model with separated
     expressive control prediction and signal processing components.
+    Enhanced with singer and language mixture capabilities.
     """
     def __init__(self, 
                  num_phonemes, 
@@ -36,6 +36,8 @@ class SVS(nn.Module):
         self.num_harmonics = num_harmonics
         self.num_mag_harmonic = num_mag_harmonic
         self.num_mag_noise = num_mag_noise
+        self.num_singers = num_singers
+        self.num_languages = num_languages
         
         # Define embedding dimensions
         self.phoneme_embed_dim = 128
@@ -87,33 +89,99 @@ class SVS(nn.Module):
 
         self.harmonic_phaser = PhaseAwareEnhancer(hidden_dim=512)
         self.noise_phaser = PhaseAwareEnhancer(hidden_dim=256)
-
-    def forward(self, f0, phoneme_seq, singer_id, language_id, initial_phase=None):
+    
+    def get_weighted_embedding(self, weights, embedding_layer):
         """
-        Forward pass with separated expressive control and signal processing.
+        Calculate weighted embeddings from a weight vector
+        
+        Args:
+            weights: Weights for each embedding [B, num_embeddings]
+            embedding_layer: The embedding layer to use
+            
+        Returns:
+            Weighted embeddings [B, embedding_dim]
+        """
+        # Get all embeddings
+        all_embeddings = embedding_layer.weight  # [num_embeddings, embedding_dim]
+        
+        # Apply weights and sum
+        # [B, num_embeddings] @ [num_embeddings, embedding_dim] -> [B, embedding_dim]
+        return torch.matmul(weights, all_embeddings)
+        
+    def convert_to_weights(self, ids, num_classes, device):
+        """
+        Convert IDs to one-hot weight vectors
+        
+        Args:
+            ids: IDs [B]
+            num_classes: Number of possible classes
+            device: Device to place tensor on
+            
+        Returns:
+            One-hot weights [B, num_classes]
+        """
+        batch_size = ids.size(0)
+        weights = torch.zeros(batch_size, num_classes, device=device)
+        weights.scatter_(1, ids.unsqueeze(1), 1.0)
+        return weights
+
+    def forward(self, f0, phoneme_seq, singer_id=None, language_id=None, 
+                singer_weights=None, language_weights=None, initial_phase=None):
+        """
+        Forward pass with support for both single IDs and mixture weights.
         
         Args:
             f0: Fundamental frequency trajectory [B, T]
             phoneme_seq: Phoneme sequence [B, T] (indices)
-            singer_id: Singer IDs [B] (indices)
-            language_id: Language IDs [B] (indices)
-            mel: Optional mel-spectrogram [B, T, n_mels] (if None, it will be predicted)
+            singer_id: Singer IDs [B] (indices) - optional if singer_weights provided
+            language_id: Language IDs [B] (indices) - optional if language_weights provided
+            singer_weights: Weights for each singer [B, num_singers] - optional
+            language_weights: Weights for each language [B, num_languages] - optional
             initial_phase: Optional initial phase for the harmonic oscillator
             
         Returns:
             Audio signal [B, T*hop_length], expressive parameters dict
         """
         batch_size, n_frames = f0.shape[0], f0.shape[1]
+        device = f0.device
         
         # Apply embeddings
         phoneme_emb = self.phoneme_embed(phoneme_seq)  # [B, T, phoneme_dim]
-        singer_emb = self.singer_embed(singer_id)      # [B, singer_dim]
-        language_emb = self.language_embed(language_id) # [B, language_dim]
+        
+        # Handle singer embedding - either from ID or weights
+        if singer_weights is not None:
+            # Use provided weights
+            singer_emb = self.get_weighted_embedding(singer_weights, self.singer_embed)
+        elif singer_id is not None:
+            # Convert single ID to one-hot weights if mixture required
+            if hasattr(singer_id, 'shape') and len(singer_id.shape) > 1 and singer_id.shape[1] > 1:
+                # Already in weight form
+                singer_emb = self.get_weighted_embedding(singer_id, self.singer_embed)
+            else:
+                # Traditional single ID lookup
+                singer_emb = self.singer_embed(singer_id)
+        else:
+            raise ValueError("Either singer_id or singer_weights must be provided")
+        
+        # Handle language embedding - either from ID or weights
+        if language_weights is not None:
+            # Use provided weights
+            language_emb = self.get_weighted_embedding(language_weights, self.language_embed)
+        elif language_id is not None:
+            # Convert single ID to one-hot weights if mixture required
+            if hasattr(language_id, 'shape') and len(language_id.shape) > 1 and language_id.shape[1] > 1:
+                # Already in weight form
+                language_emb = self.get_weighted_embedding(language_id, self.language_embed)
+            else:
+                # Traditional single ID lookup
+                language_emb = self.language_embed(language_id)
+        else:
+            raise ValueError("Either language_id or language_weights must be provided")
 
         # Prepare f0 for mel encoder
         f0_unsqueeze = f0.unsqueeze(2)  # [B, T, 1]
         
-        # Generate mel spectrogram if not provided
+        # Generate mel spectrogram
         predicted_mel = self.encoder(f0_unsqueeze, phoneme_emb, singer_emb, language_emb)
 
         # Get control parameters from feature extractor
@@ -161,3 +229,45 @@ class SVS(nn.Module):
 
         # Return both the audio output and the expressive parameters
         return signal, predicted_mel
+        
+    def get_singer_mixture(self, mixture_dict):
+        """
+        Helper method to create singer mixture weights from a dictionary
+        
+        Args:
+            mixture_dict: Dictionary mapping singer IDs to weights
+                         (e.g., {0: 0.7, 2: 0.3})
+                         
+        Returns:
+            Tensor of normalized weights [num_singers]
+        """
+        weights = torch.zeros(self.num_singers)
+        for id, weight in mixture_dict.items():
+            weights[id] = weight
+            
+        # Normalize to sum to 1.0
+        if weights.sum() > 0:
+            weights = weights / weights.sum()
+            
+        return weights
+        
+    def get_language_mixture(self, mixture_dict):
+        """
+        Helper method to create language mixture weights from a dictionary
+        
+        Args:
+            mixture_dict: Dictionary mapping language IDs to weights
+                         (e.g., {0: 0.7, 1: 0.3})
+                         
+        Returns:
+            Tensor of normalized weights [num_languages]
+        """
+        weights = torch.zeros(self.num_languages)
+        for id, weight in mixture_dict.items():
+            weights[id] = weight
+            
+        # Normalize to sum to 1.0
+        if weights.sum() > 0:
+            weights = weights / weights.sum()
+            
+        return weights

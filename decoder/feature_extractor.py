@@ -47,9 +47,18 @@ class FeatureExtractor(nn.Module):
             nn.Dropout(0.1)
         )
         
+        # 3. Enhanced Style Information Processing
+        # Add a dedicated network to better process mixed singer/language embeddings
+        self.style_network = nn.Sequential(
+            weight_norm(nn.Linear(singer_dim + language_dim, 64)),
+            nn.LayerNorm(64),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+        
         # 3. Feature fusion
-        # Calculate fusion input dimension
-        fusion_input_dim = 128 + 32 + phoneme_dim + singer_dim + language_dim
+        # Calculate fusion input dimension (added 64 for enhanced style network)
+        fusion_input_dim = 128 + 32 + phoneme_dim + 64
         
         self.fusion_layers = nn.Sequential(
             weight_norm(nn.Linear(fusion_input_dim, 256)),
@@ -70,7 +79,7 @@ class FeatureExtractor(nn.Module):
             dropout=0.1
         )
         
-        # 5. Self-Attention mechanism - NEW
+        # 5. Self-Attention mechanism
         self.self_attn = nn.MultiheadAttention(
             embed_dim=256,
             num_heads=num_attention_heads,
@@ -78,7 +87,7 @@ class FeatureExtractor(nn.Module):
             batch_first=True  # This makes the input expected as [B, T, dim]
         )
         
-        # 6. Attention-GRU fusion layer - NEW
+        # 6. Attention-GRU fusion layer
         self.attn_gru_fusion = nn.Sequential(
             weight_norm(nn.Linear(hidden_dim * 2, hidden_dim)),
             nn.ReLU(),
@@ -98,6 +107,22 @@ class FeatureExtractor(nn.Module):
         # 8. Output projection
         self.n_out = sum([v for k, v in output_splits.items()])
         self.dense_out = weight_norm(nn.Linear(64, self.n_out))
+
+        # 9. Style-specific adaptors for harmonic and noise magnitudes
+        # These help the model learn different timbral characteristics for different singer/language mixtures
+        self.harmonic_style_adaptor = nn.Sequential(
+            weight_norm(nn.Linear(64, 32)),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            weight_norm(nn.Linear(32, output_splits.get('harmonic_magnitude', 0)))
+        )
+        
+        self.noise_style_adaptor = nn.Sequential(
+            weight_norm(nn.Linear(64, 32)),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            weight_norm(nn.Linear(32, output_splits.get('noise_magnitude', 0)))
+        )
 
     def forward(self, mel, f0, phoneme_seq, singer_id, language_id):
         '''
@@ -123,17 +148,19 @@ class FeatureExtractor(nn.Module):
         f0_features = self.f0_conv(f0_trans)  # [B, 32, T]
         f0_features = f0_features.transpose(1, 2)  # [B, T, 32]
         
-        # Expand singer and language embeddings to match sequence length
-        singer_expanded = singer_id.unsqueeze(1).expand(-1, seq_length, -1)  # [B, T, singer_dim]
-        language_expanded = language_id.unsqueeze(1).expand(-1, seq_length, -1)  # [B, T, language_dim]
+        # Process style information (singer and language)
+        style_features = torch.cat([singer_id, language_id], dim=-1)  # [B, singer_dim + language_dim]
+        style_features = self.style_network(style_features)  # [B, 64]
         
-        # Concatenate all features
+        # Expand style features to match sequence length
+        style_features = style_features.unsqueeze(1).expand(-1, seq_length, -1)  # [B, T, 64]
+        
+        # Concatenate all features (now using the processed style features)
         concat_features = torch.cat([
             mel_features,             # [B, T, 128]
             f0_features,              # [B, T, 32]
             phoneme_seq,              # [B, T, phoneme_dim]
-            singer_expanded,          # [B, T, singer_dim]
-            language_expanded         # [B, T, language_dim]
+            style_features            # [B, T, 64]
         ], dim=-1)  # [B, T, fusion_input_dim]
         
         # Apply fusion layers
@@ -157,8 +184,24 @@ class FeatureExtractor(nn.Module):
         # Apply final pre-output transformation
         x = self.pre_out_to_hidden(pre_out)  # [B, T, 64]
         
-        # Output projection
-        e = self.dense_out(x)  # [B, T, n_out]
-        controls = split_to_dict(e, self.output_splits)
+        # Get base outputs
+        base_output = self.dense_out(x)  # [B, T, n_out]
         
-        return controls
+        # Get style-specific adaptations for harmonic and noise magnitudes
+        # These will be added to the base outputs to create the final outputs
+        harmonic_style = self.harmonic_style_adaptor(x)
+        noise_style = self.noise_style_adaptor(x)
+        
+        # Split the base output into components
+        base_controls = split_to_dict(base_output, self.output_splits)
+        
+        # Apply style adaptations
+        if 'harmonic_magnitude' in self.output_splits:
+            harmonic_magnitude = base_controls['harmonic_magnitude'] + harmonic_style
+            base_controls['harmonic_magnitude'] = harmonic_magnitude
+            
+        if 'noise_magnitude' in self.output_splits:
+            noise_magnitude = base_controls['noise_magnitude'] + noise_style
+            base_controls['noise_magnitude'] = noise_magnitude
+        
+        return base_controls

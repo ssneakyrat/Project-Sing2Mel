@@ -192,6 +192,7 @@ class LatentEncoder(nn.Module):
     Encodes fundamental frequency and linguistic features into mel spectrograms.
     Uses a hybrid architecture with convolutional layers and self-attention to predict 
     mel spectrograms from f0, phoneme, singer, and language embeddings.
+    Enhanced to better handle mixed singer and language embeddings.
     """
     def __init__(self, 
                  n_mels=80, 
@@ -240,9 +241,17 @@ class LatentEncoder(nn.Module):
         for _ in range(num_encoder_layers):
             self.encoder_layers.append(EncoderLayer(hidden_dim, num_heads, hidden_dim * 4, dropout))
         
+        # Enhanced conditional output projection
+        # Add style conditioning layer to better handle mixed singer/language embeddings
+        self.style_conditioning = nn.Sequential(
+            nn.Linear(singer_embed_dim + language_embed_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU()
+        )
+        
         # Conditional output projection based on singer and language
         self.output_projection = nn.Sequential(
-            nn.Linear(hidden_dim + singer_embed_dim + language_embed_dim, hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),  # doubled hidden_dim to account for style conditioning
             nn.ReLU(),
             nn.Linear(hidden_dim, n_mels),
             nn.Sigmoid()  # Constrain values
@@ -251,6 +260,7 @@ class LatentEncoder(nn.Module):
     def forward(self, f0, phoneme_emb, singer_emb, language_emb):
         """
         Forward pass to generate mel spectrogram from linguistic features.
+        Enhanced to better handle mixed singer and language embeddings.
         
         Args:
             f0: Fundamental frequency trajectory [B, T, 1]
@@ -287,8 +297,15 @@ class LatentEncoder(nn.Module):
         for encoder_layer in self.encoder_layers:
             x = encoder_layer(x)
         
-        # Concatenate with singer and language for conditional output
-        x = torch.cat([x, singer_emb_expanded, language_emb_expanded], dim=-1)
+        # Process singer and language embeddings for style conditioning
+        style_embs = torch.cat([singer_emb, language_emb], dim=-1)  # [B, singer_embed_dim + language_embed_dim]
+        style_features = self.style_conditioning(style_embs)  # [B, hidden_dim]
+        
+        # Expand style features to match sequence length
+        style_features = style_features.unsqueeze(1).expand(-1, seq_len, -1)  # [B, T, hidden_dim]
+        
+        # Concatenate encoder output with style features
+        x = torch.cat([x, style_features], dim=-1)  # [B, T, hidden_dim*2]
         
         # Project to mel spectrogram
         mel_pred = self.output_projection(x)  # [B, T, n_mels]
