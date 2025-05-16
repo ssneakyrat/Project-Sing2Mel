@@ -15,12 +15,12 @@ model:
   num_mag_noise: 80
 
 training:
-  continue_ckpt: True
+  continue_ckpt: False
   checkpoint_path: 'best_model.pth'
   batch_size: 32
-  stage_files: 50 #per stage files
+  stage_files: 100 #per stage files
   num_epochs: 100 #per stage epoch
-  lr: 0.001
+  lr: 0.002
   save_interval: 10
 
 log:

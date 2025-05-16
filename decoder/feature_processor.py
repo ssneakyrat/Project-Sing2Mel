@@ -4,155 +4,117 @@ import math
 
 class PositionalEncoding(nn.Module):
     """
-    Positional encoding for transformer-based models.
+    Adds positional encoding to the token embeddings to introduce a notion of word order.
     """
-    def __init__(self, d_model, max_seq_len=2000):
-        super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_seq_len, d_model)
-        position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model))
+    def __init__(self, d_model, max_seq_length=5000, dropout=0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
+        # Create positional encodings
+        pe = torch.zeros(max_seq_length, d_model)
+        position = torch.arange(0, max_seq_length, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0)
         
+        # Register buffer (not a parameter but should be saved and loaded with the model)
         self.register_buffer('pe', pe)
-        self.d_model = d_model
         
     def forward(self, x):
-        """
-        Args:
-            x: Input tensor [B, T, D]
-        Returns:
-            Output tensor with positional encoding added [B, T, D]
-        """
-        return x + self.pe[:, :x.size(1), :]
+        # Add positional encoding to input
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+
+class TransformerBlock(nn.Module):
+    """
+    Transformer block with multi-head self-attention and feed-forward networks
+    """
+    def __init__(self, dim, heads=4, ff_dim=None, dropout=0.1):
+        super().__init__()
+        if ff_dim is None:
+            ff_dim = dim * 4
+            
+        # Layer normalization and multi-head attention
+        self.norm1 = nn.LayerNorm(dim)
+        self.attention = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.dropout1 = nn.Dropout(dropout)
+        
+        # Feed-forward network
+        self.norm2 = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, ff_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, dim)
+        )
+        self.dropout2 = nn.Dropout(dropout)
+        
+    def forward(self, x, mask=None):
+        # Self-attention block with residual connection
+        residual = x
+        x = self.norm1(x)
+        x_attn, _ = self.attention(x, x, x, attn_mask=mask)
+        x = residual + self.dropout1(x_attn)
+        
+        # Feed-forward block with residual connection
+        residual = x
+        x = self.norm2(x)
+        x = residual + self.dropout2(self.ff(x))
+        return x
+
 
 class FeatureProcessor(nn.Module):
     """
-    Direct linguistic feature to control parameter processor.
-    Replaces both LatentEncoder and FeatureExtractor for more efficient processing.
+    Enhanced FeatureProcessor using Transformer architecture for better 
+    sequence modeling capabilities.
     """
     def __init__(self, 
                  phoneme_embed_dim=128,
                  singer_embed_dim=16, 
                  language_embed_dim=8,
                  hidden_dim=256,
+                 num_heads=4,
+                 num_layers=2,
+                 ff_dim=None,
+                 max_seq_length=1000,
                  num_harmonics=100,
                  num_mag_harmonic=80,
                  num_mag_noise=80,
                  dropout=0.1):
         super().__init__()
         
-        # F0 processing with enhanced representation
-        self.f0_encoder = nn.Sequential(
-            nn.Linear(1, 32),
-            nn.LayerNorm(32),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, 64),
-            nn.LayerNorm(64)
-        )
+        # Calculate total input dimension
+        total_input_dim = phoneme_embed_dim + 1 + singer_embed_dim + language_embed_dim
         
-        # Style processing (singer + language)
-        self.style_processor = nn.Sequential(
-            nn.Linear(singer_embed_dim + language_embed_dim, 64),
-            nn.LayerNorm(64),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
+        # Input projection to hidden dimension
+        self.input_proj = nn.Linear(total_input_dim, hidden_dim)
         
-        # Positional encoding for sequence data
-        self.positional_encoding = PositionalEncoding(phoneme_embed_dim)
+        # Optional positional encoding
+        self.pos_encoding = PositionalEncoding(hidden_dim, max_seq_length, dropout)
         
-        # Calculate fusion input dimension
-        fusion_input_dim = phoneme_embed_dim + 64 + 64  # phoneme + f0 + style
+        # Transformer layers
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(hidden_dim, num_heads, ff_dim, dropout)
+            for _ in range(num_layers)
+        ])
         
-        # Feature fusion transformer block
-        self.fusion_transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=fusion_input_dim,
-                nhead=8,
-                dim_feedforward=hidden_dim * 2,
-                dropout=dropout,
-                batch_first=True
-            ),
-            num_layers=3
-        )
-        
-        # Feature processing network
-        self.feature_net = nn.Sequential(
-            nn.Linear(fusion_input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-        )
-        
-        # Temporal context modeling (BiGRU + attention)
-        self.temporal_gru = nn.GRU(
-            input_size=hidden_dim,
-            hidden_size=hidden_dim // 2,
-            num_layers=2,
-            batch_first=True,
-            bidirectional=True,
-            dropout=dropout
-        )
-        
-        # Multi-head self-attention for global context
-        self.self_attention = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=8,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # Context fusion
-        self.context_fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
+        # Final layer normalization
+        self.norm = nn.LayerNorm(hidden_dim)
         
         # Output projections for control parameters
-        self.harmonic_projector = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, num_mag_harmonic),
-            nn.Sigmoid()  # Scale to [0,1]
-        )
+        self.harmonic_projector = nn.Linear(hidden_dim, num_mag_harmonic)
+        self.noise_projector = nn.Linear(hidden_dim, num_mag_noise)
         
-        self.noise_projector = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, num_mag_noise),
-            nn.Sigmoid()  # Scale to [0,1]
-        )
-        
-        # Style-specific adaptors for expressive control
-        self.style_harmonic_adaptor = nn.Sequential(
-            nn.Linear(64, hidden_dim // 4),
-            nn.LayerNorm(hidden_dim // 4),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 4, num_mag_harmonic)
-        )
-        
-        self.style_noise_adaptor = nn.Sequential(
-            nn.Linear(64, hidden_dim // 4),
-            nn.LayerNorm(hidden_dim // 4),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 4, num_mag_noise)
-        )
+        # Simple sigmoid activation for scaling outputs to [0,1]
+        self.sigmoid = nn.Sigmoid()
         
     def forward(self, f0, phoneme_emb, singer_emb, language_emb):
         """
-        Direct conversion from linguistic features to control parameters
+        Process linguistic features through transformer architecture to
+        generate control parameters.
         
         Args:
             f0: Fundamental frequency trajectory [B, T, 1]
@@ -167,75 +129,39 @@ class FeatureProcessor(nn.Module):
         """
         batch_size, seq_len = f0.shape[0], f0.shape[1]
         
-        # 1. Process F0
-        f0_features = self.f0_encoder(f0)  # [B, T, 64]
-        
-        # 2. Process style information (singer and language)
-        style_features = torch.cat([singer_emb, language_emb], dim=-1)  # [B, singer_dim + language_dim]
-        style_features = self.style_processor(style_features)  # [B, 64]
-        
         # Expand style features to match sequence length
-        style_features = style_features.unsqueeze(1).expand(-1, seq_len, -1)  # [B, T, 64]
+        singer_expanded = singer_emb.unsqueeze(1).expand(-1, seq_len, -1)  # [B, T, singer_dim]
+        language_expanded = language_emb.unsqueeze(1).expand(-1, seq_len, -1)  # [B, T, language_dim]
         
-        # 3. Apply positional encoding to phoneme embeddings
-        phoneme_features = self.positional_encoding(phoneme_emb)  # [B, T, phoneme_embed_dim]
-        
-        # 4. Concatenate all features
+        # Concatenate all features
         combined_features = torch.cat([
-            phoneme_features,  # [B, T, phoneme_embed_dim]
-            f0_features,       # [B, T, 64]
-            style_features     # [B, T, 64]
-        ], dim=-1)  # [B, T, fusion_input_dim]
+            phoneme_emb,       # [B, T, phoneme_embed_dim]
+            f0,                # [B, T, 1]
+            singer_expanded,   # [B, T, singer_dim]
+            language_expanded  # [B, T, language_dim]
+        ], dim=-1)
         
-        # 5. Apply fusion transformer for integrated feature processing
-        fused_features = self.fusion_transformer(combined_features)  # [B, T, fusion_input_dim]
+        # Project to hidden dimension
+        x = self.input_proj(combined_features)
         
-        # 6. Process through feature network
-        processed_features = self.feature_net(fused_features)  # [B, T, hidden_dim]
+        # Add positional encoding
+        x = self.pos_encoding(x)
         
-        # 7. Apply temporal context modeling (parallel processing)
-        # a. GRU for sequential processing
-        gru_out, _ = self.temporal_gru(processed_features)  # [B, T, hidden_dim]
+        # Process through transformer blocks
+        for block in self.transformer_blocks:
+            x = block(x)
+            
+        # Final normalization
+        x = self.norm(x)
         
-        # b. Self-attention for global context
-        attn_out, _ = self.self_attention(
-            processed_features, 
-            processed_features, 
-            processed_features
-        )  # [B, T, hidden_dim]
+        # Generate control parameters
+        harmonic_magnitude = self.sigmoid(self.harmonic_projector(x))
+        noise_magnitude = self.sigmoid(self.noise_projector(x))
         
-        # c. Combine GRU and attention outputs
-        context_combined = torch.cat([gru_out, attn_out], dim=-1)  # [B, T, hidden_dim*2]
-        context_features = self.context_fusion(context_combined)  # [B, T, hidden_dim]
-        
-        # 8. Generate control parameters
-        harmonic_magnitude = self.harmonic_projector(context_features)  # [B, T, num_mag_harmonic]
-        noise_magnitude = self.noise_projector(context_features)  # [B, T, num_mag_noise]
-        
-        # 9. Apply style-specific adaptations
-        style_harmonic = self.style_harmonic_adaptor(style_features)  # [B, T, num_mag_harmonic]
-        style_noise = self.style_noise_adaptor(style_features)  # [B, T, num_mag_noise]
-        
-        # 10. Add style adaptations (residual connection)
-        harmonic_magnitude = harmonic_magnitude + 0.1 * style_harmonic
-        noise_magnitude = noise_magnitude + 0.1 * style_noise
-        
-        # 11. Create output dictionary
+        # Create output dictionary with the same structure as the original
         output = {
             'harmonic_magnitude': harmonic_magnitude,
             'noise_magnitude': noise_magnitude
         }
         
         return output
-
-def split_to_dict(tensor, tensor_splits):
-    """Split a tensor into a dictionary of multiple tensors."""
-    labels = []
-    sizes = []
-
-    for k, v in tensor_splits.items():
-        labels.append(k)
-        sizes.append(v)
-
-    tensors = torch.split(tensor, sizes, dim=-1)
-    return dict(zip(labels, tensors))
