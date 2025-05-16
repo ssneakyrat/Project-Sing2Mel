@@ -713,13 +713,31 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
             for task in tasks
         ]
         
-        # Use multiprocessing to process files
-        with mp.Pool(max_workers) as pool:
-            results = list(tqdm(
-                pool.imap(process_file_for_mp, mp_args),
-                total=len(tasks),
-                desc="Preprocessing files"
-            ))
+        # Try multiprocessing with explicit 'spawn' method first
+        try:
+            # Use spawn context for better Linux compatibility
+            mp_ctx = mp.get_context('spawn')
+            
+            with mp_ctx.Pool(max_workers) as pool:
+                results = list(tqdm(
+                    pool.imap(process_file_for_mp, mp_args),
+                    total=len(tasks),
+                    desc="Preprocessing files (spawn method)"
+                ))
+                
+        except Exception as e:
+            logger.warning(f"Multiprocessing with 'spawn' failed: {str(e)}")
+            logger.warning("Falling back to sequential processing")
+            
+            # Fallback to sequential processing
+            results = []
+            for args in tqdm(mp_args, desc="Sequential processing"):
+                try:
+                    result = process_file_for_mp(args)
+                    results.append(result)
+                except Exception as e:
+                    logger.error(f"Error processing file: {str(e)}")
+                    continue
         
         # Filter out None results
         valid_results = [r for r in results if r is not None]
