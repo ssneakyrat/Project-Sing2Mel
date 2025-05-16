@@ -318,7 +318,7 @@ def train_epoch(config, model, dataloader, criterion, optimizer, device, epoch, 
 
     return avg_loss, avg_stft_loss, aavg_stft_loss
 
-def evaluate(config, model, dataloader, criterion, device, epoch, mel_transform, visualize=False, use_mixtures_for_viz=False):
+def evaluate(config, model, dataloader, criterion, device, epoch, mel_transform, visualize=False):
     """
     Evaluate the model with option to use mixtures for visualization only
     """
@@ -340,14 +340,7 @@ def evaluate(config, model, dataloader, criterion, device, epoch, mel_transform,
             # Extract original audio for comparison
             target_audio = extract_audio_from_dataset(batch, device)
             
-            # Decide whether to use mixtures (only for visualization batches)
-            if visualize and batch_idx == 0 and use_mixtures_for_viz:
-                # For visualization only, create some example mixtures
-                singer_weights, language_weights = prepare_singer_language_mixtures(batch, config, device, mixture_ratio=0.7)
-                wave = model(f0, phoneme_seq, singer_weights=singer_weights, language_weights=language_weights)
-            else:
-                # Normal evaluation with original IDs
-                wave = model(f0, phoneme_seq, singer_id=singer_id, language_id=language_id)
+            wave = model(f0, phoneme_seq, singer_id=singer_id, language_id=language_id)
             
             # Compute combined loss
             loss, stft_loss, astft_loss = criterion(wave, target_audio)
@@ -366,14 +359,9 @@ def evaluate(config, model, dataloader, criterion, device, epoch, mel_transform,
             predicted_mel = torch.log(mel_transform(wave))
             # Visualize only the first batch if requested
             if visualize and batch_idx == 0:
-                if use_mixtures_for_viz:
-                    # Visualization with mixture weights
-                    visualize_outputs(config, epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
-                                    singer_weights, language_weights, save_dir='visuals')
-                else:
-                    # Normal visualization without mixture weights
-                    visualize_outputs(config, epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
-                                    save_dir='visuals')
+                # Normal visualization without mixture weights
+                visualize_outputs(config, epoch, batch_idx, mel, predicted_mel, wave, target_audio, 
+                                save_dir='visuals')
         
         avg_loss = total_loss / len(dataloader)
         avg_stft_loss = total_stft_loss / len(dataloader)
@@ -397,13 +385,10 @@ def train_stage(config, device, stage, num_epochs, train_loader, val_loader, mod
         
         # Visualize during evaluation at certain intervals
         should_visualize = (epoch % visualization_interval == 0)
-        
-        # Only use mixtures for visualization in later epochs
-        use_mixtures_for_viz = should_visualize and epoch > num_epochs * 0.5
             
         val_loss, val_mel_loss, val_stft_loss = evaluate(
             config, model, val_loader, criterion, device, epoch, mel_transform,
-            visualize=should_visualize, use_mixtures_for_viz=use_mixtures_for_viz
+            visualize=should_visualize
         )
         
         # Update learning rate based on validation loss
@@ -511,8 +496,8 @@ def main():
     
     # load checkpoint
     if config['training']['continue_ckpt'] is True:
-        checkpoint = torch.load(checkpoint_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        checkpoint = torch.load( checkpoint_path, weights_only=True)
+        model.load_state_dict(checkpoint)
         current_stage = checkpoint.get('stage', 0)
         print(f"\nLoaded checkpoint: {checkpoint_path}")
         print(f"Continuing from stage: {current_stage}")
