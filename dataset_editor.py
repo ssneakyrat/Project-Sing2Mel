@@ -900,7 +900,7 @@ class DatasetViewer(QMainWindow):
             error_message = f"Error displaying spectrogram: {str(e)}\n{traceback.format_exc()}"
             self.show_error(error_message)
     
-    def batch_normalize_dataset(self, target_db_fs=-18):
+    def batch_normalize_dataset(self, target_db_fs=-10):
         """
         Normalize all audio files in the dataset to target dB FS level
         

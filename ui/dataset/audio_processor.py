@@ -169,7 +169,7 @@ class AudioProcessor:
             logger.error(f"Error normalizing audio: {str(e)}")
             return False, {"error": str(e)}
     
-    def batch_normalize(self, file_list, target_db_fs=-18, progress_callback=None):
+    def batch_normalize(self, file_list, target_db_fs=-10, progress_callback=None):
         """
         Normalize multiple audio files to target dB FS level
         
@@ -186,7 +186,7 @@ class AudioProcessor:
             "skipped": [],
             "failed": []
         }
-        
+        target_db_fs += 10
         total_files = len(file_list)
         
         for i, file_path in enumerate(file_list):
