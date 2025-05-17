@@ -285,7 +285,8 @@ class DatasetViewer(QMainWindow):
             # Connect canvas signals
             self.spectrogram_canvas.audio_loaded.connect(self.on_audio_loaded)
             self.spectrogram_canvas.boundaries_modified.connect(self.on_boundaries_modified)
-            
+            self.spectrogram_canvas.phonemes_modified.connect(self.on_phonemes_modified)
+
             right_layout.addWidget(self.scrollable_spectrogram)
             
             # Set up media player signals
@@ -317,6 +318,13 @@ class DatasetViewer(QMainWindow):
         # Visual feedback
         self.save_boundaries_button.setStyleSheet("background-color: #f8a8a8; font-weight: bold;")  # Highlight with red
     
+    def on_phonemes_modified(self):
+        """Handle signal that phoneme labels have been modified"""
+        # Enable the save button
+        self.save_boundaries_button.setEnabled(True)
+        # Visual feedback
+        self.save_boundaries_button.setStyleSheet("background-color: #f8a8a8; font-weight: bold;")  # Highlight with red
+        
     def on_save_boundaries_clicked(self):
         """Handle save button click to update lab file"""
         # Get the current selected item
@@ -340,7 +348,7 @@ class DatasetViewer(QMainWindow):
         reply = QMessageBox.question(
             self,
             'Confirm Lab File Update',
-            f"This will overwrite the phoneme boundaries in {os.path.basename(file_task.lab_file)}. Continue?",
+            f"This will overwrite the phoneme boundaries and labels in {os.path.basename(file_task.lab_file)}. Continue?",  # Updated message
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -360,7 +368,7 @@ class DatasetViewer(QMainWindow):
             QMessageBox.information(
                 self,
                 "Save Complete",
-                f"Phoneme boundaries have been updated in {os.path.basename(file_task.lab_file)}."
+                f"Phoneme boundaries and labels have been updated in {os.path.basename(file_task.lab_file)}."  # Updated message
             )
             
             # Reload to reflect changes
