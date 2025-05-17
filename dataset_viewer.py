@@ -7,7 +7,7 @@ import logging
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QTreeWidget, QTreeWidgetItem, QLabel,
                             QSplitter, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
-                            QSlider, QGroupBox)
+                            QSlider, QGroupBox, QProgressDialog)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtGui import QIcon
@@ -565,7 +565,29 @@ class DatasetViewer(QMainWindow):
             self.time_label = QLabel("Position: 0:00 / 0:00")
             playback_layout.addWidget(self.time_label)
             
+            # Add audio processing controls
+            processing_layout = QHBoxLayout()
+            
+            # Normalize to -18 dB FS button
+            self.normalize_button = QPushButton("Normalize to -18 dB FS")
+            self.normalize_button.setEnabled(False)  # Disabled until audio is loaded
+            self.normalize_button.setToolTip("Process audio to -18 dB FS loudness standard and overwrite the file")
+            self.normalize_button.clicked.connect(self.on_normalize_clicked)
+            self.normalize_button.setStyleSheet("background-color: #a8d8a8; font-weight: bold;")  # Light green background
+            processing_layout.addWidget(self.normalize_button)
+            
+            # Batch Normalize button
+            self.batch_normalize_button = QPushButton("Batch Normalize Dataset")
+            self.batch_normalize_button.setToolTip("Normalize all audio files in the dataset to -18 dB FS")
+            self.batch_normalize_button.clicked.connect(self.on_batch_normalize_clicked)
+            self.batch_normalize_button.setStyleSheet("background-color: #a8d8c8; font-weight: bold;")  # Blue-green background
+            processing_layout.addWidget(self.batch_normalize_button)
+            
             controls_layout.addLayout(playback_layout)
+            
+            # Add the audio processing layout after playback controls
+            controls_layout.addLayout(processing_layout)
+            
             controls_group.setLayout(controls_layout)
             right_layout.addWidget(controls_group)
             
@@ -599,15 +621,6 @@ class DatasetViewer(QMainWindow):
         
         # Set main widget
         self.setCentralWidget(main_widget)
-
-    def on_db_min_slider_changed(self, value):
-        """Handle dB min slider value change"""
-        # Update label text
-        self.db_min_value_label.setText(f"{value} dB")
-        
-        # Update spectrogram canvas dB scale
-        if self.spectrogram_canvas:
-            self.spectrogram_canvas.update_db_scale(value, 0)  # Keep max at 0 dB FS
     
     def on_scale_slider_changed(self, value):
         """Handle width scale slider value change"""
@@ -618,6 +631,15 @@ class DatasetViewer(QMainWindow):
         # Update spectrogram if canvas exists
         if self.spectrogram_canvas:
             self.spectrogram_canvas.rescale_width(self.width_scale_factor)
+    
+    def on_db_min_slider_changed(self, value):
+        """Handle dB min slider value change"""
+        # Update label text
+        self.db_min_value_label.setText(f"{value} dB")
+        
+        # Update spectrogram canvas dB scale
+        if self.spectrogram_canvas:
+            self.spectrogram_canvas.update_db_scale(value, 0)  # Keep max at 0 dB FS
     
     def on_play_clicked(self):
         """Handle play button click"""
@@ -635,6 +657,37 @@ class DatasetViewer(QMainWindow):
         # Hide playback position line
         if self.spectrogram_canvas:
             self.spectrogram_canvas.hide_playback_position()
+    
+    def on_normalize_clicked(self):
+        """Handle normalize button click"""
+        # Get the current selected item
+        current_item = self.tree_widget.currentItem()
+        if current_item:
+            file_task = current_item.data(0, Qt.UserRole)
+            if file_task and file_task.wav_file:
+                # Show a confirmation dialog
+                reply = QMessageBox.question(
+                    self, 
+                    'Confirm Normalization',
+                    f"This will normalize {os.path.basename(file_task.wav_file)} to -18 dB FS and overwrite the original file. Continue?",
+                    QMessageBox.Yes | QMessageBox.No, 
+                    QMessageBox.No
+                )
+                
+                if reply == QMessageBox.Yes:
+                    # Perform normalization
+                    success = self.normalize_to_target_db(file_task.wav_file)
+                    
+                    if success:
+                        QMessageBox.information(
+                            self,
+                            "Normalization Complete",
+                            f"Audio file has been normalized to -18 dB FS."
+                        )
+    
+    def on_batch_normalize_clicked(self):
+        """Handle batch normalize button click"""
+        self.batch_normalize_dataset()
     
     def on_media_state_changed(self, state):
         """Handle media player state changes"""
@@ -687,8 +740,9 @@ class DatasetViewer(QMainWindow):
     
     def on_audio_loaded(self, duration):
         """Handle audio loaded signal from spectrogram canvas"""
-        # Enable play button
+        # Enable play and normalize buttons
         self.play_button.setEnabled(True)
+        self.normalize_button.setEnabled(True)
         
     def scan_directory(self):
         """Scan dataset directory and find WAV and LAB file pairs"""
@@ -818,6 +872,7 @@ class DatasetViewer(QMainWindow):
             self.play_button.setText("Play")
             self.play_button.setEnabled(False)
             self.stop_button.setEnabled(False)
+            self.normalize_button.setEnabled(False)  # Disable normalize button until audio is loaded
             self.time_label.setText("Position: 0:00 / 0:00")
             
             # Display file info
@@ -840,6 +895,7 @@ class DatasetViewer(QMainWindow):
             self.play_button.setText("Play")
             self.play_button.setEnabled(False)
             self.stop_button.setEnabled(False)
+            self.normalize_button.setEnabled(False)  # Disable normalize button
             self.time_label.setText("Position: 0:00 / 0:00")
             
             if self.spectrogram_canvas:
@@ -992,6 +1048,220 @@ class DatasetViewer(QMainWindow):
             width_scale_factor=self.width_scale_factor,
             audio_duration=audio_duration
         )
+    
+    def normalize_to_target_db(self, wav_file, target_db_fs=-10):
+        """
+        Normalize audio file to target dB FS level, overwrite the original file, and refresh display
+        
+        Args:
+            wav_file (str): Path to the WAV file
+            target_db_fs (float): Target dB FS level, typically -18 dB FS for EBU R128 reference
+        """
+        if not os.path.exists(wav_file):
+            self.show_error(f"WAV file not found: {wav_file}")
+            return False
+            
+        try:
+            self.media_player.stop()
+            self.media_player.setMedia(QMediaContent()) 
+
+            # Load the audio file
+            audio, sr = sf.read(wav_file, dtype='float32')
+            
+            # Convert to mono if stereo
+            if len(audio.shape) > 1 and audio.shape[1] > 1:
+                audio = audio.mean(axis=1)
+            
+            # Calculate peak amplitude
+            peak_amplitude = np.max(np.abs(audio))
+            
+            # Current level in dB FS
+            current_db_fs = 20 * np.log10(peak_amplitude) if peak_amplitude > 0 else -np.inf
+            
+            # Calculate needed gain in dB
+            gain_db = target_db_fs - current_db_fs
+            
+            # Convert dB gain to amplitude scalar
+            gain_factor = 10 ** (gain_db / 20)
+            
+            # Apply gain
+            normalized_audio = audio * gain_factor
+            
+            # Ensure we don't clip (shouldn't happen when normalizing to negative dB FS)
+            if np.max(np.abs(normalized_audio)) > 1.0:
+                normalized_audio = normalized_audio / np.max(np.abs(normalized_audio))
+                logger.warning(f"Audio was clipping after normalization. Applied additional scaling.")
+            
+            # Write back to the original file
+            sf.write(wav_file, normalized_audio, sr)
+            
+            # Log the normalization
+            logger.info(f"Normalized {os.path.basename(wav_file)} from {current_db_fs:.2f} dB FS to {target_db_fs:.2f} dB FS (gain: {gain_db:.2f} dB)")
+            
+            # Update the UI if this is the currently selected file
+            if wav_file == self.current_audio_file:
+                # Get the current lab file from the current file_task
+                current_item = self.tree_widget.currentItem()
+                if current_item:
+                    file_task = current_item.data(0, Qt.UserRole)
+                    if file_task and file_task.lab_file:
+                        # Reload the audio and regenerate the spectrogram
+                        self.display_spectrogram(wav_file, file_task.lab_file)
+                        
+                        # Update the media player
+                        self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(wav_file)))
+            
+            return True
+        except Exception as e:
+            error_message = f"Error normalizing audio: {str(e)}\n{traceback.format_exc()}"
+            self.show_error(error_message)
+            return False
+    
+    def batch_normalize_dataset(self, target_db_fs=-18):
+        """
+        Normalize all audio files in the dataset to target dB FS level
+        
+        Args:
+            target_db_fs (float): Target dB FS level, typically -18 dB FS for EBU R128 reference
+        """
+        # Scan directory to get all files
+        file_tasks = self.scan_directory()
+        
+        if not file_tasks:
+            self.show_error("No dataset files found for batch normalization")
+            return
+        
+        # Create progress dialog
+        progress_dialog = QMessageBox(self)
+        progress_dialog.setWindowTitle("Batch Normalization")
+        progress_dialog.setText(f"Preparing to normalize {len(file_tasks)} files to {target_db_fs} dB FS...")
+        progress_dialog.setStandardButtons(QMessageBox.Cancel)
+        progress_dialog.setDefaultButton(QMessageBox.Cancel)
+        
+        # Show the initial dialog to confirm
+        confirm_dialog = QMessageBox(self)
+        confirm_dialog.setWindowTitle("Confirm Batch Normalization")
+        confirm_dialog.setText(f"This will normalize all {len(file_tasks)} audio files to {target_db_fs} dB FS and overwrite the original files.\n\nDo you want to continue?")
+        confirm_dialog.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        confirm_dialog.setDefaultButton(QMessageBox.No)
+        
+        # If user confirms, proceed with batch normalization
+        if confirm_dialog.exec_() == QMessageBox.Yes:
+            # Create a new progress dialog with a QProgressBar
+            from PyQt5.QtWidgets import QProgressDialog
+            from PyQt5.QtCore import Qt
+            
+            progress = QProgressDialog("Normalizing audio files...", "Cancel", 0, len(file_tasks), self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setWindowTitle("Batch Normalization Progress")
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+            
+            # Lists to track results
+            successful_files = []
+            failed_files = []
+            skipped_files = []
+            
+            # Process each file
+            for i, file_task in enumerate(file_tasks):
+                # Update progress
+                progress.setValue(i)
+                progress.setLabelText(f"Processing: {os.path.basename(file_task.wav_file)}")
+                
+                # Process events to keep UI responsive
+                QApplication.processEvents()
+                
+                # Check if user canceled
+                if progress.wasCanceled():
+                    break
+                
+                # Check if file exists
+                if not os.path.exists(file_task.wav_file):
+                    skipped_files.append(file_task.wav_file)
+                    continue
+                
+                try:
+                    # Load the audio file
+                    audio, sr = sf.read(file_task.wav_file, dtype='float32')
+                    
+                    # Convert to mono if stereo
+                    if len(audio.shape) > 1 and audio.shape[1] > 1:
+                        audio = audio.mean(axis=1)
+                    
+                    # Calculate peak amplitude
+                    peak_amplitude = np.max(np.abs(audio))
+                    
+                    # Current level in dB FS
+                    current_db_fs = 20 * np.log10(peak_amplitude) if peak_amplitude > 0 else -np.inf
+                    
+                    # Skip if already within 0.5 dB of target (to avoid unnecessary processing)
+                    if abs(current_db_fs - target_db_fs) < 0.5:
+                        skipped_files.append(file_task.wav_file)
+                        logger.info(f"Skipped {os.path.basename(file_task.wav_file)} - already at {current_db_fs:.2f} dB FS (target: {target_db_fs:.2f} dB FS)")
+                        continue
+                    
+                    # Calculate needed gain in dB
+                    gain_db = target_db_fs - current_db_fs
+                    
+                    # Convert dB gain to amplitude scalar
+                    gain_factor = 10 ** (gain_db / 20)
+                    
+                    # Apply gain
+                    normalized_audio = audio * gain_factor
+                    
+                    # Ensure we don't clip (shouldn't happen when normalizing to negative dB FS)
+                    if np.max(np.abs(normalized_audio)) > 1.0:
+                        normalized_audio = normalized_audio / np.max(np.abs(normalized_audio))
+                        logger.warning(f"Audio was clipping after normalization. Applied additional scaling.")
+                    
+                    # Write back to the original file
+                    sf.write(file_task.wav_file, normalized_audio, sr)
+                    
+                    # Log the normalization
+                    logger.info(f"Normalized {os.path.basename(file_task.wav_file)} from {current_db_fs:.2f} dB FS to {target_db_fs:.2f} dB FS (gain: {gain_db:.2f} dB)")
+                    
+                    # Add to successful files
+                    successful_files.append(file_task.wav_file)
+                    
+                except Exception as e:
+                    # Log the error and add to failed files
+                    error_message = f"Error normalizing {os.path.basename(file_task.wav_file)}: {str(e)}"
+                    logger.error(error_message)
+                    failed_files.append((file_task.wav_file, str(e)))
+            
+            # Complete the progress
+            progress.setValue(len(file_tasks))
+            
+            # Update the UI if this is the currently selected file
+            current_item = self.tree_widget.currentItem()
+            if current_item:
+                file_task = current_item.data(0, Qt.UserRole)
+                if file_task and file_task.wav_file:
+                    # Check if the current file was processed
+                    if file_task.wav_file in successful_files:
+                        # Reload the audio and regenerate the spectrogram
+                        self.display_spectrogram(file_task.wav_file, file_task.lab_file)
+                        
+                        # Update the media player
+                        self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(file_task.wav_file)))
+            
+            # Show summary dialog
+            summary = f"Batch Normalization Summary:\n\n"
+            summary += f"Target Level: {target_db_fs} dB FS\n"
+            summary += f"Files Processed: {len(successful_files) + len(failed_files) + len(skipped_files)}\n"
+            summary += f"   - Successfully Normalized: {len(successful_files)}\n"
+            summary += f"   - Already at Target Level: {len(skipped_files)}\n"
+            summary += f"   - Failed: {len(failed_files)}\n"
+            
+            if failed_files:
+                summary += "\nFailed Files:\n"
+                for file_path, error in failed_files[:10]:  # Show first 10 failures
+                    summary += f"   - {os.path.basename(file_path)}: {error}\n"
+                
+                if len(failed_files) > 10:
+                    summary += f"   - ... and {len(failed_files) - 10} more\n"
+            
+            QMessageBox.information(self, "Batch Normalization Complete", summary)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
