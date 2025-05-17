@@ -168,7 +168,7 @@ class SpectrogramCanvas(FigureCanvas):
                 return 2595 * np.log10(1 + hz/700)
             
             # Get frequency range (same as in display_spectrogram)
-            f_min = 40  # Minimum frequency in Hz
+            f_min = 0  # Minimum frequency in Hz
             f_max = 12000  # Approximate Nyquist frequency for 24kHz
             n_mels = mel_spec.shape[0]  # Number of mel bins
             
@@ -178,7 +178,7 @@ class SpectrogramCanvas(FigureCanvas):
             
             # Convert each F0 value to the corresponding mel bin
             for i, freq in enumerate(f0):
-                if freq > 0:  # Only consider positive frequencies (voiced)
+                if freq >= f_min:  # Only consider positive frequencies (voiced)
                     # Convert frequency to mel
                     freq_mel = hz_to_mel(freq)
                     # Map to mel bin index
@@ -223,10 +223,6 @@ class SpectrogramCanvas(FigureCanvas):
                     valid_start = max(0, start)
                     valid_end = min(mel_spec.shape[1], end)
                     
-                    # Skip very short segments
-                    if valid_end - valid_start <= 1:
-                        continue
-                    
                     # Draw phoneme boundary as vertical lines
                     self.axes.axvline(x=valid_start, color='white', linestyle='-', alpha=0.7, linewidth=0.7)
                     
@@ -243,16 +239,15 @@ class SpectrogramCanvas(FigureCanvas):
                     
                     # Add phoneme label if segment is wide enough
                     segment_width = valid_end - valid_start
-                    if segment_width > 5:  # Minimum width for labels
-                        center = valid_start + segment_width/2
-                        # White text with dark edge for contrast against any background
-                        self.axes.text(
-                            center, label_y_pos, phone,
-                            ha='center', va='center',
-                            fontsize=8, color='white',
-                            fontweight='bold',
-                            bbox=dict(facecolor='black', alpha=0.5, pad=1, boxstyle='round')
-                        )
+                    center = valid_start + segment_width/2
+                    # White text with dark edge for contrast against any background
+                    self.axes.text(
+                        center, label_y_pos, phone,
+                        ha='center', va='center',
+                        fontsize=8, color='white',
+                        fontweight='bold',
+                        bbox=dict(facecolor='black', alpha=0.5, pad=1, boxstyle='round')
+                    )
                     
                     # Add phoneme boundaries in waveform plot too
                     if audio_duration and start_times and end_times:
