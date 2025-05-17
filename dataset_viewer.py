@@ -90,7 +90,7 @@ class SpectrogramCanvas(FigureCanvas):
         self.total_mel_frames = None
         
         # Default width scale factor
-        self.width_scale_factor = 1.0
+        self.width_scale_factor = 2.0
         
         # Fixed dB scale for waveform display (dB FS)
         self.db_min = -60  # Minimum dB FS value to display
@@ -481,25 +481,7 @@ class DatasetViewer(QMainWindow):
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         
-        # Add refresh button
-        refresh_button = QPushButton("Refresh Dataset")
-        refresh_button.clicked.connect(self.load_dataset)
-        left_layout.addWidget(refresh_button)
-        
-        # Dataset statistics label
-        self.stats_label = QLabel("Dataset Statistics: Loading...")
-        left_layout.addWidget(self.stats_label)
-        
-        # Add tree widget
-        self.tree_widget = QTreeWidget()
-        self.tree_widget.setHeaderLabels(['Dataset Browser'])
-        self.tree_widget.itemClicked.connect(self.on_item_clicked)
-        left_layout.addWidget(self.tree_widget)
-        
-        # Right panel: Spectrogram display and controls
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        
+        # Moved spectrogram controls to the top of the left panel
         if matplotlib_available:
             # Add spectrogram controls
             controls_group = QGroupBox("Spectrogram Controls")
@@ -510,10 +492,10 @@ class DatasetViewer(QMainWindow):
             scale_label = QLabel("Width Scale:")
             self.width_scale_slider = QSlider(Qt.Horizontal)
             self.width_scale_slider.setRange(10, 500)  # 0.1x to 5.0x
-            self.width_scale_slider.setValue(100)  # Default 1.0x
+            self.width_scale_slider.setValue(200)  # Default 2.0x
             self.width_scale_slider.setTickPosition(QSlider.TicksBelow)
             self.width_scale_slider.setTickInterval(50)
-            self.width_scale_value_label = QLabel("1.0x")
+            self.width_scale_value_label = QLabel("2.0x")
             
             # Connect slider value change signal
             self.width_scale_slider.valueChanged.connect(self.on_scale_slider_changed)
@@ -584,8 +566,28 @@ class DatasetViewer(QMainWindow):
             controls_layout.addLayout(processing_layout)
             
             controls_group.setLayout(controls_layout)
-            right_layout.addWidget(controls_group)
-            
+            left_layout.addWidget(controls_group)  # Add controls to the left panel
+        
+        # Add refresh button
+        refresh_button = QPushButton("Refresh Dataset")
+        refresh_button.clicked.connect(self.load_dataset)
+        left_layout.addWidget(refresh_button)
+        
+        # Dataset statistics label
+        self.stats_label = QLabel("Dataset Statistics: Loading...")
+        left_layout.addWidget(self.stats_label)
+        
+        # Add tree widget
+        self.tree_widget = QTreeWidget()
+        self.tree_widget.setHeaderLabels(['Dataset Browser'])
+        self.tree_widget.itemClicked.connect(self.on_item_clicked)
+        left_layout.addWidget(self.tree_widget)
+        
+        # Right panel: Spectrogram display only now
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        
+        if matplotlib_available:
             # Use the scrollable spectrogram widget instead of just the canvas
             self.scrollable_spectrogram = ScrollableSpectrogramWidget(right_panel)
             self.spectrogram_canvas = self.scrollable_spectrogram.spectrogram_canvas
