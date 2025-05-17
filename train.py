@@ -428,7 +428,6 @@ def main():
     os.makedirs('visuals', exist_ok=True)
     os.makedirs('audio_samples', exist_ok=True)
     os.makedirs('checkpoints', exist_ok=True)
-    os.makedirs('mixture_samples', exist_ok=True)  # For inference-time mixture samples
 
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
