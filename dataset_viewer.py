@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QSlider, QGroupBox, QProgressDialog)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
-from PyQt5.QtGui import QIcon
+from PyQt5.QtGui import QIcon, QCursor
 from PyQt5.QtCore import QUrl
 import glob
 from collections import namedtuple
@@ -52,9 +52,11 @@ FileMetadata = namedtuple('FileMetadata', [
 ])
 
 class SpectrogramCanvas(FigureCanvas):
-    """Canvas for displaying spectrograms using Matplotlib with fixed scale"""
+    """Canvas for displaying spectrograms using Matplotlib with fixed scale and interactive phoneme boundaries"""
     # Signal to tell parent when audio duration is available
     audio_loaded = pyqtSignal(float)
+    # Signal emitted when boundaries are modified
+    boundaries_modified = pyqtSignal()
     
     def __init__(self, parent=None, width=5, height=4, dpi=100):
         if not matplotlib_available:
@@ -100,26 +102,53 @@ class SpectrogramCanvas(FigureCanvas):
         self.playback_line = None
         self.waveform_playback_line = None
         
+        # Add phoneme boundary editing variables
+        self.dragging_boundary = None
+        self.drag_start_x = None
+        self.boundary_lines = []  # Keep track of boundary lines for interaction
+        self.boundary_rects = []  # Keep track of rectangles
+        self.boundary_waveform_lines = []  # Keep track of boundary lines in waveform
+        self.boundary_indices = []  # Which boundary index is associated with each line
+        self.boundary_times = []  # Store the actual times (in seconds)
+        self.edits_made = False  # Track if edits have been made
+        
+        # Connect to mouse events
+        self.mpl_connect('button_press_event', self.on_mouse_press)
+        self.mpl_connect('button_release_event', self.on_mouse_release)
+        self.mpl_connect('motion_notify_event', self.on_mouse_move)
+        
         self.fig.tight_layout()
         
     def plot_spectrogram(self, mel_spec, audio=None, f0=None, phones=None, start_times=None, end_times=None, 
-                         sample_rate=None, hop_length=None, width_scale_factor=1.0, audio_duration=None):
+                         sample_rate=None, hop_length=None, width_scale_factor=2.0, audio_duration=None):
         """Plot spectrogram with F0 contour overlay, phoneme boundaries, and fixed-scale waveform below"""
         self.axes.clear()
         self.waveform_axes.clear()
+        
+        # Reset boundary tracking
+        self.boundary_lines = []
+        self.boundary_rects = []
+        self.boundary_waveform_lines = []
+        self.boundary_indices = []
+        self.boundary_times = []
+        self.edits_made = False
         
         # Store current data for rescaling
         self.current_mel_spec = mel_spec
         self.current_audio = audio
         self.current_f0 = f0
         self.current_phones = phones
-        self.current_start_times = start_times
-        self.current_end_times = end_times
+        self.current_start_times = start_times.copy() if start_times else None
+        self.current_end_times = end_times.copy() if end_times else None
         self.current_sample_rate = sample_rate
         self.current_hop_length = hop_length
         self.width_scale_factor = width_scale_factor
         self.current_audio_duration = audio_duration
         self.total_mel_frames = mel_spec.shape[1]
+        
+        # Store boundary times for editing
+        if start_times:
+            self.boundary_times = start_times.copy()
         
         # Use a fixed aspect ratio instead of 'auto'
         im = self.axes.imshow(mel_spec, aspect='auto', origin='lower')
@@ -218,13 +247,19 @@ class SpectrogramCanvas(FigureCanvas):
             label_y_pos = mel_spec.shape[0] * 0.15  # 15% from the bottom
             
             # Plot vertical lines for phoneme boundaries and phoneme labels
+            self.phone_labels = []  # Store text objects for updating
+            rect_patches = []  # Store rectangle patches
+            
             for i, (phone, start, end) in enumerate(zip(phones, start_frames, end_frames)):
                 if start < mel_spec.shape[1] and end > 0:  # Check if within spectrogram bounds
                     valid_start = max(0, start)
                     valid_end = min(mel_spec.shape[1], end)
                     
-                    # Draw phoneme boundary as vertical lines
-                    self.axes.axvline(x=valid_start, color='white', linestyle='-', alpha=0.7, linewidth=0.7)
+                    # Draw phoneme boundary as vertical lines with thicker lines for draggable boundaries
+                    boundary_line = self.axes.axvline(x=valid_start, color='white', linestyle='-', 
+                                                      alpha=0.8, linewidth=1.5, picker=5)
+                    self.boundary_lines.append(boundary_line)
+                    self.boundary_indices.append(i)
                     
                     # Add colored background for phoneme segment
                     rect = Rectangle(
@@ -236,23 +271,29 @@ class SpectrogramCanvas(FigureCanvas):
                         edgecolor=None                   # no edge color
                     )
                     self.axes.add_patch(rect)
+                    self.boundary_rects.append(rect)
                     
                     # Add phoneme label if segment is wide enough
                     segment_width = valid_end - valid_start
                     center = valid_start + segment_width/2
                     # White text with dark edge for contrast against any background
-                    self.axes.text(
+                    text = self.axes.text(
                         center, label_y_pos, phone,
                         ha='center', va='center',
                         fontsize=8, color='white',
                         fontweight='bold',
                         bbox=dict(facecolor='black', alpha=0.5, pad=1, boxstyle='round')
                     )
+                    self.phone_labels.append(text)
                     
                     # Add phoneme boundaries in waveform plot too
                     if audio_duration and start_times and end_times:
                         # Directly use original time values for waveform plot
-                        self.waveform_axes.axvline(x=start_times[i], color='white', linestyle='-', alpha=0.7, linewidth=0.7)
+                        waveform_line = self.waveform_axes.axvline(
+                            x=start_times[i], color='white', linestyle='-', 
+                            alpha=0.7, linewidth=0.7
+                        )
+                        self.boundary_waveform_lines.append(waveform_line)
         
         # Use a fixed height and scale width based on time dimension and scale factor
         fixed_height = 10  # Increased to accommodate waveform
@@ -268,7 +309,7 @@ class SpectrogramCanvas(FigureCanvas):
         self.setFixedSize(int(width * dpi), int(fixed_height * dpi))
         
         # Add legend, title and labels
-        self.axes.set_title('Mel Spectrogram with F0 Contour and Phoneme Alignment')
+        self.axes.set_title('Mel Spectrogram with F0 Contour and Phoneme Alignment (Drag boundaries to adjust)')
         self.axes.set_ylabel('Mel Bins')
         self.axes.set_xlabel('Frames')
         self.waveform_axes.set_title('Audio Waveform (dB FS)')
@@ -284,6 +325,127 @@ class SpectrogramCanvas(FigureCanvas):
         # Emit signal with audio duration
         if audio_duration is not None:
             self.audio_loaded.emit(audio_duration)
+    
+    def on_mouse_press(self, event):
+        """Handle mouse press events for phoneme boundary dragging"""
+        if event.inaxes != self.axes or not self.boundary_lines:
+            return
+        
+        # Check if click is near a boundary line
+        for i, line in enumerate(self.boundary_lines):
+            line_x = line.get_xdata()[0]
+            if abs(event.xdata - line_x) < 5:  # Allow a bit of tolerance for clicking
+                self.dragging_boundary = i
+                self.drag_start_x = event.xdata
+                if i < len(self.boundary_times):
+                    self.setCursor(QCursor(Qt.SizeHorCursor))  # Change cursor to horizontal resize
+                break
+    
+    def on_mouse_release(self, event):
+        """Handle mouse release events after dragging"""
+        if self.dragging_boundary is not None:
+            self.dragging_boundary = None
+            self.setCursor(QCursor(Qt.ArrowCursor))  # Reset cursor
+            
+            # Signal that edits have been made if boundaries were changed
+            if not np.array_equal(self.boundary_times, self.current_start_times):
+                self.edits_made = True
+                self.boundaries_modified.emit()
+    
+    def on_mouse_move(self, event):
+        """Handle mouse movement for phoneme boundary dragging"""
+        if event.inaxes != self.axes:
+            return
+        
+        # Check if hovering near a boundary for cursor change
+        if self.dragging_boundary is None:
+            near_boundary = False
+            for line in self.boundary_lines:
+                if abs(event.xdata - line.get_xdata()[0]) < 5:
+                    self.setCursor(QCursor(Qt.SizeHorCursor))
+                    near_boundary = True
+                    break
+            if not near_boundary:
+                self.setCursor(QCursor(Qt.ArrowCursor))
+        
+        # Handle dragging
+        if self.dragging_boundary is not None and event.inaxes == self.axes:
+            # Get the index of the boundary being dragged
+            i = self.dragging_boundary
+            
+            # Calculate new position with constraints
+            new_frame = int(event.xdata)
+            
+            # Apply constraints - boundary must be between adjacent boundaries
+            min_frame = 0
+            if i > 0 and i-1 < len(self.boundary_lines):
+                min_frame = int(self.boundary_lines[i-1].get_xdata()[0]) + 1
+                
+            max_frame = self.total_mel_frames
+            if i < len(self.boundary_lines)-1:
+                max_frame = int(self.boundary_lines[i+1].get_xdata()[0]) - 1
+            
+            constrained_frame = max(min_frame, min(new_frame, max_frame))
+            
+            # Update the boundary line position
+            self.boundary_lines[i].set_xdata([constrained_frame, constrained_frame])
+            
+            # Update the rectangle on the left side of the dragged boundary
+            if i > 0 and i-1 < len(self.boundary_rects):
+                prev_start = int(self.boundary_lines[i-1].get_xdata()[0])
+                width = constrained_frame - prev_start
+                self.boundary_rects[i-1].set_width(width)
+                
+                # Update phoneme label position
+                if i-1 < len(self.phone_labels):
+                    center = prev_start + width/2
+                    self.phone_labels[i-1].set_position((center, self.phone_labels[i-1].get_position()[1]))
+            
+            # Update the rectangle on the right side of the dragged boundary
+            if i < len(self.boundary_rects):
+                next_end = self.total_mel_frames
+                if i+1 < len(self.boundary_lines):
+                    next_end = int(self.boundary_lines[i+1].get_xdata()[0])
+                
+                width = next_end - constrained_frame
+                self.boundary_rects[i].set_x(constrained_frame)
+                self.boundary_rects[i].set_width(width)
+                
+                # Update phoneme label position
+                if i < len(self.phone_labels):
+                    center = constrained_frame + width/2
+                    self.phone_labels[i].set_position((center, self.phone_labels[i].get_position()[1]))
+            
+            # Update boundary time based on frame position
+            if self.current_audio_duration and i < len(self.boundary_times):
+                frame_ratio = constrained_frame / self.total_mel_frames
+                new_time = frame_ratio * self.current_audio_duration
+                self.boundary_times[i] = new_time
+                
+                # Update the corresponding waveform line
+                if i < len(self.boundary_waveform_lines):
+                    self.boundary_waveform_lines[i].set_xdata([new_time, new_time])
+            
+            # Redraw
+            self.draw_idle()
+    
+    def get_modified_lab_data(self):
+        """Get the current phoneme data with modified boundaries"""
+        if not self.edits_made or not self.current_phones:
+            return None
+        
+        # For start times, use the boundary times
+        new_start_times = self.boundary_times.copy()
+        
+        # For end times, use the next start time (for all except the last phoneme)
+        new_end_times = []
+        for i in range(len(new_start_times)):
+            if i < len(new_start_times) - 1:
+                new_end_times.append(new_start_times[i+1])
+            else:
+                new_end_times.append(self.current_audio_duration)
+        
+        return self.current_phones, new_start_times, new_end_times
     
     def update_db_scale(self, db_min, db_max):
         """Update the dB scale of the waveform display"""
@@ -369,6 +531,15 @@ class SpectrogramCanvas(FigureCanvas):
         self.total_mel_frames = None
         self.playback_line = None
         self.waveform_playback_line = None
+        
+        # Clear boundary tracking variables
+        self.boundary_lines = []
+        self.boundary_rects = []
+        self.boundary_waveform_lines = []
+        self.boundary_indices = []
+        self.boundary_times = []
+        self.phone_labels = []
+        self.edits_made = False
 
 class ScrollableSpectrogramWidget(QScrollArea):
     """A scrollable container for the spectrogram canvas"""
@@ -433,7 +604,7 @@ class DatasetViewer(QMainWindow):
         self.n_mels = self.config['model']['n_mels'] if self.config else 80
         
         # Width scale factor for spectrograms
-        self.width_scale_factor = 1.0
+        self.width_scale_factor = 2.0
         
         # Audio playback
         self.media_player = QMediaPlayer()
@@ -542,6 +713,21 @@ class DatasetViewer(QMainWindow):
             self.time_label = QLabel("Position: 0:00 / 0:00")
             playback_layout.addWidget(self.time_label)
             
+            controls_layout.addLayout(playback_layout)
+            
+            # Add save phoneme boundaries button
+            phoneme_layout = QHBoxLayout()
+            
+            # Save button for phoneme boundaries
+            self.save_boundaries_button = QPushButton("Save Phoneme Boundaries")
+            self.save_boundaries_button.setEnabled(False)  # Disabled until phonemes are modified
+            self.save_boundaries_button.setToolTip("Save modified phoneme boundaries to the .lab file")
+            self.save_boundaries_button.clicked.connect(self.on_save_boundaries_clicked)
+            self.save_boundaries_button.setStyleSheet("background-color: #f8d8a8; font-weight: bold;")  # Light orange background
+            phoneme_layout.addWidget(self.save_boundaries_button)
+            
+            controls_layout.addLayout(phoneme_layout)
+            
             # Add audio processing controls
             processing_layout = QHBoxLayout()
             
@@ -560,9 +746,7 @@ class DatasetViewer(QMainWindow):
             self.batch_normalize_button.setStyleSheet("background-color: #a8d8c8; font-weight: bold;")  # Blue-green background
             processing_layout.addWidget(self.batch_normalize_button)
             
-            controls_layout.addLayout(playback_layout)
-            
-            # Add the audio processing layout after playback controls
+            # Add the audio processing layout
             controls_layout.addLayout(processing_layout)
             
             controls_group.setLayout(controls_layout)
@@ -594,6 +778,7 @@ class DatasetViewer(QMainWindow):
             
             # Connect canvas signals
             self.spectrogram_canvas.audio_loaded.connect(self.on_audio_loaded)
+            self.spectrogram_canvas.boundaries_modified.connect(self.on_boundaries_modified)
             
             right_layout.addWidget(self.scrollable_spectrogram)
             
@@ -618,6 +803,73 @@ class DatasetViewer(QMainWindow):
         
         # Set main widget
         self.setCentralWidget(main_widget)
+    
+    def on_boundaries_modified(self):
+        """Handle signal that phoneme boundaries have been modified"""
+        # Enable the save button
+        self.save_boundaries_button.setEnabled(True)
+        # Visual feedback
+        self.save_boundaries_button.setStyleSheet("background-color: #f8a8a8; font-weight: bold;")  # Highlight with red
+    
+    def on_save_boundaries_clicked(self):
+        """Handle save button click to update lab file"""
+        # Get the current selected item
+        current_item = self.tree_widget.currentItem()
+        if not current_item:
+            return
+            
+        file_task = current_item.data(0, Qt.UserRole)
+        if not file_task or not file_task.lab_file:
+            return
+        
+        # Get modified phoneme data
+        modified_data = self.spectrogram_canvas.get_modified_lab_data()
+        if not modified_data:
+            self.show_error("No changes to save")
+            return
+        
+        phones, start_times, end_times = modified_data
+        
+        # Show confirmation dialog
+        reply = QMessageBox.question(
+            self,
+            'Confirm Lab File Update',
+            f"This will overwrite the phoneme boundaries in {os.path.basename(file_task.lab_file)}. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        # Update the lab file
+        success = self.update_lab_file(file_task.lab_file, phones, start_times, end_times)
+        
+        if success:
+            # Disable save button and reset style
+            self.save_boundaries_button.setEnabled(False)
+            self.save_boundaries_button.setStyleSheet("background-color: #f8d8a8; font-weight: bold;")
+            
+            # Show success message
+            QMessageBox.information(
+                self,
+                "Save Complete",
+                f"Phoneme boundaries have been updated in {os.path.basename(file_task.lab_file)}."
+            )
+            
+            # Reload to reflect changes
+            self.display_spectrogram(file_task.wav_file, file_task.lab_file)
+    
+    def update_lab_file(self, lab_file, phones, start_times, end_times):
+        """Update a lab file with new phoneme boundaries"""
+        try:
+            with open(lab_file, 'w') as f:
+                for phone, start, end in zip(phones, start_times, end_times):
+                    f.write(f"{start:.6f} {end:.6f} {phone}\n")
+            return True
+        except Exception as e:
+            self.show_error(f"Error updating lab file: {str(e)}")
+            return False
     
     def on_scale_slider_changed(self, value):
         """Handle width scale slider value change"""
@@ -870,6 +1122,7 @@ class DatasetViewer(QMainWindow):
             self.play_button.setEnabled(False)
             self.stop_button.setEnabled(False)
             self.normalize_button.setEnabled(False)  # Disable normalize button until audio is loaded
+            self.save_boundaries_button.setEnabled(False)  # Disable save button until edits are made
             self.time_label.setText("Position: 0:00 / 0:00")
             
             # Display file info
@@ -893,6 +1146,7 @@ class DatasetViewer(QMainWindow):
             self.play_button.setEnabled(False)
             self.stop_button.setEnabled(False)
             self.normalize_button.setEnabled(False)  # Disable normalize button
+            self.save_boundaries_button.setEnabled(False)  # Disable save button
             self.time_label.setText("Position: 0:00 / 0:00")
             
             if self.spectrogram_canvas:
@@ -1046,7 +1300,7 @@ class DatasetViewer(QMainWindow):
             audio_duration=audio_duration
         )
     
-    def normalize_to_target_db(self, wav_file, target_db_fs=-10):
+    def normalize_to_target_db(self, wav_file, target_db_fs=-18):
         """
         Normalize audio file to target dB FS level, overwrite the original file, and refresh display
         
