@@ -197,6 +197,27 @@ class DatasetViewer(QMainWindow):
         # Add the audio processing layout
         controls_layout.addLayout(processing_layout)
         
+        # Add Sanitize Segmentation buttons
+        sanitize_layout = QHBoxLayout()
+        
+        # Sanitize current file button
+        self.sanitize_button = QPushButton("Sanitize Segmentation")
+        self.sanitize_button.setEnabled(False)  # Disabled until a file is loaded
+        self.sanitize_button.setToolTip("Add 'pau' at start/end of phoneme sequence and fix timing")
+        self.sanitize_button.clicked.connect(self.on_sanitize_clicked)
+        self.sanitize_button.setStyleSheet("background-color: #d8a8d8; font-weight: bold;")  # Light purple background
+        sanitize_layout.addWidget(self.sanitize_button)
+        
+        # Batch Sanitize button
+        self.batch_sanitize_button = QPushButton("Batch Sanitize Dataset")
+        self.batch_sanitize_button.setToolTip("Sanitize all lab files in the dataset")
+        self.batch_sanitize_button.clicked.connect(self.on_batch_sanitize_clicked)
+        self.batch_sanitize_button.setStyleSheet("background-color: #c8a8d8; font-weight: bold;")  # Purple-blue background
+        sanitize_layout.addWidget(self.batch_sanitize_button)
+        
+        # Add the sanitize layout
+        controls_layout.addLayout(sanitize_layout)
+        
         controls_group.setLayout(controls_layout)
         left_layout.addWidget(controls_group)  # Add controls to the left panel
         
@@ -310,6 +331,251 @@ class DatasetViewer(QMainWindow):
             
             # Reload to reflect changes
             self.display_spectrogram(file_task.wav_file, file_task.lab_file)
+
+    def on_sanitize_clicked(self):
+        """Handle sanitize segmentation button click for current file"""
+        # Get the current selected item
+        current_item = self.tree_widget.currentItem()
+        if not current_item:
+            return
+            
+        file_task = current_item.data(0, Qt.UserRole)
+        if not file_task or not file_task.lab_file or not file_task.wav_file:
+            return
+        
+        # Show confirmation dialog
+        reply = QMessageBox.question(
+            self,
+            'Confirm Sanitize Segmentation',
+            f"This will modify the phoneme boundaries in {os.path.basename(file_task.lab_file)} "
+            f"to ensure 'pau' phonemes at start and end. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        # Get audio duration
+        try:
+            audio, sr = self.audio_processor.load_audio(file_task.wav_file)
+            audio_duration = len(audio) / sr
+        except Exception as e:
+            self.show_error(f"Error loading audio file: {str(e)}")
+            return
+        
+        # Read lab file
+        phones, start_times, end_times = self.lab_file_handler.read_lab_file(file_task.lab_file)
+        
+        if not phones or len(phones) == 0:
+            self.show_error("No phoneme data found in lab file")
+            return
+        
+        # Sanitize the segmentation
+        phones, start_times, end_times = self.sanitize_segmentation(
+            phones, start_times, end_times, audio_duration
+        )
+        
+        # Write back to lab file
+        success = self.lab_file_handler.write_lab_file(file_task.lab_file, phones, start_times, end_times)
+        
+        if success:
+            # Show success message
+            QMessageBox.information(
+                self,
+                "Sanitize Complete",
+                f"Phoneme boundaries have been sanitized in {os.path.basename(file_task.lab_file)}."
+            )
+            
+            # Reload to reflect changes
+            self.display_spectrogram(file_task.wav_file, file_task.lab_file)
+    
+    def on_batch_sanitize_clicked(self):
+        """Handle batch sanitize segmentation button click"""
+        self.batch_sanitize_dataset()
+    
+    def sanitize_segmentation(self, phones, start_times, end_times, audio_duration):
+        """
+        Sanitize phoneme segmentation to ensure 'pau' at start and end
+        
+        Args:
+            phones (list): List of phoneme labels
+            start_times (list): List of start times
+            end_times (list): List of end times
+            audio_duration (float): Duration of the audio file in seconds
+            
+        Returns:
+            tuple: (phones, start_times, end_times)
+        """
+        if not phones or len(phones) == 0:
+            return phones, start_times, end_times
+            
+        # Make a copy of the lists to avoid modifying the originals
+        phones = phones.copy()
+        start_times = start_times.copy()
+        end_times = end_times.copy()
+        
+        modified = False
+        
+        # Check if first phone is 'pau'
+        if phones[0] != 'pau':
+            # Split the first phone to make room for 'pau'
+            original_start = start_times[0]
+            split_point = min(0.1, (end_times[0] - start_times[0]) / 3)  # Use 1/3 of duration or 100ms
+            
+            # Insert 'pau' at the beginning
+            phones.insert(0, 'pau')
+            start_times.insert(0, 0.0)  # Start at 0
+            end_times.insert(0, original_start + split_point)
+            
+            # Adjust the start time of the original first phone
+            start_times[1] = original_start + split_point
+            
+            modified = True
+        
+        start_times[0] = 0.0
+        
+        # Check if last phone is 'pau'
+        if phones[-1] != 'pau':
+            # Split the last phone to make room for 'pau'
+            original_end = end_times[-1]
+            split_point = max(0.1, (end_times[-1] - start_times[-1]) / 3)  # Use 1/3 of duration or 100ms
+            
+            # Adjust the end time of the original last phone
+            end_times[-1] = original_end - split_point
+            
+            # Add 'pau' at the end
+            phones.append('pau')
+            start_times.append(original_end - split_point)
+            end_times.append(audio_duration)
+            
+            modified = True
+
+        end_times[-1] = round(audio_duration * 10000000)
+        
+        return phones, start_times, end_times
+    
+    def batch_sanitize_dataset(self):
+        """
+        Sanitize all lab files in the dataset
+        """
+        # Get all files from dataset manager
+        file_tasks = self.dataset_manager.get_file_tasks()
+        
+        if not file_tasks:
+            self.show_error("No dataset files found for batch sanitization")
+            return
+        
+        # Create a list of lab files with corresponding wav files
+        processing_tasks = []
+        for task in file_tasks:
+            if os.path.exists(task.lab_file) and os.path.exists(task.wav_file):
+                processing_tasks.append(task)
+        
+        # Show the initial dialog to confirm
+        confirm_dialog = QMessageBox(self)
+        confirm_dialog.setWindowTitle("Confirm Batch Sanitization")
+        confirm_dialog.setText(
+            f"This will sanitize all {len(processing_tasks)} lab files to ensure 'pau' "
+            f"phonemes at the start and end, and proper timing alignment with audio.\n\n"
+            f"Do you want to continue?"
+        )
+        confirm_dialog.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        confirm_dialog.setDefaultButton(QMessageBox.No)
+        
+        # If user confirms, proceed with batch sanitization
+        if confirm_dialog.exec_() == QMessageBox.Yes:
+            # Create a progress dialog
+            progress = QProgressDialog("Sanitizing lab files...", "Cancel", 0, len(processing_tasks), self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setWindowTitle("Batch Sanitization Progress")
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+            
+            successful = []
+            skipped = []
+            failed = []
+            
+            # Process each file
+            for i, task in enumerate(processing_tasks):
+                # Update progress
+                progress.setValue(i)
+                progress.setLabelText(f"Processing: {os.path.basename(task.lab_file)}")
+                QApplication.processEvents()
+                
+                # Check for cancel
+                if progress.wasCanceled():
+                    break
+                
+                try:
+                    # Get audio duration
+                    audio, sr = self.audio_processor.load_audio(task.wav_file)
+                    audio_duration = len(audio) / sr
+                    
+                    # Read lab file
+                    phones, start_times, end_times = self.lab_file_handler.read_lab_file(task.lab_file)
+                    
+                    if not phones or len(phones) == 0:
+                        skipped.append((task.lab_file, "No phoneme data found"))
+                        continue
+                    
+                    # Make a copy of original data to check if modified
+                    original_phones = phones.copy()
+                    original_starts = start_times.copy()
+                    original_ends = end_times.copy()
+                    
+                    # Sanitize the segmentation
+                    phones, start_times, end_times = self.sanitize_segmentation(
+                        phones, start_times, end_times, audio_duration
+                    )
+                    
+                    # Check if anything changed
+                    if (phones == original_phones and 
+                        start_times == original_starts and 
+                        end_times == original_ends):
+                        skipped.append((task.lab_file, "No changes needed"))
+                        continue
+                    
+                    # Write back to lab file
+                    success = self.lab_file_handler.write_lab_file(task.lab_file, phones, start_times, end_times)
+                    
+                    if success:
+                        successful.append(task.lab_file)
+                    else:
+                        failed.append((task.lab_file, "Failed to write lab file"))
+                        
+                except Exception as e:
+                    failed.append((task.lab_file, str(e)))
+            
+            # Complete the progress
+            progress.setValue(len(processing_tasks))
+            
+            # Update the UI if this is the currently selected file
+            current_item = self.tree_widget.currentItem()
+            if current_item:
+                file_task = current_item.data(0, Qt.UserRole)
+                if file_task and file_task.lab_file:
+                    # Check if the current file was processed
+                    if file_task.lab_file in successful:
+                        # Reload the display
+                        self.display_spectrogram(file_task.wav_file, file_task.lab_file)
+            
+            # Show summary dialog
+            summary = f"Batch Sanitization Summary:\n\n"
+            summary += f"Files Processed: {len(processing_tasks)}\n"
+            summary += f"   - Successfully Sanitized: {len(successful)}\n"
+            summary += f"   - Already Valid: {len(skipped)}\n"
+            summary += f"   - Failed: {len(failed)}\n"
+            
+            if failed:
+                summary += "\nFailed Files:\n"
+                for file_path, error in failed[:10]:  # Show first 10 failures
+                    summary += f"   - {os.path.basename(file_path)}: {error}\n"
+                
+                if len(failed) > 10:
+                    summary += f"   - ... and {len(failed) - 10} more\n"
+            
+            QMessageBox.information(self, "Batch Sanitization Complete", summary)
     
     def on_scale_slider_changed(self, value):
         """Handle width scale slider value change"""
@@ -435,6 +701,7 @@ class DatasetViewer(QMainWindow):
         # Enable play and normalize buttons
         self.play_button.setEnabled(True)
         self.normalize_button.setEnabled(True)
+        self.sanitize_button.setEnabled(True)  # Enable sanitize button when audio is loaded
     
     def load_dataset(self):
         """Load and display the dataset structure"""
@@ -493,6 +760,7 @@ class DatasetViewer(QMainWindow):
             self.play_button.setEnabled(False)
             self.stop_button.setEnabled(False)
             self.normalize_button.setEnabled(False)
+            self.sanitize_button.setEnabled(False)  # Disable sanitize button
             self.save_boundaries_button.setEnabled(False)
             self.time_label.setText("Position: 0:00 / 0:00")
             
@@ -511,6 +779,7 @@ class DatasetViewer(QMainWindow):
             self.play_button.setEnabled(False)
             self.stop_button.setEnabled(False)
             self.normalize_button.setEnabled(False)
+            self.sanitize_button.setEnabled(False)  # Disable sanitize button
             self.save_boundaries_button.setEnabled(False)
             self.time_label.setText("Position: 0:00 / 0:00")
             
