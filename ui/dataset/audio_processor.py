@@ -111,16 +111,15 @@ class AudioProcessor:
             # This is just a placeholder and won't give accurate F0
             return np.zeros(len(audio) // hop_length + 1)
     
-    def normalize_audio(self, file_path, target_db_fs=-18, suppress_outliers=True, outlier_percentile=80, outlier_threshold=3.0):
+    def normalize_audio(self, file_path, target_db_fs=-18, detect_end_spikes=True, outlier_percentile=99.5):
         """
         Normalize audio file to target dB FS level with protection against ice pick amplitudes
         
         Args:
             file_path (str): Path to the audio file
             target_db_fs (float): Target dB FS level, typically -18 dB FS for EBU R128 reference
-            suppress_outliers (bool): Whether to detect and suppress outlier peaks
+            detect_end_spikes (bool): Whether to detect and trim ice pick artifacts at the end
             outlier_percentile (float): Percentile to use for outlier detection (99-99.9 recommended)
-            outlier_threshold (float): How many times above the percentile peak to consider as an outlier
                 
         Returns:
             bool: Success status
@@ -137,50 +136,67 @@ class AudioProcessor:
             if len(audio.shape) > 1 and audio.shape[1] > 1:
                 audio = audio.mean(axis=1)
             
-            # Create a working copy of the audio
-            processed_audio = np.copy(audio)
+            original_length = len(audio)
+            trimmed_samples = 0
+            
+            # Detect and trim ice pick at the end if requested
+            if detect_end_spikes and len(audio) > sr * 0.1:  # At least 100ms of audio
+                # Define analysis windows
+                end_window_ms = 50  # Analyze last 50ms for potential ice picks
+                end_window_samples = int((end_window_ms / 1000) * sr)
+                
+                # Get the main body of the audio (everything except the very end)
+                main_body = audio[:-end_window_samples] if end_window_samples < len(audio) else audio
+                
+                # Get the end section 
+                end_section = audio[-end_window_samples:] if end_window_samples < len(audio) else np.array([])
+                
+                if len(end_section) > 0:
+                    # Calculate statistics for both sections
+                    main_body_percentile = np.percentile(np.abs(main_body), outlier_percentile)
+                    end_section_max = np.max(np.abs(end_section))
+                    
+                    # Define what qualifies as an ice pick (end max significantly higher than main body)
+                    # 5.0 is a threshold meaning "5 times louder" - can be adjusted based on your specific audio
+                    ice_pick_ratio_threshold = 5.0
+                    
+                    if end_section_max > main_body_percentile * ice_pick_ratio_threshold:
+                        # Ice pick detected! Find where it starts
+                        end_array = np.abs(end_section)
+                        spike_threshold = main_body_percentile * 3.0  # Less strict for finding start point
+                        
+                        # Find where the spike begins by going backwards from the end
+                        spike_start_idx = 0
+                        for i in range(len(end_array)-1, 0, -1):
+                            if end_array[i] > spike_threshold and end_array[i-1] < spike_threshold:
+                                spike_start_idx = i
+                                break
+                        
+                        # Calculate how many samples to trim
+                        trimmed_samples = end_window_samples - spike_start_idx
+                        if trimmed_samples > 0:
+                            audio = audio[:-trimmed_samples]
+                            logger.warning(f"Ice pick detected at end of audio: {trimmed_samples} samples ({trimmed_samples/sr*1000:.1f}ms) trimmed")
             
             # Calculate absolute amplitude values
             abs_audio = np.abs(audio)
             
-            # Original peak before any processing
-            original_peak = np.max(abs_audio)
-            original_db_fs = 20 * np.log10(original_peak) if original_peak > 0 else -np.inf
+            # Get max peak
+            raw_peak_amplitude = np.max(abs_audio)
             
-            # Suppression stats
-            suppression_applied = False
-            num_samples_suppressed = 0
+            # Get percentile-based peak (to handle any remaining outliers)
+            percentile_peak = np.percentile(abs_audio, outlier_percentile)
             
-            # Check for and suppress outliers if requested
-            if suppress_outliers:
-                # Calculate percentile-based peak
-                percentile_peak = np.percentile(abs_audio, outlier_percentile)
-                
-                # Set threshold for outlier detection
-                outlier_threshold_value = percentile_peak * outlier_threshold
-                
-                # Find outlier samples
-                outlier_mask = abs_audio > outlier_threshold_value
-                num_outliers = np.sum(outlier_mask)
-                
-                if num_outliers > 0:
-                    # Calculate suppression factor to bring outliers down to the percentile peak level
-                    # Use original sign but scale magnitude
-                    suppression_factors = np.ones_like(processed_audio)
-                    suppression_factors[outlier_mask] = (outlier_threshold_value / abs_audio[outlier_mask])
-                    
-                    # Apply suppression only to outlier samples
-                    processed_audio = processed_audio * suppression_factors
-                    
-                    # Update stats
-                    suppression_applied = True
-                    num_samples_suppressed = num_outliers
-                    
-                    logger.info(f"Suppressed {num_outliers} outlier samples ({num_outliers/len(audio)*100:.4f}% of audio)")
-                    logger.info(f"Outlier threshold: {outlier_threshold_value:.6f} ({outlier_threshold}x the {outlier_percentile}th percentile)")
+            # Determine if outliers exist throughout the audio
+            peak_ratio = raw_peak_amplitude / percentile_peak if percentile_peak > 0 else 1.0
+            has_outliers = peak_ratio > 2.0
             
-            # Recalculate peak amplitude after possible suppression
-            peak_amplitude = np.max(np.abs(processed_audio))
+            # Choose peak amplitude for normalization
+            if has_outliers:
+                logger.warning(f"Detected outlier peaks in audio: max={raw_peak_amplitude:.4f}, {outlier_percentile}th percentile={percentile_peak:.4f}, ratio={peak_ratio:.2f}")
+                peak_amplitude = percentile_peak
+            else:
+                peak_amplitude = raw_peak_amplitude
             
             # Current level in dB FS
             current_db_fs = 20 * np.log10(peak_amplitude) if peak_amplitude > 0 else -np.inf
@@ -192,7 +208,7 @@ class AudioProcessor:
             gain_factor = 10 ** (gain_db / 20)
             
             # Apply gain
-            normalized_audio = processed_audio * gain_factor
+            normalized_audio = audio * gain_factor
             
             # Final check to prevent clipping
             max_amplitude = np.max(np.abs(normalized_audio))
@@ -205,13 +221,14 @@ class AudioProcessor:
             
             # Return success and details
             return True, {
-                "original_db_fs": original_db_fs,
-                "processed_db_fs": current_db_fs,
+                "original_db_fs": current_db_fs,
                 "target_db_fs": target_db_fs,
                 "gain_db": gain_db,
-                "outliers_suppressed": suppression_applied,
-                "num_samples_suppressed": num_samples_suppressed,
-                "suppression_percentage": (num_samples_suppressed/len(audio)*100) if num_samples_suppressed > 0 else 0
+                "has_outliers": has_outliers,
+                "trimmed_samples": trimmed_samples,
+                "trimmed_ms": (trimmed_samples / sr * 1000) if trimmed_samples > 0 else 0,
+                "original_duration_sec": original_length / sr,
+                "new_duration_sec": len(normalized_audio) / sr
             }
             
         except Exception as e:
