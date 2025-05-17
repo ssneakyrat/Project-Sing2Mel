@@ -3,18 +3,32 @@ import os
 import yaml
 import numpy as np
 import traceback
+import logging
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QTreeWidget, QTreeWidgetItem, QLabel,
-                            QSplitter, QMessageBox, QPushButton, QScrollArea, QSizePolicy)
+                            QSplitter, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
+                            QSlider, QGroupBox)
 from PyQt5.QtCore import Qt
 import glob
 from collections import namedtuple
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("DatasetViewer")
 
 # Try to import matplotlib for spectrogram display
 try:
     import matplotlib.pyplot as plt
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.patches import Rectangle
+    import matplotlib.cm as cm
     matplotlib_available = True
 except ImportError:
     matplotlib_available = False
@@ -53,31 +67,53 @@ class SpectrogramCanvas(FigureCanvas):
         self.setMinimumWidth(400)
         self.setMinimumHeight(300)
         
+        # Store the current mel spectrogram and related data for rescaling
+        self.current_mel_spec = None
+        self.current_f0 = None
+        self.current_phones = None
+        self.current_start_times = None
+        self.current_end_times = None
+        self.current_sample_rate = None
+        self.current_hop_length = None
+        
+        # Default width scale factor
+        self.width_scale_factor = 1.0
+        
         self.fig.tight_layout()
         
-    def plot_spectrogram(self, mel_spec, f0=None):
-        """Plot spectrogram with optional F0 contour overlay using fixed scale"""
+    def plot_spectrogram(self, mel_spec, f0=None, phones=None, start_times=None, end_times=None, 
+                         sample_rate=None, hop_length=None, width_scale_factor=1.0):
+        """Plot spectrogram with F0 contour overlay and phoneme boundaries using adjustable scale"""
         self.axes.clear()
         
+        # Store current data for rescaling
+        self.current_mel_spec = mel_spec
+        self.current_f0 = f0
+        self.current_phones = phones
+        self.current_start_times = start_times
+        self.current_end_times = end_times
+        self.current_sample_rate = sample_rate
+        self.current_hop_length = hop_length
+        self.width_scale_factor = width_scale_factor
+        
         # Use a fixed aspect ratio instead of 'auto'
-        self.axes.imshow(mel_spec, aspect='auto', origin='lower')
+        im = self.axes.imshow(mel_spec, aspect='auto', origin='lower')
         self.axes.set_ylim(0, mel_spec.shape[0]-1)  # From 0 to the number of mel bins
 
-        # Use a fixed height and only adjust width based on time dimension
+        # Use a fixed height and scale width based on time dimension and scale factor
         fixed_height = 8  # Set a consistent height
-        width = max(10, mel_spec.shape[1]/50)  # Only time dimension affects width
+        base_width = max(10, mel_spec.shape[1]/50)  # Base width calculation
+        width = base_width * self.width_scale_factor  # Apply scale factor
         
         # Disable automatic adjustments
         self.fig.set_size_inches(width, fixed_height, forward=True)
         self.fig.subplots_adjust(left=0.1, right=0.95, top=0.9, bottom=0.1)
         
-        # Disable tight_layout which can override our settings
-        # self.fig.tight_layout()  # Comment this out
-
         # Force fixed pixel size
         dpi = self.fig.get_dpi()
         self.setFixedSize(int(width * dpi), int(fixed_height * dpi))
         
+        # Plot F0 contour if provided
         if f0 is not None and len(f0) > 0:
             # Filter out zeros and negative values (unvoiced regions)
             x_indices = []
@@ -108,13 +144,95 @@ class SpectrogramCanvas(FigureCanvas):
             
             # Plot only the valid points
             if x_indices:
-                self.axes.plot(x_indices, y_indices, 'r-', linewidth=1)
+                self.axes.plot(x_indices, y_indices, 'r-', linewidth=1.5, label='F0 Contour')
+        
+        # Plot phoneme boundaries and labels if provided
+        if phones and start_times and end_times and sample_rate and hop_length:
+            # Scale phoneme timings to match the mel spectrogram frames
+            total_mel_frames = mel_spec.shape[1]
+            
+            if len(end_times) > 0:
+                # Get the maximum time from the lab file
+                max_time = max(end_times)
                 
-        self.axes.set_title('Mel Spectrogram with F0 Contour')
+                # Scale factor to convert time to mel frames
+                scale_factor = total_mel_frames / max_time
+                
+                # Convert time to frames using the scale factor
+                start_frames = [int(t * scale_factor) for t in start_times]
+                end_frames = [int(t * scale_factor) for t in end_times]
+            
+            # Create unique color for each phoneme
+            unique_phones = list(set(phones))
+            phone_colors = {}
+            cmap = cm.get_cmap('tab20', max(20, len(unique_phones)))
+            
+            for i, phone in enumerate(unique_phones):
+                phone_colors[phone] = cmap(i % 20)  # Use modulo to handle more than 20 phonemes
+            
+            # Set y-position for phoneme labels (near the bottom of the spectrogram)
+            label_y_pos = mel_spec.shape[0] * 0.15  # 15% from the bottom
+            
+            # Plot vertical lines for phoneme boundaries and phoneme labels
+            for i, (phone, start, end) in enumerate(zip(phones, start_frames, end_frames)):
+                if start < mel_spec.shape[1] and end > 0:  # Check if within spectrogram bounds
+                    valid_start = max(0, start)
+                    valid_end = min(mel_spec.shape[1], end)
+                    
+                    # Skip very short segments
+                    #if valid_end - valid_start <= 1:
+                    #    continue
+                    
+                    # Draw phoneme boundary as vertical lines
+                    self.axes.axvline(x=valid_start, color='white', linestyle='-', alpha=0.7, linewidth=0.7)
+                    
+                    # Add colored background for phoneme segment
+                    rect = Rectangle(
+                        (valid_start, 0),                # (x, y) bottom left corner
+                        valid_end - valid_start,         # width
+                        label_y_pos * 1.5,               # height (just above label position)
+                        alpha=0.3,                       # transparency
+                        facecolor=phone_colors[phone],   # phoneme color
+                        edgecolor=None                   # no edge color
+                    )
+                    self.axes.add_patch(rect)
+                    
+                    # Add phoneme label if segment is wide enough
+                    segment_width = valid_end - valid_start
+                    center = valid_start + segment_width/2
+                    # White text with dark edge for contrast against any background
+                    self.axes.text(
+                        center, label_y_pos, phone,
+                        ha='center', va='center',
+                        fontsize=8, color='white',
+                        fontweight='bold',
+                        bbox=dict(facecolor='black', alpha=0.5, pad=1, boxstyle='round')
+                    )
+        
+        # Add legend, title and labels
+        self.axes.set_title('Mel Spectrogram with F0 Contour and Phoneme Alignment')
         self.axes.set_ylabel('Mel Bins')
         self.axes.set_xlabel('Frames')
+        
+        # Add a colorbar for the spectrogram
+        #self.fig.colorbar(im, ax=self.axes, orientation='vertical', pad=0.01, fraction=0.05)
+        
         self.fig.tight_layout()
         self.draw()
+    
+    def rescale_width(self, scale_factor):
+        """Rescale the spectrogram width with the given scale factor"""
+        if self.current_mel_spec is not None:
+            self.plot_spectrogram(
+                self.current_mel_spec, 
+                f0=self.current_f0, 
+                phones=self.current_phones, 
+                start_times=self.current_start_times, 
+                end_times=self.current_end_times,
+                sample_rate=self.current_sample_rate,
+                hop_length=self.current_hop_length,
+                width_scale_factor=scale_factor
+            )
         
     def clear(self):
         """Clear the spectrogram display"""
@@ -122,6 +240,15 @@ class SpectrogramCanvas(FigureCanvas):
         self.axes.set_title('No spectrogram loaded')
         self.fig.tight_layout()
         self.draw()
+        
+        # Clear stored data
+        self.current_mel_spec = None
+        self.current_f0 = None
+        self.current_phones = None
+        self.current_start_times = None
+        self.current_end_times = None
+        self.current_sample_rate = None
+        self.current_hop_length = None
 
 class ScrollableSpectrogramWidget(QScrollArea):
     """A scrollable container for the spectrogram canvas"""
@@ -172,16 +299,21 @@ class DatasetViewer(QMainWindow):
                 self.mappings = yaml.safe_load(f)
             self.singer_map = self.mappings.get('singer_map', {})
             self.language_map = self.mappings.get('lang_map', {})
+            self.phone_map = self.mappings.get('phone_map', {})  # Load phone map for reference
         except Exception as e:
             self.show_error(f"Error loading mappings: {str(e)}")
             self.singer_map = {}
             self.language_map = {}
+            self.phone_map = {}
             
         # Initialize audio processing params from config
         self.sr = self.config['model']['sample_rate'] if self.config else 24000
         self.hop_length = self.config['model']['hop_length'] if self.config else 240
         self.win_length = self.config['model']['win_length'] if self.config else 1024
         self.n_mels = self.config['model']['n_mels'] if self.config else 80
+        
+        # Width scale factor for spectrograms
+        self.width_scale_factor = 1.0
         
         # Set up the UI
         self.init_ui()
@@ -237,11 +369,36 @@ class DatasetViewer(QMainWindow):
         self.tree_widget.itemClicked.connect(self.on_item_clicked)
         left_layout.addWidget(self.tree_widget)
         
-        # Right panel: Spectrogram display
+        # Right panel: Spectrogram display and controls
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         
         if matplotlib_available:
+            # Add spectrogram controls
+            controls_group = QGroupBox("Spectrogram Controls")
+            controls_layout = QVBoxLayout()
+            
+            # Add width scale slider with label
+            scale_layout = QHBoxLayout()
+            scale_label = QLabel("Width Scale:")
+            self.width_scale_slider = QSlider(Qt.Horizontal)
+            self.width_scale_slider.setRange(10, 500)  # 0.1x to 5.0x
+            self.width_scale_slider.setValue(100)  # Default 1.0x
+            self.width_scale_slider.setTickPosition(QSlider.TicksBelow)
+            self.width_scale_slider.setTickInterval(50)
+            self.width_scale_value_label = QLabel("1.0x")
+            
+            # Connect slider value change signal
+            self.width_scale_slider.valueChanged.connect(self.on_scale_slider_changed)
+            
+            scale_layout.addWidget(scale_label)
+            scale_layout.addWidget(self.width_scale_slider)
+            scale_layout.addWidget(self.width_scale_value_label)
+            
+            controls_layout.addLayout(scale_layout)
+            controls_group.setLayout(controls_layout)
+            right_layout.addWidget(controls_group)
+            
             # Use the scrollable spectrogram widget instead of just the canvas
             self.scrollable_spectrogram = ScrollableSpectrogramWidget(right_panel)
             self.spectrogram_canvas = self.scrollable_spectrogram.spectrogram_canvas
@@ -263,6 +420,16 @@ class DatasetViewer(QMainWindow):
         
         # Set main widget
         self.setCentralWidget(main_widget)
+    
+    def on_scale_slider_changed(self, value):
+        """Handle width scale slider value change"""
+        # Calculate scale factor (range 0.1x to 5.0x)
+        self.width_scale_factor = value / 100.0
+        self.width_scale_value_label.setText(f"{self.width_scale_factor:.1f}x")
+        
+        # Update spectrogram if canvas exists
+        if self.spectrogram_canvas:
+            self.spectrogram_canvas.rescale_width(self.width_scale_factor)
         
     def scan_directory(self):
         """Scan dataset directory and find WAV and LAB file pairs"""
@@ -465,7 +632,7 @@ class DatasetViewer(QMainWindow):
             return [], [], []
     
     def display_spectrogram(self, wav_file, lab_file):
-        """Load audio file and display its spectrogram"""
+        """Load audio file and display its spectrogram with phoneme alignment"""
         if not os.path.exists(wav_file):
             raise FileNotFoundError(f"WAV file not found: {wav_file}")
             
@@ -485,6 +652,13 @@ class DatasetViewer(QMainWindow):
             audio_tensor = resampler(audio_tensor)
             audio = audio_tensor.squeeze(0).numpy()
             sr = self.sr
+        
+        # Read phoneme information
+        phones, start_times, end_times = self.read_lab_file(lab_file)
+        
+        # Check for empty phoneme data
+        if not phones or not start_times or not end_times:
+            logger.warning(f"No phoneme data found in {lab_file}")
         
         # Extract F0
         f0 = self.extract_f0(audio, sr, self.hop_length)
@@ -511,8 +685,27 @@ class DatasetViewer(QMainWindow):
         # Convert to numpy for plotting
         mel_np = mel_norm.squeeze(0).cpu().numpy()
         
-        # Display spectrogram
-        self.spectrogram_canvas.plot_spectrogram(mel_np, f0)
+        # Calculate audio duration and expected mel frames
+        audio_duration = len(audio) / sr
+        expected_mel_frames = mel_np.shape[1]
+        
+        # Validation of lab file timing
+        if phones and len(phones) > 0:
+            lab_max_time = max(end_times)
+            if abs(lab_max_time - audio_duration) > 0.5:  # More than 0.5 seconds difference
+                logger.warning(f"Lab file timing mismatch: lab_max_time={lab_max_time:.2f}s, audio_duration={audio_duration:.2f}s")
+        
+        # Display spectrogram with phoneme alignment using current width scale factor
+        self.spectrogram_canvas.plot_spectrogram(
+            mel_np, 
+            f0=f0, 
+            phones=phones, 
+            start_times=start_times, 
+            end_times=end_times,
+            sample_rate=sr,
+            hop_length=self.hop_length,
+            width_scale_factor=self.width_scale_factor
+        )
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
