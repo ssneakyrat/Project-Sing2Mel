@@ -1,6 +1,6 @@
 import numpy as np
 
-from PyQt5.QtWidgets import ( QSizePolicy )
+from PyQt5.QtWidgets import (QSizePolicy, QInputDialog, QLineEdit)
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QCursor
 
@@ -15,6 +15,8 @@ class SpectrogramCanvas(FigureCanvas):
     audio_loaded = pyqtSignal(float)
     # Signal emitted when boundaries are modified
     boundaries_modified = pyqtSignal()
+    # Signal emitted when phoneme labels are modified
+    phonemes_modified = pyqtSignal()
     
     def __init__(self, parent=None, width=5, height=4, dpi=100):
         
@@ -68,10 +70,16 @@ class SpectrogramCanvas(FigureCanvas):
         self.boundary_times = []  # Store the actual times (in seconds)
         self.edits_made = False  # Track if edits have been made
         
+        # Phone label editing variables
+        self.phone_labels = []  # Store text objects for updating
+        self.phone_label_indices = []  # Store the index of each phone label
+        self.phone_labels_edits_made = False  # Track if phoneme label edits have been made
+        
         # Connect to mouse events
         self.mpl_connect('button_press_event', self.on_mouse_press)
         self.mpl_connect('button_release_event', self.on_mouse_release)
         self.mpl_connect('motion_notify_event', self.on_mouse_move)
+        self.mpl_connect('pick_event', self.on_pick_event)  # For clicking on text
         
         self.fig.tight_layout()
         
@@ -89,11 +97,16 @@ class SpectrogramCanvas(FigureCanvas):
         self.boundary_times = []
         self.edits_made = False
         
+        # Reset phone label tracking
+        self.phone_labels = []
+        self.phone_label_indices = []
+        self.phone_labels_edits_made = False
+        
         # Store current data for rescaling
         self.current_mel_spec = mel_spec
         self.current_audio = audio
         self.current_f0 = f0
-        self.current_phones = phones
+        self.current_phones = phones.copy() if phones else None  # Make a copy to avoid modifying the original
         self.current_start_times = start_times.copy() if start_times else None
         self.current_end_times = end_times.copy() if end_times else None
         self.current_sample_rate = sample_rate
@@ -204,6 +217,7 @@ class SpectrogramCanvas(FigureCanvas):
             
             # Plot vertical lines for phoneme boundaries and phoneme labels
             self.phone_labels = []  # Store text objects for updating
+            self.phone_label_indices = []  # Store the index of each phone label
             rect_patches = []  # Store rectangle patches
             
             for i, (phone, start, end) in enumerate(zip(phones, start_frames, end_frames)):
@@ -238,9 +252,11 @@ class SpectrogramCanvas(FigureCanvas):
                         ha='center', va='center',
                         fontsize=8, color='white',
                         fontweight='bold',
-                        bbox=dict(facecolor='black', alpha=0.5, pad=1, boxstyle='round')
+                        bbox=dict(facecolor='black', alpha=0.5, pad=1, boxstyle='round'),
+                        picker=True  # Make text pickable for editing
                     )
                     self.phone_labels.append(text)
+                    self.phone_label_indices.append(i)  # Store the index for reference
                     
                     # Add phoneme boundaries in waveform plot too
                     if audio_duration and start_times and end_times:
@@ -265,7 +281,7 @@ class SpectrogramCanvas(FigureCanvas):
         self.setFixedSize(int(width * dpi), int(fixed_height * dpi))
         
         # Add legend, title and labels
-        self.axes.set_title('Mel Spectrogram with F0 Contour and Phoneme Alignment (Drag boundaries to adjust)')
+        self.axes.set_title('Mel Spectrogram with F0 Contour and Phoneme Alignment (Drag boundaries to adjust, Click labels to edit)')
         self.axes.set_ylabel('Mel Bins')
         self.axes.set_xlabel('Frames')
         self.waveform_axes.set_title('Audio Waveform (dB FS)')
@@ -281,6 +297,43 @@ class SpectrogramCanvas(FigureCanvas):
         # Emit signal with audio duration
         if audio_duration is not None:
             self.audio_loaded.emit(audio_duration)
+    
+    def on_pick_event(self, event):
+        """Handle pick events for phoneme label editing"""
+        # Check if it's a text object (phone label)
+        if hasattr(event, 'artist') and event.artist in self.phone_labels:
+            # Get the index of the picked phone label
+            label_idx = self.phone_labels.index(event.artist)
+            phone_idx = self.phone_label_indices[label_idx]
+            
+            # Get the current phoneme text
+            current_phone = self.current_phones[phone_idx]
+            
+            # Show dialog to edit the phoneme label
+            new_phone, ok = QInputDialog.getText(
+                self, 
+                'Edit Phoneme Label', 
+                'Enter new phoneme label:',
+                QLineEdit.Normal,
+                current_phone
+            )
+            
+            # If user clicked OK and provided a new label
+            if ok and new_phone and new_phone != current_phone:
+                # Update the phoneme label text
+                self.phone_labels[label_idx].set_text(new_phone)
+                
+                # Update the internal phoneme data
+                self.current_phones[phone_idx] = new_phone
+                
+                # Mark that edits have been made
+                self.phone_labels_edits_made = True
+                
+                # Redraw the canvas
+                self.draw_idle()
+                
+                # Emit signal that phoneme labels have been modified
+                self.phonemes_modified.emit()
     
     def on_mouse_press(self, event):
         """Handle mouse press events for phoneme boundary dragging"""
@@ -386,8 +439,8 @@ class SpectrogramCanvas(FigureCanvas):
             self.draw_idle()
     
     def get_modified_lab_data(self):
-        """Get the current phoneme data with modified boundaries"""
-        if not self.edits_made or not self.current_phones:
+        """Get the current phoneme data with modified boundaries and/or labels"""
+        if not (self.edits_made or self.phone_labels_edits_made) or not self.current_phones:
             return None
         
         # For start times, use the boundary times
@@ -401,6 +454,7 @@ class SpectrogramCanvas(FigureCanvas):
             else:
                 new_end_times.append(self.current_audio_duration)
         
+        # Return modified phoneme data, including any edited phoneme labels
         return self.current_phones, new_start_times, new_end_times
     
     def update_db_scale(self, db_min, db_max):
@@ -495,4 +549,6 @@ class SpectrogramCanvas(FigureCanvas):
         self.boundary_indices = []
         self.boundary_times = []
         self.phone_labels = []
+        self.phone_label_indices = []
         self.edits_made = False
+        self.phone_labels_edits_made = False
