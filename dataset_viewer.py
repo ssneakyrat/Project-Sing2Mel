@@ -92,6 +92,10 @@ class SpectrogramCanvas(FigureCanvas):
         # Default width scale factor
         self.width_scale_factor = 1.0
         
+        # Fixed dB scale for waveform display (dB FS)
+        self.db_min = -60  # Minimum dB FS value to display
+        self.db_max = 0    # Maximum dB FS value (0 = full scale)
+        
         # Playback position indicators
         self.playback_line = None
         self.waveform_playback_line = None
@@ -100,7 +104,7 @@ class SpectrogramCanvas(FigureCanvas):
         
     def plot_spectrogram(self, mel_spec, audio=None, f0=None, phones=None, start_times=None, end_times=None, 
                          sample_rate=None, hop_length=None, width_scale_factor=1.0, audio_duration=None):
-        """Plot spectrogram with F0 contour overlay and phoneme boundaries, and add waveform display below"""
+        """Plot spectrogram with F0 contour overlay, phoneme boundaries, and fixed-scale waveform below"""
         self.axes.clear()
         self.waveform_axes.clear()
         
@@ -123,37 +127,35 @@ class SpectrogramCanvas(FigureCanvas):
 
         # Plot waveform if audio data is provided
         if audio is not None and sample_rate is not None:
-            # Convert audio to dB scale
-            if np.max(np.abs(audio)) > 0:
-                # Normalize audio
-                audio_norm = audio / np.max(np.abs(audio))
-                # Convert to dB (20*log10 for amplitude)
-                eps = 1e-10  # Small epsilon to avoid log(0)
-                audio_db = 20 * np.log10(np.abs(audio_norm) + eps)
+            # Convert to dB FS (Decibels relative to Full Scale)
+            # Digital audio typically has a max value of 1.0 or -1.0
+            # dB FS = 20 * log10(|amplitude| / 1.0)
+            eps = 1e-10  # Small epsilon to avoid log(0)
+            audio_db_fs = 20 * np.log10(np.abs(audio) + eps)
+            
+            # Create the time axis for the waveform
+            time_axis = np.linspace(0, audio_duration, len(audio_db_fs)) if audio_duration else np.arange(len(audio_db_fs)) / sample_rate
+            
+            # Plot waveform with fixed dB FS scale
+            self.waveform_axes.plot(time_axis, audio_db_fs, color='blue', linewidth=0.5)
+            self.waveform_axes.set_ylim(self.db_min, self.db_max)  # Fixed scale for comparison
+            self.waveform_axes.set_ylabel('Amplitude (dB FS)')
+            self.waveform_axes.set_xlabel('Time (s)')
+            
+            # Add grid and set fixed y-ticks for better readability
+            self.waveform_axes.grid(True, alpha=0.3)
+            
+            # Set y-ticks at reasonable intervals (-60, -50, -40, -30, -20, -10, 0)
+            self.waveform_axes.set_yticks([self.db_min + i*10 for i in range((self.db_max - self.db_min)//10 + 1)])
+            
+            # Set x limits to match the audio duration
+            if audio_duration:
+                self.waveform_axes.set_xlim(0, audio_duration)
                 
-                # Set fixed 10 dB y-scale for waveform
-                ymin = -30  # dB relative to max
-                ymax = 0    # dB relative to max
-                
-                # Create the time axis for the waveform
-                time_axis = np.linspace(0, audio_duration, len(audio_db)) if audio_duration else np.arange(len(audio_db)) / sample_rate
-                
-                # Calculate spectrogram time axis for alignment
-                spec_time_axis = np.linspace(0, audio_duration, self.total_mel_frames) if audio_duration else np.arange(self.total_mel_frames) * hop_length / sample_rate
-                
-                # Plot waveform
-                self.waveform_axes.plot(time_axis, audio_db, color='blue', linewidth=0.5)
-                self.waveform_axes.set_ylim(ymin, ymax)
-                self.waveform_axes.set_ylabel('Amplitude (dB)')
-                self.waveform_axes.set_xlabel('Time (s)')
-                
-                # Add grid and set fixed y-ticks for the 10dB scale
-                self.waveform_axes.grid(True, alpha=0.3)
-                self.waveform_axes.set_yticks([-10, -8, -6, -4, -2, 0])
-                
-                # Set x limits to match the audio duration
-                if audio_duration:
-                    self.waveform_axes.set_xlim(0, audio_duration)
+            # Add reference lines at common thresholds
+            self.waveform_axes.axhline(y=-18, color='green', linestyle='--', alpha=0.7, linewidth=0.8)  # EBU R128 target level
+            self.waveform_axes.axhline(y=-3, color='orange', linestyle='--', alpha=0.7, linewidth=0.8)  # Warning level
+            self.waveform_axes.axhline(y=-0.5, color='red', linestyle='--', alpha=0.7, linewidth=0.8)  # Clipping danger
 
         # Plot F0 contour if provided
         if f0 is not None and len(f0) > 0:
@@ -274,7 +276,7 @@ class SpectrogramCanvas(FigureCanvas):
         self.axes.set_title('Mel Spectrogram with F0 Contour and Phoneme Alignment')
         self.axes.set_ylabel('Mel Bins')
         self.axes.set_xlabel('Frames')
-        self.waveform_axes.set_title('Audio Waveform (10 dB scale)')
+        self.waveform_axes.set_title('Audio Waveform (dB FS)')
         
         # Initialize playback position lines (hidden initially)
         self.playback_line = self.axes.axvline(x=0, color='g', linestyle='-', linewidth=2, alpha=0.7, visible=False)
@@ -287,6 +289,25 @@ class SpectrogramCanvas(FigureCanvas):
         # Emit signal with audio duration
         if audio_duration is not None:
             self.audio_loaded.emit(audio_duration)
+    
+    def update_db_scale(self, db_min, db_max):
+        """Update the dB scale of the waveform display"""
+        self.db_min = db_min
+        self.db_max = db_max
+        # Redraw with the new scale if we have data
+        if self.current_mel_spec is not None:
+            self.plot_spectrogram(
+                self.current_mel_spec, 
+                audio=self.current_audio,
+                f0=self.current_f0, 
+                phones=self.current_phones, 
+                start_times=self.current_start_times, 
+                end_times=self.current_end_times,
+                sample_rate=self.current_sample_rate,
+                hop_length=self.current_hop_length,
+                width_scale_factor=self.width_scale_factor,
+                audio_duration=self.current_audio_duration
+            )
     
     def rescale_width(self, scale_factor):
         """Rescale the spectrogram width with the given scale factor"""
@@ -450,7 +471,7 @@ class DatasetViewer(QMainWindow):
         QMessageBox.critical(self, "Error", message)
         
     def init_ui(self):
-        """Initialize the user interface with scrollable spectrogram"""
+        """Initialize the user interface with scrollable spectrogram and waveform display"""
         self.setWindowTitle('Singing Voice Dataset Viewer')
         self.setGeometry(100, 100, 1200, 800)
         
@@ -507,6 +528,24 @@ class DatasetViewer(QMainWindow):
             scale_layout.addWidget(self.width_scale_value_label)
             controls_layout.addLayout(scale_layout)
             
+            # Add dB FS scale controls
+            db_scale_layout = QHBoxLayout()
+            db_min_label = QLabel("Min dB FS:")
+            self.db_min_slider = QSlider(Qt.Horizontal)
+            self.db_min_slider.setRange(-100, -10)  # -100 dB to -10 dB
+            self.db_min_slider.setValue(-60)  # Default -60 dB
+            self.db_min_slider.setTickPosition(QSlider.TicksBelow)
+            self.db_min_slider.setTickInterval(10)
+            self.db_min_value_label = QLabel("-60 dB")
+            
+            # Connect db min slider value change signal
+            self.db_min_slider.valueChanged.connect(self.on_db_min_slider_changed)
+            
+            db_scale_layout.addWidget(db_min_label)
+            db_scale_layout.addWidget(self.db_min_slider)
+            db_scale_layout.addWidget(self.db_min_value_label)
+            controls_layout.addLayout(db_scale_layout)
+            
             # Add playback controls
             playback_layout = QHBoxLayout()
             
@@ -560,6 +599,15 @@ class DatasetViewer(QMainWindow):
         
         # Set main widget
         self.setCentralWidget(main_widget)
+
+    def on_db_min_slider_changed(self, value):
+        """Handle dB min slider value change"""
+        # Update label text
+        self.db_min_value_label.setText(f"{value} dB")
+        
+        # Update spectrogram canvas dB scale
+        if self.spectrogram_canvas:
+            self.spectrogram_canvas.update_db_scale(value, 0)  # Keep max at 0 dB FS
     
     def on_scale_slider_changed(self, value):
         """Handle width scale slider value change"""
