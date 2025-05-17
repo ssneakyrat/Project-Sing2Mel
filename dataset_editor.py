@@ -87,7 +87,7 @@ class DatasetViewer(QMainWindow):
         
     def init_ui(self):
         """Initialize the user interface with scrollable spectrogram and waveform display"""
-        self.setWindowTitle('Singing Voice Dataset Viewer')
+        self.setWindowTitle('Dataset Editor')
         self.setGeometry(100, 100, 1200, 800)
         
         # Create main widget and layout
@@ -157,6 +157,18 @@ class DatasetViewer(QMainWindow):
         self.stop_button.clicked.connect(self.on_stop_clicked)
         playback_layout.addWidget(self.stop_button)
         
+        # Play Marker button
+        self.play_marker_button = QPushButton("Play Markers")
+        self.play_marker_button.setEnabled(False)  # Disabled until audio is loaded
+        self.play_marker_button.setToolTip("Play audio between start and end markers")
+        self.play_marker_button.clicked.connect(self.on_play_marker_clicked)
+        self.play_marker_button.setStyleSheet("background-color: #a8f8a8;")  # Light green background
+        playback_layout.addWidget(self.play_marker_button)
+
+        # Current position and duration label
+        self.time_label = QLabel("Position: 0:00 / 0:00")
+        playback_layout.addWidget(self.time_label)
+
         # Current position and duration label
         self.time_label = QLabel("Position: 0:00 / 0:00")
         playback_layout.addWidget(self.time_label)
@@ -613,6 +625,38 @@ class DatasetViewer(QMainWindow):
         if self.spectrogram_canvas:
             self.spectrogram_canvas.hide_playback_position()
     
+    def on_play_marker_clicked(self):
+        """Handle play marker button click to play audio between markers"""
+        if not self.current_audio_file:
+            return
+            
+        # Get marker positions from canvas
+        start_position, end_position = self.spectrogram_canvas.get_marker_positions()
+        
+        # Convert to milliseconds for media player
+        start_ms = int(start_position * 1000)
+        end_ms = int(end_position * 1000)
+        
+        # Check if the positions are valid
+        if start_ms >= end_ms:
+            QMessageBox.warning(self, "Invalid Marker Positions", 
+                            "The start marker must be before the end marker.")
+            return
+            
+        # Set position to start marker
+        self.media_player.setPosition(start_ms)
+        
+        # Store end position to stop playback when reached
+        self.playback_end_position = end_ms
+        
+        # Start playback
+        self.media_player.play()
+        self.update_timer.start()
+        
+        # Update button states
+        self.play_button.setText("Pause")
+        self.stop_button.setEnabled(True)
+        
     def on_normalize_clicked(self):
         """Handle normalize button click"""
         # Get the current selected item
@@ -691,17 +735,24 @@ class DatasetViewer(QMainWindow):
         return f"{minutes}:{seconds:02d}"
     
     def update_playback_position(self):
-        """Update the playback position line on the spectrogram"""
+        """Update the playback position line on the spectrogram and check markers"""
         if self.spectrogram_canvas and self.media_player.state() == QMediaPlayer.PlayingState:
             position_seconds = self.media_player.position() / 1000.0
             self.spectrogram_canvas.update_playback_position(position_seconds)
+            
+            # Check if playback has reached the end marker
+            if hasattr(self, 'playback_end_position') and self.media_player.position() >= self.playback_end_position:
+                self.media_player.pause()
+                self.update_timer.stop()
+                self.play_button.setText("Play")
     
     def on_audio_loaded(self, duration):
         """Handle audio loaded signal from spectrogram canvas"""
-        # Enable play and normalize buttons
+        # Enable play, normalize, and play marker buttons
         self.play_button.setEnabled(True)
         self.normalize_button.setEnabled(True)
-        self.sanitize_button.setEnabled(True)  # Enable sanitize button when audio is loaded
+        self.sanitize_button.setEnabled(True)
+        self.play_marker_button.setEnabled(True)  # Enable play marker button
     
     def load_dataset(self):
         """Load and display the dataset structure"""
