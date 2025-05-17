@@ -689,7 +689,7 @@ class DatasetViewer(QMainWindow):
                 if reply == QMessageBox.Yes:
                     self.media_player.setMedia(QMediaContent())
                     # Perform normalization using audio processor
-                    success, details = self.audio_processor.normalize_audio(file_task.wav_file, target_db_fs=-10)
+                    success, details = self.audio_processor.normalize_audio(file_task.wav_file)
                     
                     if success:
                         QMessageBox.information(

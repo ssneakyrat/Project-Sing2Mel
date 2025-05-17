@@ -111,14 +111,17 @@ class AudioProcessor:
             # This is just a placeholder and won't give accurate F0
             return np.zeros(len(audio) // hop_length + 1)
     
-    def normalize_audio(self, file_path, target_db_fs=-10):
+    def normalize_audio(self, file_path, target_db_fs=-18, suppress_outliers=True, outlier_percentile=80, outlier_threshold=3.0):
         """
-        Normalize audio file to target dB FS level and overwrite the original file
+        Normalize audio file to target dB FS level with protection against ice pick amplitudes
         
         Args:
             file_path (str): Path to the audio file
             target_db_fs (float): Target dB FS level, typically -18 dB FS for EBU R128 reference
-            
+            suppress_outliers (bool): Whether to detect and suppress outlier peaks
+            outlier_percentile (float): Percentile to use for outlier detection (99-99.9 recommended)
+            outlier_threshold (float): How many times above the percentile peak to consider as an outlier
+                
         Returns:
             bool: Success status
             dict: Normalization details
@@ -127,7 +130,6 @@ class AudioProcessor:
             return False, {"error": f"File not found: {file_path}"}
             
         try:
-            target_db_fs += 10
             # Load the audio file
             audio, sr = sf.read(file_path, dtype='float32')
             
@@ -135,8 +137,50 @@ class AudioProcessor:
             if len(audio.shape) > 1 and audio.shape[1] > 1:
                 audio = audio.mean(axis=1)
             
-            # Calculate peak amplitude
-            peak_amplitude = np.max(np.abs(audio))
+            # Create a working copy of the audio
+            processed_audio = np.copy(audio)
+            
+            # Calculate absolute amplitude values
+            abs_audio = np.abs(audio)
+            
+            # Original peak before any processing
+            original_peak = np.max(abs_audio)
+            original_db_fs = 20 * np.log10(original_peak) if original_peak > 0 else -np.inf
+            
+            # Suppression stats
+            suppression_applied = False
+            num_samples_suppressed = 0
+            
+            # Check for and suppress outliers if requested
+            if suppress_outliers:
+                # Calculate percentile-based peak
+                percentile_peak = np.percentile(abs_audio, outlier_percentile)
+                
+                # Set threshold for outlier detection
+                outlier_threshold_value = percentile_peak * outlier_threshold
+                
+                # Find outlier samples
+                outlier_mask = abs_audio > outlier_threshold_value
+                num_outliers = np.sum(outlier_mask)
+                
+                if num_outliers > 0:
+                    # Calculate suppression factor to bring outliers down to the percentile peak level
+                    # Use original sign but scale magnitude
+                    suppression_factors = np.ones_like(processed_audio)
+                    suppression_factors[outlier_mask] = (outlier_threshold_value / abs_audio[outlier_mask])
+                    
+                    # Apply suppression only to outlier samples
+                    processed_audio = processed_audio * suppression_factors
+                    
+                    # Update stats
+                    suppression_applied = True
+                    num_samples_suppressed = num_outliers
+                    
+                    logger.info(f"Suppressed {num_outliers} outlier samples ({num_outliers/len(audio)*100:.4f}% of audio)")
+                    logger.info(f"Outlier threshold: {outlier_threshold_value:.6f} ({outlier_threshold}x the {outlier_percentile}th percentile)")
+            
+            # Recalculate peak amplitude after possible suppression
+            peak_amplitude = np.max(np.abs(processed_audio))
             
             # Current level in dB FS
             current_db_fs = 20 * np.log10(peak_amplitude) if peak_amplitude > 0 else -np.inf
@@ -148,11 +192,12 @@ class AudioProcessor:
             gain_factor = 10 ** (gain_db / 20)
             
             # Apply gain
-            normalized_audio = audio * gain_factor
+            normalized_audio = processed_audio * gain_factor
             
-            # Ensure we don't clip (shouldn't happen when normalizing to negative dB FS)
-            if np.max(np.abs(normalized_audio)) > 1.0:
-                normalized_audio = normalized_audio / np.max(np.abs(normalized_audio))
+            # Final check to prevent clipping
+            max_amplitude = np.max(np.abs(normalized_audio))
+            if max_amplitude > 1.0:
+                normalized_audio = normalized_audio / max_amplitude
                 logger.warning(f"Audio was clipping after normalization. Applied additional scaling.")
             
             # Write back to the original file
@@ -160,16 +205,20 @@ class AudioProcessor:
             
             # Return success and details
             return True, {
-                "original_db_fs": current_db_fs,
+                "original_db_fs": original_db_fs,
+                "processed_db_fs": current_db_fs,
                 "target_db_fs": target_db_fs,
-                "gain_db": gain_db
+                "gain_db": gain_db,
+                "outliers_suppressed": suppression_applied,
+                "num_samples_suppressed": num_samples_suppressed,
+                "suppression_percentage": (num_samples_suppressed/len(audio)*100) if num_samples_suppressed > 0 else 0
             }
             
         except Exception as e:
             logger.error(f"Error normalizing audio: {str(e)}")
             return False, {"error": str(e)}
     
-    def batch_normalize(self, file_list, target_db_fs=-10, progress_callback=None):
+    def batch_normalize(self, file_list, target_db_fs=-18, progress_callback=None):
         """
         Normalize multiple audio files to target dB FS level
         
@@ -186,7 +235,7 @@ class AudioProcessor:
             "skipped": [],
             "failed": []
         }
-        target_db_fs += 10
+        
         total_files = len(file_list)
         
         for i, file_path in enumerate(file_list):
