@@ -20,6 +20,7 @@ class SpectrogramCanvas(FigureCanvas):
     
     def __init__(self, parent=None, width=5, height=4, dpi=100):
         
+        self.phone_boundary_click = 2
         self.fig = Figure(figsize=(width, height), dpi=dpi)
         # Create two subplots with specific height ratios (80% spectrogram, 20% waveform)
         self.gs = self.fig.add_gridspec(2, 1, height_ratios=[4, 1])  # 4:1 ratio
@@ -259,13 +260,14 @@ class SpectrogramCanvas(FigureCanvas):
                     self.phone_label_indices.append(i)  # Store the index for reference
                     
                     # Add phoneme boundaries in waveform plot too
-                    if audio_duration and start_times and end_times:
-                        # Directly use original time values for waveform plot
-                        waveform_line = self.waveform_axes.axvline(
-                            x=start_times[i], color='red', linestyle='-', 
-                            alpha=0.7, linewidth=0.7
-                        )
-                        self.boundary_waveform_lines.append(waveform_line)
+                    # Directly use original time values for waveform plot
+                    waveform_line = self.waveform_axes.axvline(
+                        x=start_times[i], color='red', linestyle='-', 
+                        alpha=0.7, linewidth=0.7
+                    )
+                    self.boundary_waveform_lines.append(waveform_line)
+
+                self.draw_idle()
         
         # Use a fixed height and scale width based on time dimension and scale factor
         fixed_height = 10  # Increased to accommodate waveform
@@ -477,7 +479,7 @@ class SpectrogramCanvas(FigureCanvas):
         # Check if click is near a boundary line
         for i, line in enumerate(self.boundary_lines):
             line_x = line.get_xdata()[0]
-            if abs(event.xdata - line_x) < 5:  # Allow a bit of tolerance for clicking
+            if abs(event.xdata - line_x) < self.phone_boundary_click:  # Allow a bit of tolerance for clicking
                 self.dragging_boundary = i
                 self.drag_start_x = event.xdata
                 if i < len(self.boundary_times):
