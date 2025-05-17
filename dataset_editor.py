@@ -306,6 +306,14 @@ class DatasetViewer(QMainWindow):
         if not file_task or not file_task.lab_file:
             return
         
+        # Get audio duration
+        try:
+            audio, sr = self.audio_processor.load_audio(file_task.wav_file)
+            audio_duration = len(audio) / sr
+        except Exception as e:
+            self.show_error(f"Error loading audio file: {str(e)}")
+            return
+        
         # Get modified phoneme data
         modified_data = self.spectrogram_canvas.get_modified_lab_data()
         if not modified_data:
@@ -314,6 +322,11 @@ class DatasetViewer(QMainWindow):
         
         phones, start_times, end_times = modified_data
         
+        # Sanitize the segmentation
+        phones, start_times, end_times = self.sanitize_segmentation(
+            phones, start_times, end_times, audio_duration
+        )
+
         # Show confirmation dialog
         reply = QMessageBox.question(
             self,
@@ -674,8 +687,9 @@ class DatasetViewer(QMainWindow):
                 )
                 
                 if reply == QMessageBox.Yes:
+                    self.media_player.setMedia(QMediaContent())
                     # Perform normalization using audio processor
-                    success, details = self.audio_processor.normalize_audio(file_task.wav_file)
+                    success, details = self.audio_processor.normalize_audio(file_task.wav_file, target_db_fs=-10)
                     
                     if success:
                         QMessageBox.information(
@@ -686,6 +700,8 @@ class DatasetViewer(QMainWindow):
                         
                         # Reload the current file
                         self.display_spectrogram(file_task.wav_file, file_task.lab_file)
+                
+                self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(self.current_audio_file)))
     
     def on_batch_normalize_clicked(self):
         """Handle batch normalize button click"""
@@ -866,12 +882,6 @@ class DatasetViewer(QMainWindow):
             # Check for empty phoneme data
             if not phones or not start_times or not end_times:
                 logger.warning(f"No phoneme data found in {lab_file}")
-            
-            # Validation of lab file timing
-            if phones and len(phones) > 0:
-                lab_max_time = max(end_times)
-                if abs(lab_max_time - audio_duration) > 0.5:  # More than 0.5 seconds difference
-                    logger.warning(f"Lab file timing mismatch: lab_max_time={lab_max_time:.2f}s, audio_duration={audio_duration:.2f}s")
             
             # Display spectrogram with phoneme alignment and waveform using current width scale factor
             self.spectrogram_canvas.plot_spectrogram(

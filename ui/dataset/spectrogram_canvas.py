@@ -616,7 +616,7 @@ class SpectrogramCanvas(FigureCanvas):
                 if self.current_audio_duration and i < len(self.boundary_times):
                     frame_ratio = constrained_frame / self.total_mel_frames
                     new_time = frame_ratio * self.current_audio_duration
-                    self.boundary_times[i] = new_time
+                    self.boundary_times[i] = round(new_time * 10000000)
                     
                     # Update the corresponding waveform line
                     if i < len(self.boundary_waveform_lines):
@@ -668,9 +668,9 @@ class SpectrogramCanvas(FigureCanvas):
         new_end_times = []
         for i in range(len(new_start_times)):
             if i < len(new_start_times) - 1:
-                new_end_times.append(new_start_times[i+1])
+                new_end_times.append(round(new_start_times[i+1]))
             else:
-                new_end_times.append(self.current_audio_duration)
+                new_end_times.append(round(self.current_audio_duration * 10000000))
         
         # Return modified phoneme data, including any edited phoneme labels
         return self.current_phones, new_start_times, new_end_times

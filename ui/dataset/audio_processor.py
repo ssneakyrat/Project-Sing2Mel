@@ -111,7 +111,7 @@ class AudioProcessor:
             # This is just a placeholder and won't give accurate F0
             return np.zeros(len(audio) // hop_length + 1)
     
-    def normalize_audio(self, file_path, target_db_fs=-18):
+    def normalize_audio(self, file_path, target_db_fs=-10):
         """
         Normalize audio file to target dB FS level and overwrite the original file
         
@@ -127,6 +127,7 @@ class AudioProcessor:
             return False, {"error": f"File not found: {file_path}"}
             
         try:
+            target_db_fs += 10
             # Load the audio file
             audio, sr = sf.read(file_path, dtype='float32')
             
