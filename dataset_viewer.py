@@ -61,7 +61,11 @@ class SpectrogramCanvas(FigureCanvas):
             raise ImportError("Matplotlib is required for spectrogram display")
             
         self.fig = Figure(figsize=(width, height), dpi=dpi)
-        self.axes = self.fig.add_subplot(111)
+        # Create two subplots with specific height ratios (80% spectrogram, 20% waveform)
+        self.gs = self.fig.add_gridspec(2, 1, height_ratios=[4, 1])  # 4:1 ratio
+        self.axes = self.fig.add_subplot(self.gs[0])  # Top subplot for spectrogram
+        self.waveform_axes = self.fig.add_subplot(self.gs[1])  # Bottom for waveform
+        
         super(SpectrogramCanvas, self).__init__(self.fig)
         self.setParent(parent)
         
@@ -75,6 +79,7 @@ class SpectrogramCanvas(FigureCanvas):
         
         # Store the current mel spectrogram and related data for rescaling
         self.current_mel_spec = None
+        self.current_audio = None  # Store audio data for waveform
         self.current_f0 = None
         self.current_phones = None
         self.current_start_times = None
@@ -87,18 +92,21 @@ class SpectrogramCanvas(FigureCanvas):
         # Default width scale factor
         self.width_scale_factor = 1.0
         
-        # Playback position indicator line
+        # Playback position indicators
         self.playback_line = None
+        self.waveform_playback_line = None
         
         self.fig.tight_layout()
         
-    def plot_spectrogram(self, mel_spec, f0=None, phones=None, start_times=None, end_times=None, 
+    def plot_spectrogram(self, mel_spec, audio=None, f0=None, phones=None, start_times=None, end_times=None, 
                          sample_rate=None, hop_length=None, width_scale_factor=1.0, audio_duration=None):
-        """Plot spectrogram with F0 contour overlay and phoneme boundaries using adjustable scale"""
+        """Plot spectrogram with F0 contour overlay and phoneme boundaries, and add waveform display below"""
         self.axes.clear()
+        self.waveform_axes.clear()
         
         # Store current data for rescaling
         self.current_mel_spec = mel_spec
+        self.current_audio = audio
         self.current_f0 = f0
         self.current_phones = phones
         self.current_start_times = start_times
@@ -113,19 +121,40 @@ class SpectrogramCanvas(FigureCanvas):
         im = self.axes.imshow(mel_spec, aspect='auto', origin='lower')
         self.axes.set_ylim(0, mel_spec.shape[0]-1)  # From 0 to the number of mel bins
 
-        # Use a fixed height and scale width based on time dimension and scale factor
-        fixed_height = 8  # Set a consistent height
-        base_width = max(10, mel_spec.shape[1]/50)  # Base width calculation
-        width = base_width * self.width_scale_factor  # Apply scale factor
-        
-        # Disable automatic adjustments
-        self.fig.set_size_inches(width, fixed_height, forward=True)
-        self.fig.subplots_adjust(left=0.1, right=0.95, top=0.9, bottom=0.1)
-        
-        # Force fixed pixel size
-        dpi = self.fig.get_dpi()
-        self.setFixedSize(int(width * dpi), int(fixed_height * dpi))
-        
+        # Plot waveform if audio data is provided
+        if audio is not None and sample_rate is not None:
+            # Convert audio to dB scale
+            if np.max(np.abs(audio)) > 0:
+                # Normalize audio
+                audio_norm = audio / np.max(np.abs(audio))
+                # Convert to dB (20*log10 for amplitude)
+                eps = 1e-10  # Small epsilon to avoid log(0)
+                audio_db = 20 * np.log10(np.abs(audio_norm) + eps)
+                
+                # Set fixed 10 dB y-scale for waveform
+                ymin = -30  # dB relative to max
+                ymax = 0    # dB relative to max
+                
+                # Create the time axis for the waveform
+                time_axis = np.linspace(0, audio_duration, len(audio_db)) if audio_duration else np.arange(len(audio_db)) / sample_rate
+                
+                # Calculate spectrogram time axis for alignment
+                spec_time_axis = np.linspace(0, audio_duration, self.total_mel_frames) if audio_duration else np.arange(self.total_mel_frames) * hop_length / sample_rate
+                
+                # Plot waveform
+                self.waveform_axes.plot(time_axis, audio_db, color='blue', linewidth=0.5)
+                self.waveform_axes.set_ylim(ymin, ymax)
+                self.waveform_axes.set_ylabel('Amplitude (dB)')
+                self.waveform_axes.set_xlabel('Time (s)')
+                
+                # Add grid and set fixed y-ticks for the 10dB scale
+                self.waveform_axes.grid(True, alpha=0.3)
+                self.waveform_axes.set_yticks([-10, -8, -6, -4, -2, 0])
+                
+                # Set x limits to match the audio duration
+                if audio_duration:
+                    self.waveform_axes.set_xlim(0, audio_duration)
+
         # Plot F0 contour if provided
         if f0 is not None and len(f0) > 0:
             # Filter out zeros and negative values (unvoiced regions)
@@ -222,17 +251,35 @@ class SpectrogramCanvas(FigureCanvas):
                             fontweight='bold',
                             bbox=dict(facecolor='black', alpha=0.5, pad=1, boxstyle='round')
                         )
+                    
+                    # Add phoneme boundaries in waveform plot too
+                    if audio_duration and start_times and end_times:
+                        # Directly use original time values for waveform plot
+                        self.waveform_axes.axvline(x=start_times[i], color='white', linestyle='-', alpha=0.7, linewidth=0.7)
+        
+        # Use a fixed height and scale width based on time dimension and scale factor
+        fixed_height = 10  # Increased to accommodate waveform
+        base_width = max(10, mel_spec.shape[1]/50)  # Base width calculation
+        width = base_width * self.width_scale_factor  # Apply scale factor
+        
+        # Disable automatic adjustments
+        self.fig.set_size_inches(width, fixed_height, forward=True)
+        self.fig.subplots_adjust(left=0.1, right=0.95, top=0.9, bottom=0.1)
+        
+        # Force fixed pixel size
+        dpi = self.fig.get_dpi()
+        self.setFixedSize(int(width * dpi), int(fixed_height * dpi))
         
         # Add legend, title and labels
         self.axes.set_title('Mel Spectrogram with F0 Contour and Phoneme Alignment')
         self.axes.set_ylabel('Mel Bins')
         self.axes.set_xlabel('Frames')
+        self.waveform_axes.set_title('Audio Waveform (10 dB scale)')
         
-        # Initialize playback position line (hidden initially)
+        # Initialize playback position lines (hidden initially)
         self.playback_line = self.axes.axvline(x=0, color='g', linestyle='-', linewidth=2, alpha=0.7, visible=False)
-        
-        # Add a colorbar for the spectrogram
-        #self.fig.colorbar(im, ax=self.axes, orientation='vertical', pad=0.01, fraction=0.05)
+        if audio_duration:
+            self.waveform_playback_line = self.waveform_axes.axvline(x=0, color='g', linestyle='-', linewidth=2, alpha=0.7, visible=False)
         
         self.fig.tight_layout()
         self.draw()
@@ -246,6 +293,7 @@ class SpectrogramCanvas(FigureCanvas):
         if self.current_mel_spec is not None:
             self.plot_spectrogram(
                 self.current_mel_spec, 
+                audio=self.current_audio,
                 f0=self.current_f0, 
                 phones=self.current_phones, 
                 start_times=self.current_start_times, 
@@ -257,31 +305,44 @@ class SpectrogramCanvas(FigureCanvas):
             )
     
     def update_playback_position(self, position_seconds):
-        """Update the position of the playback line"""
+        """Update the position of the playback lines on both plots"""
         if self.playback_line and self.total_mel_frames and self.current_audio_duration:
-            # Convert position in seconds to frames
+            # For spectrogram: Convert position in seconds to frames
             position_frame = int((position_seconds / self.current_audio_duration) * self.total_mel_frames)
             
-            # Update line position
+            # Update spectrogram line position
             self.playback_line.set_xdata([position_frame, position_frame])
             self.playback_line.set_visible(True)
+            
+            # Update waveform line position (in seconds)
+            if hasattr(self, 'waveform_playback_line') and self.waveform_playback_line:
+                self.waveform_playback_line.set_xdata([position_seconds, position_seconds])
+                self.waveform_playback_line.set_visible(True)
+            
             self.draw()
     
     def hide_playback_position(self):
-        """Hide the playback position line"""
+        """Hide the playback position lines"""
         if self.playback_line:
             self.playback_line.set_visible(False)
-            self.draw()
+        if hasattr(self, 'waveform_playback_line') and self.waveform_playback_line:
+            self.waveform_playback_line.set_visible(False)
+        self.draw()
         
     def clear(self):
         """Clear the spectrogram display"""
         self.axes.clear()
+        if hasattr(self, 'waveform_axes'):
+            self.waveform_axes.clear()
         self.axes.set_title('No spectrogram loaded')
+        if hasattr(self, 'waveform_axes'):
+            self.waveform_axes.set_title('No waveform loaded')
         self.fig.tight_layout()
         self.draw()
         
         # Clear stored data
         self.current_mel_spec = None
+        self.current_audio = None
         self.current_f0 = None
         self.current_phones = None
         self.current_start_times = None
@@ -291,6 +352,7 @@ class SpectrogramCanvas(FigureCanvas):
         self.current_audio_duration = None
         self.total_mel_frames = None
         self.playback_line = None
+        self.waveform_playback_line = None
 
 class ScrollableSpectrogramWidget(QScrollArea):
     """A scrollable container for the spectrogram canvas"""
@@ -797,7 +859,7 @@ class DatasetViewer(QMainWindow):
             return [], [], []
     
     def display_spectrogram(self, wav_file, lab_file):
-        """Load audio file and display its spectrogram with phoneme alignment"""
+        """Load audio file and display its spectrogram with phoneme alignment and waveform"""
         if not os.path.exists(wav_file):
             raise FileNotFoundError(f"WAV file not found: {wav_file}")
             
@@ -869,9 +931,10 @@ class DatasetViewer(QMainWindow):
             if abs(lab_max_time - audio_duration) > 0.5:  # More than 0.5 seconds difference
                 logger.warning(f"Lab file timing mismatch: lab_max_time={lab_max_time:.2f}s, audio_duration={audio_duration:.2f}s")
         
-        # Display spectrogram with phoneme alignment using current width scale factor
+        # Display spectrogram with phoneme alignment and waveform using current width scale factor
         self.spectrogram_canvas.plot_spectrogram(
-            mel_np, 
+            mel_np,
+            audio=audio,  # Pass the audio data for waveform display
             f0=f0, 
             phones=phones, 
             start_times=start_times, 
