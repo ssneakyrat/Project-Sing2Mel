@@ -26,20 +26,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("DatasetViewer")
 
-# Try to import matplotlib for spectrogram display
-try:
-    matplotlib_available = True
-except ImportError:
-    matplotlib_available = False
-
-# Try to import audio processing libraries
-try:
-    import soundfile as sf
-    import torchaudio
-    import torch
-    audio_processing_available = True
-except ImportError:
-    audio_processing_available = False
+import soundfile as sf
+import torchaudio
+import torch
 
 # Create a namedtuple for file metadata
 FileMetadata = namedtuple('FileMetadata', [
@@ -73,9 +62,6 @@ class DatasetViewer(QMainWindow):
     """Main application window for the dataset viewer"""
     def __init__(self):
         super().__init__()
-        
-        # Check dependencies
-        self.check_dependencies()
         
         # Load config
         try:
@@ -124,19 +110,6 @@ class DatasetViewer(QMainWindow):
         
         # Load the dataset
         self.load_dataset()
-        
-    def check_dependencies(self):
-        """Check if all required dependencies are available"""
-        missing_deps = []
-        
-        if not matplotlib_available:
-            missing_deps.append("matplotlib")
-            
-        if not audio_processing_available:
-            missing_deps.append("soundfile, torchaudio, torch")
-            
-        if missing_deps:
-            self.show_error(f"Missing dependencies: {', '.join(missing_deps)}")
             
     def show_error(self, message):
         """Show an error message box"""
@@ -159,104 +132,103 @@ class DatasetViewer(QMainWindow):
         left_layout = QVBoxLayout(left_panel)
         
         # Moved spectrogram controls to the top of the left panel
-        if matplotlib_available:
-            # Add spectrogram controls
-            controls_group = QGroupBox("Spectrogram Controls")
-            controls_layout = QVBoxLayout()
-            
-            # Add width scale slider with label
-            scale_layout = QHBoxLayout()
-            scale_label = QLabel("Width Scale:")
-            self.width_scale_slider = QSlider(Qt.Horizontal)
-            self.width_scale_slider.setRange(10, 500)  # 0.1x to 5.0x
-            self.width_scale_slider.setValue(200)  # Default 2.0x
-            self.width_scale_slider.setTickPosition(QSlider.TicksBelow)
-            self.width_scale_slider.setTickInterval(50)
-            self.width_scale_value_label = QLabel("2.0x")
-            
-            # Connect slider value change signal
-            self.width_scale_slider.valueChanged.connect(self.on_scale_slider_changed)
-            
-            scale_layout.addWidget(scale_label)
-            scale_layout.addWidget(self.width_scale_slider)
-            scale_layout.addWidget(self.width_scale_value_label)
-            controls_layout.addLayout(scale_layout)
-            
-            # Add dB FS scale controls
-            db_scale_layout = QHBoxLayout()
-            db_min_label = QLabel("Min dB FS:")
-            self.db_min_slider = QSlider(Qt.Horizontal)
-            self.db_min_slider.setRange(-100, -10)  # -100 dB to -10 dB
-            self.db_min_slider.setValue(-60)  # Default -60 dB
-            self.db_min_slider.setTickPosition(QSlider.TicksBelow)
-            self.db_min_slider.setTickInterval(10)
-            self.db_min_value_label = QLabel("-60 dB")
-            
-            # Connect db min slider value change signal
-            self.db_min_slider.valueChanged.connect(self.on_db_min_slider_changed)
-            
-            db_scale_layout.addWidget(db_min_label)
-            db_scale_layout.addWidget(self.db_min_slider)
-            db_scale_layout.addWidget(self.db_min_value_label)
-            controls_layout.addLayout(db_scale_layout)
-            
-            # Add playback controls
-            playback_layout = QHBoxLayout()
-            
-            # Play button
-            self.play_button = QPushButton("Play")
-            self.play_button.setEnabled(False)  # Disabled until audio is loaded
-            self.play_button.clicked.connect(self.on_play_clicked)
-            playback_layout.addWidget(self.play_button)
-            
-            # Stop button
-            self.stop_button = QPushButton("Stop")
-            self.stop_button.setEnabled(False)  # Disabled until audio is playing
-            self.stop_button.clicked.connect(self.on_stop_clicked)
-            playback_layout.addWidget(self.stop_button)
-            
-            # Current position and duration label
-            self.time_label = QLabel("Position: 0:00 / 0:00")
-            playback_layout.addWidget(self.time_label)
-            
-            controls_layout.addLayout(playback_layout)
-            
-            # Add save phoneme boundaries button
-            phoneme_layout = QHBoxLayout()
-            
-            # Save button for phoneme boundaries
-            self.save_boundaries_button = QPushButton("Save Phoneme Boundaries")
-            self.save_boundaries_button.setEnabled(False)  # Disabled until phonemes are modified
-            self.save_boundaries_button.setToolTip("Save modified phoneme boundaries to the .lab file")
-            self.save_boundaries_button.clicked.connect(self.on_save_boundaries_clicked)
-            self.save_boundaries_button.setStyleSheet("background-color: #f8d8a8; font-weight: bold;")  # Light orange background
-            phoneme_layout.addWidget(self.save_boundaries_button)
-            
-            controls_layout.addLayout(phoneme_layout)
-            
-            # Add audio processing controls
-            processing_layout = QHBoxLayout()
-            
-            # Normalize to -18 dB FS button
-            self.normalize_button = QPushButton("Normalize to -18 dB FS")
-            self.normalize_button.setEnabled(False)  # Disabled until audio is loaded
-            self.normalize_button.setToolTip("Process audio to -18 dB FS loudness standard and overwrite the file")
-            self.normalize_button.clicked.connect(self.on_normalize_clicked)
-            self.normalize_button.setStyleSheet("background-color: #a8d8a8; font-weight: bold;")  # Light green background
-            processing_layout.addWidget(self.normalize_button)
-            
-            # Batch Normalize button
-            self.batch_normalize_button = QPushButton("Batch Normalize Dataset")
-            self.batch_normalize_button.setToolTip("Normalize all audio files in the dataset to -18 dB FS")
-            self.batch_normalize_button.clicked.connect(self.on_batch_normalize_clicked)
-            self.batch_normalize_button.setStyleSheet("background-color: #a8d8c8; font-weight: bold;")  # Blue-green background
-            processing_layout.addWidget(self.batch_normalize_button)
-            
-            # Add the audio processing layout
-            controls_layout.addLayout(processing_layout)
-            
-            controls_group.setLayout(controls_layout)
-            left_layout.addWidget(controls_group)  # Add controls to the left panel
+        # Add spectrogram controls
+        controls_group = QGroupBox("Spectrogram Controls")
+        controls_layout = QVBoxLayout()
+        
+        # Add width scale slider with label
+        scale_layout = QHBoxLayout()
+        scale_label = QLabel("Width Scale:")
+        self.width_scale_slider = QSlider(Qt.Horizontal)
+        self.width_scale_slider.setRange(10, 500)  # 0.1x to 5.0x
+        self.width_scale_slider.setValue(200)  # Default 2.0x
+        self.width_scale_slider.setTickPosition(QSlider.TicksBelow)
+        self.width_scale_slider.setTickInterval(50)
+        self.width_scale_value_label = QLabel("2.0x")
+        
+        # Connect slider value change signal
+        self.width_scale_slider.valueChanged.connect(self.on_scale_slider_changed)
+        
+        scale_layout.addWidget(scale_label)
+        scale_layout.addWidget(self.width_scale_slider)
+        scale_layout.addWidget(self.width_scale_value_label)
+        controls_layout.addLayout(scale_layout)
+        
+        # Add dB FS scale controls
+        db_scale_layout = QHBoxLayout()
+        db_min_label = QLabel("Min dB FS:")
+        self.db_min_slider = QSlider(Qt.Horizontal)
+        self.db_min_slider.setRange(-100, -10)  # -100 dB to -10 dB
+        self.db_min_slider.setValue(-60)  # Default -60 dB
+        self.db_min_slider.setTickPosition(QSlider.TicksBelow)
+        self.db_min_slider.setTickInterval(10)
+        self.db_min_value_label = QLabel("-60 dB")
+        
+        # Connect db min slider value change signal
+        self.db_min_slider.valueChanged.connect(self.on_db_min_slider_changed)
+        
+        db_scale_layout.addWidget(db_min_label)
+        db_scale_layout.addWidget(self.db_min_slider)
+        db_scale_layout.addWidget(self.db_min_value_label)
+        controls_layout.addLayout(db_scale_layout)
+        
+        # Add playback controls
+        playback_layout = QHBoxLayout()
+        
+        # Play button
+        self.play_button = QPushButton("Play")
+        self.play_button.setEnabled(False)  # Disabled until audio is loaded
+        self.play_button.clicked.connect(self.on_play_clicked)
+        playback_layout.addWidget(self.play_button)
+        
+        # Stop button
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setEnabled(False)  # Disabled until audio is playing
+        self.stop_button.clicked.connect(self.on_stop_clicked)
+        playback_layout.addWidget(self.stop_button)
+        
+        # Current position and duration label
+        self.time_label = QLabel("Position: 0:00 / 0:00")
+        playback_layout.addWidget(self.time_label)
+        
+        controls_layout.addLayout(playback_layout)
+        
+        # Add save phoneme boundaries button
+        phoneme_layout = QHBoxLayout()
+        
+        # Save button for phoneme boundaries
+        self.save_boundaries_button = QPushButton("Save Phoneme Boundaries")
+        self.save_boundaries_button.setEnabled(False)  # Disabled until phonemes are modified
+        self.save_boundaries_button.setToolTip("Save modified phoneme boundaries to the .lab file")
+        self.save_boundaries_button.clicked.connect(self.on_save_boundaries_clicked)
+        self.save_boundaries_button.setStyleSheet("background-color: #f8d8a8; font-weight: bold;")  # Light orange background
+        phoneme_layout.addWidget(self.save_boundaries_button)
+        
+        controls_layout.addLayout(phoneme_layout)
+        
+        # Add audio processing controls
+        processing_layout = QHBoxLayout()
+        
+        # Normalize to -18 dB FS button
+        self.normalize_button = QPushButton("Normalize to -18 dB FS")
+        self.normalize_button.setEnabled(False)  # Disabled until audio is loaded
+        self.normalize_button.setToolTip("Process audio to -18 dB FS loudness standard and overwrite the file")
+        self.normalize_button.clicked.connect(self.on_normalize_clicked)
+        self.normalize_button.setStyleSheet("background-color: #a8d8a8; font-weight: bold;")  # Light green background
+        processing_layout.addWidget(self.normalize_button)
+        
+        # Batch Normalize button
+        self.batch_normalize_button = QPushButton("Batch Normalize Dataset")
+        self.batch_normalize_button.setToolTip("Normalize all audio files in the dataset to -18 dB FS")
+        self.batch_normalize_button.clicked.connect(self.on_batch_normalize_clicked)
+        self.batch_normalize_button.setStyleSheet("background-color: #a8d8c8; font-weight: bold;")  # Blue-green background
+        processing_layout.addWidget(self.batch_normalize_button)
+        
+        # Add the audio processing layout
+        controls_layout.addLayout(processing_layout)
+        
+        controls_group.setLayout(controls_layout)
+        left_layout.addWidget(controls_group)  # Add controls to the left panel
         
         # Add refresh button
         refresh_button = QPushButton("Refresh Dataset")
@@ -277,26 +249,21 @@ class DatasetViewer(QMainWindow):
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         
-        if matplotlib_available:
-            # Use the scrollable spectrogram widget instead of just the canvas
-            self.scrollable_spectrogram = ScrollableSpectrogramWidget(right_panel)
-            self.spectrogram_canvas = self.scrollable_spectrogram.spectrogram_canvas
-            
-            # Connect canvas signals
-            self.spectrogram_canvas.audio_loaded.connect(self.on_audio_loaded)
-            self.spectrogram_canvas.boundaries_modified.connect(self.on_boundaries_modified)
-            self.spectrogram_canvas.phonemes_modified.connect(self.on_phonemes_modified)
+        # Use the scrollable spectrogram widget instead of just the canvas
+        self.scrollable_spectrogram = ScrollableSpectrogramWidget(right_panel)
+        self.spectrogram_canvas = self.scrollable_spectrogram.spectrogram_canvas
+        
+        # Connect canvas signals
+        self.spectrogram_canvas.audio_loaded.connect(self.on_audio_loaded)
+        self.spectrogram_canvas.boundaries_modified.connect(self.on_boundaries_modified)
+        self.spectrogram_canvas.phonemes_modified.connect(self.on_phonemes_modified)
 
-            right_layout.addWidget(self.scrollable_spectrogram)
-            
-            # Set up media player signals
-            self.media_player.stateChanged.connect(self.on_media_state_changed)
-            self.media_player.positionChanged.connect(self.on_position_changed)
-            self.media_player.durationChanged.connect(self.on_duration_changed)
-        else:
-            self.spectrogram_label = QLabel("Matplotlib is required for spectrogram display")
-            right_layout.addWidget(self.spectrogram_label)
-            self.spectrogram_canvas = None
+        right_layout.addWidget(self.scrollable_spectrogram)
+        
+        # Set up media player signals
+        self.media_player.stateChanged.connect(self.on_media_state_changed)
+        self.media_player.positionChanged.connect(self.on_position_changed)
+        self.media_player.durationChanged.connect(self.on_duration_changed)
         
         # Add widgets to splitter
         splitter.addWidget(left_panel)
@@ -645,13 +612,7 @@ class DatasetViewer(QMainWindow):
             info_text += f"Lab file: {os.path.basename(file_task.lab_file)}\n"
             info_text += f"WAV file: {os.path.basename(file_task.wav_file)}"
             
-            # Process audio for spectrogram if matplotlib is available
-            if matplotlib_available and audio_processing_available and self.spectrogram_canvas:
-                try:
-                    self.display_spectrogram(file_task.wav_file, file_task.lab_file)
-                except Exception as e:
-                    error_text = f"{info_text}\nError: {str(e)}\n{traceback.format_exc()}"
-                    self.spectrogram_canvas.clear()
+            self.display_spectrogram(file_task.wav_file, file_task.lab_file)
         else:
             # Reset audio player
             self.media_player.stop()
@@ -882,7 +843,7 @@ class DatasetViewer(QMainWindow):
             self.show_error(error_message)
             return False
     
-    def batch_normalize_dataset(self, target_db_fs=-18):
+    def batch_normalize_dataset(self, target_db_fs=-10):
         """
         Normalize all audio files in the dataset to target dB FS level
         
