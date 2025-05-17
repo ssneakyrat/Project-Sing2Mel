@@ -299,7 +299,7 @@ class SpectrogramCanvas(FigureCanvas):
             self.audio_loaded.emit(audio_duration)
     
     def on_pick_event(self, event):
-        """Handle pick events for phoneme label editing"""
+        """Handle pick events for phoneme label editing, splitting, and deletion"""
         # Check if it's a text object (phone label)
         if hasattr(event, 'artist') and event.artist in self.phone_labels:
             # Get the index of the picked phone label
@@ -309,31 +309,165 @@ class SpectrogramCanvas(FigureCanvas):
             # Get the current phoneme text
             current_phone = self.current_phones[phone_idx]
             
-            # Show dialog to edit the phoneme label
-            new_phone, ok = QInputDialog.getText(
-                self, 
-                'Edit Phoneme Label', 
-                'Enter new phoneme label:',
-                QLineEdit.Normal,
-                current_phone
-            )
+            # Create a popup menu with options
+            from PyQt5.QtWidgets import QMenu, QAction
+            from PyQt5.QtGui import QCursor
             
-            # If user clicked OK and provided a new label
-            if ok and new_phone and new_phone != current_phone:
-                # Update the phoneme label text
-                self.phone_labels[label_idx].set_text(new_phone)
+            menu = QMenu(self)
+            edit_action = QAction("Edit", self)
+            split_action = QAction("Split", self)
+            delete_action = QAction("Delete", self)
+            
+            menu.addAction(edit_action)
+            menu.addAction(split_action)
+            menu.addAction(delete_action)
+            
+            # Show the menu at current cursor position
+            action = menu.exec_(QCursor.pos())
+            
+            # Handle Edit action
+            if action == edit_action:
+                # Show dialog to edit the phoneme label
+                new_phone, ok = QInputDialog.getText(
+                    self, 
+                    'Edit Phoneme Label', 
+                    'Enter new phoneme label:',
+                    QLineEdit.Normal,
+                    current_phone
+                )
                 
-                # Update the internal phoneme data
-                self.current_phones[phone_idx] = new_phone
+                # If user clicked OK and provided a new label
+                if ok and new_phone and new_phone != current_phone:
+                    # Update the phoneme label text
+                    self.phone_labels[label_idx].set_text(new_phone)
+                    
+                    # Update the internal phoneme data
+                    self.current_phones[phone_idx] = new_phone
+                    
+                    # Mark that edits have been made
+                    self.phone_labels_edits_made = True
+                    
+                    # Redraw the canvas
+                    self.draw_idle()
+                    
+                    # Emit signal that phoneme labels have been modified
+                    self.phonemes_modified.emit()
+            
+            # Handle Split action
+            elif action == split_action:
+                # Get the current segment boundaries
+                segment_start = self.boundary_times[phone_idx]
+                segment_end = self.boundary_times[phone_idx + 1] if phone_idx + 1 < len(self.boundary_times) else self.current_audio_duration
+                
+                # Calculate the midpoint for splitting
+                midpoint = (segment_start + segment_end) / 2
+                
+                # Insert new boundary at midpoint
+                self.boundary_times.insert(phone_idx + 1, midpoint)
+                
+                # Duplicate the phoneme label for the second segment
+                self.current_phones.insert(phone_idx + 1, current_phone)
+                
+                # Update internal data structures
+                if self.current_start_times:
+                    self.current_start_times.insert(phone_idx + 1, midpoint)
+                
+                if self.current_end_times and phone_idx < len(self.current_end_times):
+                    # Current end time becomes the new phoneme's end time
+                    end_time = self.current_end_times[phone_idx]
+                    # Update current phoneme end time to midpoint
+                    self.current_end_times[phone_idx] = midpoint
+                    # Insert end time for new phoneme
+                    self.current_end_times.insert(phone_idx + 1, end_time)
                 
                 # Mark that edits have been made
+                self.edits_made = True
                 self.phone_labels_edits_made = True
                 
-                # Redraw the canvas
-                self.draw_idle()
+                # Redraw the spectrogram with updated phoneme boundaries
+                self.plot_spectrogram(
+                    self.current_mel_spec, 
+                    audio=self.current_audio,
+                    f0=self.current_f0, 
+                    phones=self.current_phones, 
+                    start_times=self.boundary_times,  # Use updated boundary times
+                    end_times=self.current_end_times,
+                    sample_rate=self.current_sample_rate,
+                    hop_length=self.current_hop_length,
+                    width_scale_factor=self.width_scale_factor,
+                    audio_duration=self.current_audio_duration
+                )
                 
-                # Emit signal that phoneme labels have been modified
+                # Emit signals that phonemes and boundaries have been modified
                 self.phonemes_modified.emit()
+                self.boundaries_modified.emit()
+            
+            # Handle Delete action
+            elif action == delete_action:
+                # Check if there's more than one phoneme (prevent deleting the last one)
+                if len(self.current_phones) > 1:
+                    # Check if it's the first or last phoneme (not allowed to delete these)
+                    if phone_idx == 0:
+                        from PyQt5.QtWidgets import QMessageBox
+                        QMessageBox.warning(self, "Cannot Delete", "Cannot delete the first phoneme segment.")
+                        return
+                    
+                    if phone_idx == len(self.current_phones) - 1:
+                        from PyQt5.QtWidgets import QMessageBox
+                        QMessageBox.warning(self, "Cannot Delete", "Cannot delete the last phoneme segment.")
+                        return
+                    
+                    # Get the segment boundaries
+                    segment_start = self.boundary_times[phone_idx]
+                    segment_end = self.boundary_times[phone_idx + 1] if phone_idx + 1 < len(self.boundary_times) else self.current_audio_duration
+                    
+                    # Remove the phoneme and its boundaries
+                    self.current_phones.pop(phone_idx)
+                    
+                    # Update boundary times based on deletion scenario
+                    if phone_idx < len(self.boundary_times):
+                        # Remove this boundary
+                        self.boundary_times.pop(phone_idx)
+                    
+                    # Update start times and end times
+                    if self.current_start_times and phone_idx < len(self.current_start_times):
+                        self.current_start_times.pop(phone_idx)
+                    
+                    if self.current_end_times and phone_idx < len(self.current_end_times):
+                        self.current_end_times.pop(phone_idx)
+                    
+                    # Adjust adjacent phonemes if needed
+                    # The previous phoneme now extends to where the next one begins
+                    if self.current_end_times and phone_idx - 1 < len(self.current_end_times):
+                        # Update the previous phoneme's end time to the next phoneme's start time
+                        next_start = self.current_start_times[phone_idx] if phone_idx < len(self.current_start_times) else self.current_audio_duration
+                        self.current_end_times[phone_idx - 1] = next_start
+                    
+                    # Mark that edits have been made
+                    self.edits_made = True
+                    self.phone_labels_edits_made = True
+                    
+                    # Redraw the spectrogram with updated phoneme boundaries
+                    self.plot_spectrogram(
+                        self.current_mel_spec, 
+                        audio=self.current_audio,
+                        f0=self.current_f0, 
+                        phones=self.current_phones, 
+                        start_times=self.boundary_times,  # Use updated boundary times
+                        end_times=self.current_end_times,
+                        sample_rate=self.current_sample_rate,
+                        hop_length=self.current_hop_length,
+                        width_scale_factor=self.width_scale_factor,
+                        audio_duration=self.current_audio_duration
+                    )
+                    
+                    # Emit signals that phonemes and boundaries have been modified
+                    self.phonemes_modified.emit()
+                    self.boundaries_modified.emit()
+                else:
+                    # Don't allow deleting the last phoneme
+                    from PyQt5.QtWidgets import QMessageBox
+                    QMessageBox.warning(self, "Cannot Delete", "Cannot delete the last phoneme segment.")
     
     def on_mouse_press(self, event):
         """Handle mouse press events for phoneme boundary dragging"""
