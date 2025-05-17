@@ -8,7 +8,10 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QHBoxLayout, QTreeWidget, QTreeWidgetItem, QLabel,
                             QSplitter, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
                             QSlider, QGroupBox)
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
+from PyQt5.QtGui import QIcon
+from PyQt5.QtCore import QUrl
 import glob
 from collections import namedtuple
 
@@ -50,6 +53,9 @@ FileMetadata = namedtuple('FileMetadata', [
 
 class SpectrogramCanvas(FigureCanvas):
     """Canvas for displaying spectrograms using Matplotlib with fixed scale"""
+    # Signal to tell parent when audio duration is available
+    audio_loaded = pyqtSignal(float)
+    
     def __init__(self, parent=None, width=5, height=4, dpi=100):
         if not matplotlib_available:
             raise ImportError("Matplotlib is required for spectrogram display")
@@ -75,14 +81,19 @@ class SpectrogramCanvas(FigureCanvas):
         self.current_end_times = None
         self.current_sample_rate = None
         self.current_hop_length = None
+        self.current_audio_duration = None
+        self.total_mel_frames = None
         
         # Default width scale factor
         self.width_scale_factor = 1.0
         
+        # Playback position indicator line
+        self.playback_line = None
+        
         self.fig.tight_layout()
         
     def plot_spectrogram(self, mel_spec, f0=None, phones=None, start_times=None, end_times=None, 
-                         sample_rate=None, hop_length=None, width_scale_factor=1.0):
+                         sample_rate=None, hop_length=None, width_scale_factor=1.0, audio_duration=None):
         """Plot spectrogram with F0 contour overlay and phoneme boundaries using adjustable scale"""
         self.axes.clear()
         
@@ -95,6 +106,8 @@ class SpectrogramCanvas(FigureCanvas):
         self.current_sample_rate = sample_rate
         self.current_hop_length = hop_length
         self.width_scale_factor = width_scale_factor
+        self.current_audio_duration = audio_duration
+        self.total_mel_frames = mel_spec.shape[1]
         
         # Use a fixed aspect ratio instead of 'auto'
         im = self.axes.imshow(mel_spec, aspect='auto', origin='lower')
@@ -180,8 +193,8 @@ class SpectrogramCanvas(FigureCanvas):
                     valid_end = min(mel_spec.shape[1], end)
                     
                     # Skip very short segments
-                    #if valid_end - valid_start <= 1:
-                    #    continue
+                    if valid_end - valid_start <= 1:
+                        continue
                     
                     # Draw phoneme boundary as vertical lines
                     self.axes.axvline(x=valid_start, color='white', linestyle='-', alpha=0.7, linewidth=0.7)
@@ -199,26 +212,34 @@ class SpectrogramCanvas(FigureCanvas):
                     
                     # Add phoneme label if segment is wide enough
                     segment_width = valid_end - valid_start
-                    center = valid_start + segment_width/2
-                    # White text with dark edge for contrast against any background
-                    self.axes.text(
-                        center, label_y_pos, phone,
-                        ha='center', va='center',
-                        fontsize=8, color='white',
-                        fontweight='bold',
-                        bbox=dict(facecolor='black', alpha=0.5, pad=1, boxstyle='round')
-                    )
+                    if segment_width > 5:  # Minimum width for labels
+                        center = valid_start + segment_width/2
+                        # White text with dark edge for contrast against any background
+                        self.axes.text(
+                            center, label_y_pos, phone,
+                            ha='center', va='center',
+                            fontsize=8, color='white',
+                            fontweight='bold',
+                            bbox=dict(facecolor='black', alpha=0.5, pad=1, boxstyle='round')
+                        )
         
         # Add legend, title and labels
         self.axes.set_title('Mel Spectrogram with F0 Contour and Phoneme Alignment')
         self.axes.set_ylabel('Mel Bins')
         self.axes.set_xlabel('Frames')
         
+        # Initialize playback position line (hidden initially)
+        self.playback_line = self.axes.axvline(x=0, color='g', linestyle='-', linewidth=2, alpha=0.7, visible=False)
+        
         # Add a colorbar for the spectrogram
         #self.fig.colorbar(im, ax=self.axes, orientation='vertical', pad=0.01, fraction=0.05)
         
         self.fig.tight_layout()
         self.draw()
+        
+        # Emit signal with audio duration
+        if audio_duration is not None:
+            self.audio_loaded.emit(audio_duration)
     
     def rescale_width(self, scale_factor):
         """Rescale the spectrogram width with the given scale factor"""
@@ -231,8 +252,26 @@ class SpectrogramCanvas(FigureCanvas):
                 end_times=self.current_end_times,
                 sample_rate=self.current_sample_rate,
                 hop_length=self.current_hop_length,
-                width_scale_factor=scale_factor
+                width_scale_factor=scale_factor,
+                audio_duration=self.current_audio_duration
             )
+    
+    def update_playback_position(self, position_seconds):
+        """Update the position of the playback line"""
+        if self.playback_line and self.total_mel_frames and self.current_audio_duration:
+            # Convert position in seconds to frames
+            position_frame = int((position_seconds / self.current_audio_duration) * self.total_mel_frames)
+            
+            # Update line position
+            self.playback_line.set_xdata([position_frame, position_frame])
+            self.playback_line.set_visible(True)
+            self.draw()
+    
+    def hide_playback_position(self):
+        """Hide the playback position line"""
+        if self.playback_line:
+            self.playback_line.set_visible(False)
+            self.draw()
         
     def clear(self):
         """Clear the spectrogram display"""
@@ -249,6 +288,9 @@ class SpectrogramCanvas(FigureCanvas):
         self.current_end_times = None
         self.current_sample_rate = None
         self.current_hop_length = None
+        self.current_audio_duration = None
+        self.total_mel_frames = None
+        self.playback_line = None
 
 class ScrollableSpectrogramWidget(QScrollArea):
     """A scrollable container for the spectrogram canvas"""
@@ -314,6 +356,13 @@ class DatasetViewer(QMainWindow):
         
         # Width scale factor for spectrograms
         self.width_scale_factor = 1.0
+        
+        # Audio playback
+        self.media_player = QMediaPlayer()
+        self.current_audio_file = None
+        self.update_timer = QTimer()
+        self.update_timer.setInterval(50)  # Update every 50ms
+        self.update_timer.timeout.connect(self.update_playback_position)
         
         # Set up the UI
         self.init_ui()
@@ -394,15 +443,44 @@ class DatasetViewer(QMainWindow):
             scale_layout.addWidget(scale_label)
             scale_layout.addWidget(self.width_scale_slider)
             scale_layout.addWidget(self.width_scale_value_label)
-            
             controls_layout.addLayout(scale_layout)
+            
+            # Add playback controls
+            playback_layout = QHBoxLayout()
+            
+            # Play button
+            self.play_button = QPushButton("Play")
+            self.play_button.setEnabled(False)  # Disabled until audio is loaded
+            self.play_button.clicked.connect(self.on_play_clicked)
+            playback_layout.addWidget(self.play_button)
+            
+            # Stop button
+            self.stop_button = QPushButton("Stop")
+            self.stop_button.setEnabled(False)  # Disabled until audio is playing
+            self.stop_button.clicked.connect(self.on_stop_clicked)
+            playback_layout.addWidget(self.stop_button)
+            
+            # Current position and duration label
+            self.time_label = QLabel("Position: 0:00 / 0:00")
+            playback_layout.addWidget(self.time_label)
+            
+            controls_layout.addLayout(playback_layout)
             controls_group.setLayout(controls_layout)
             right_layout.addWidget(controls_group)
             
             # Use the scrollable spectrogram widget instead of just the canvas
             self.scrollable_spectrogram = ScrollableSpectrogramWidget(right_panel)
             self.spectrogram_canvas = self.scrollable_spectrogram.spectrogram_canvas
+            
+            # Connect canvas signals
+            self.spectrogram_canvas.audio_loaded.connect(self.on_audio_loaded)
+            
             right_layout.addWidget(self.scrollable_spectrogram)
+            
+            # Set up media player signals
+            self.media_player.stateChanged.connect(self.on_media_state_changed)
+            self.media_player.positionChanged.connect(self.on_position_changed)
+            self.media_player.durationChanged.connect(self.on_duration_changed)
         else:
             self.spectrogram_label = QLabel("Matplotlib is required for spectrogram display")
             right_layout.addWidget(self.spectrogram_label)
@@ -430,6 +508,77 @@ class DatasetViewer(QMainWindow):
         # Update spectrogram if canvas exists
         if self.spectrogram_canvas:
             self.spectrogram_canvas.rescale_width(self.width_scale_factor)
+    
+    def on_play_clicked(self):
+        """Handle play button click"""
+        if self.media_player.state() == QMediaPlayer.PlayingState:
+            self.media_player.pause()
+        else:
+            self.media_player.play()
+            self.update_timer.start()
+    
+    def on_stop_clicked(self):
+        """Handle stop button click"""
+        self.media_player.stop()
+        self.update_timer.stop()
+        
+        # Hide playback position line
+        if self.spectrogram_canvas:
+            self.spectrogram_canvas.hide_playback_position()
+    
+    def on_media_state_changed(self, state):
+        """Handle media player state changes"""
+        if state == QMediaPlayer.PlayingState:
+            self.play_button.setText("Pause")
+            self.stop_button.setEnabled(True)
+        else:
+            self.play_button.setText("Play")
+            if state == QMediaPlayer.StoppedState:
+                self.stop_button.setEnabled(False)
+                self.update_timer.stop()
+                # Hide playback position line when stopped
+                if self.spectrogram_canvas:
+                    self.spectrogram_canvas.hide_playback_position()
+    
+    def on_position_changed(self, position):
+        """Handle media player position changes"""
+        # Update time label
+        position_ms = position
+        duration_ms = self.media_player.duration()
+        
+        position_str = self.format_time(position_ms)
+        duration_str = self.format_time(duration_ms)
+        
+        self.time_label.setText(f"Position: {position_str} / {duration_str}")
+    
+    def on_duration_changed(self, duration):
+        """Handle media player duration changes"""
+        # Update time label with new duration
+        position_ms = self.media_player.position()
+        duration_ms = duration
+        
+        position_str = self.format_time(position_ms)
+        duration_str = self.format_time(duration_ms)
+        
+        self.time_label.setText(f"Position: {position_str} / {duration_str}")
+    
+    def format_time(self, ms):
+        """Format milliseconds to MM:SS format"""
+        seconds = int(ms / 1000)
+        minutes = int(seconds / 60)
+        seconds = seconds % 60
+        return f"{minutes}:{seconds:02d}"
+    
+    def update_playback_position(self):
+        """Update the playback position line on the spectrogram"""
+        if self.spectrogram_canvas and self.media_player.state() == QMediaPlayer.PlayingState:
+            position_seconds = self.media_player.position() / 1000.0
+            self.spectrogram_canvas.update_playback_position(position_seconds)
+    
+    def on_audio_loaded(self, duration):
+        """Handle audio loaded signal from spectrogram canvas"""
+        # Enable play button
+        self.play_button.setEnabled(True)
         
     def scan_directory(self):
         """Scan dataset directory and find WAV and LAB file pairs"""
@@ -553,6 +702,14 @@ class DatasetViewer(QMainWindow):
         file_task = item.data(0, Qt.UserRole)
         
         if file_task:
+            # Reset audio player state
+            self.media_player.stop()
+            self.update_timer.stop()
+            self.play_button.setText("Play")
+            self.play_button.setEnabled(False)
+            self.stop_button.setEnabled(False)
+            self.time_label.setText("Position: 0:00 / 0:00")
+            
             # Display file info
             info_text = f"Singer: {file_task.singer_id} (ID: {file_task.singer_idx})\n"
             info_text += f"Language: {file_task.language_id} (ID: {file_task.language_idx})\n"
@@ -567,6 +724,14 @@ class DatasetViewer(QMainWindow):
                     error_text = f"{info_text}\nError: {str(e)}\n{traceback.format_exc()}"
                     self.spectrogram_canvas.clear()
         else:
+            # Reset audio player
+            self.media_player.stop()
+            self.update_timer.stop()
+            self.play_button.setText("Play")
+            self.play_button.setEnabled(False)
+            self.stop_button.setEnabled(False)
+            self.time_label.setText("Position: 0:00 / 0:00")
+            
             if self.spectrogram_canvas:
                 self.spectrogram_canvas.clear()
     
@@ -636,6 +801,13 @@ class DatasetViewer(QMainWindow):
         if not os.path.exists(wav_file):
             raise FileNotFoundError(f"WAV file not found: {wav_file}")
             
+        # Set current audio file
+        self.current_audio_file = wav_file
+        
+        # Load audio file into media player
+        if self.current_audio_file:
+            self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(self.current_audio_file)))
+            
         # Load audio
         audio, sr = sf.read(wav_file, dtype='float32')
         
@@ -652,6 +824,9 @@ class DatasetViewer(QMainWindow):
             audio_tensor = resampler(audio_tensor)
             audio = audio_tensor.squeeze(0).numpy()
             sr = self.sr
+        
+        # Calculate audio duration
+        audio_duration = len(audio) / sr
         
         # Read phoneme information
         phones, start_times, end_times = self.read_lab_file(lab_file)
@@ -686,7 +861,6 @@ class DatasetViewer(QMainWindow):
         mel_np = mel_norm.squeeze(0).cpu().numpy()
         
         # Calculate audio duration and expected mel frames
-        audio_duration = len(audio) / sr
         expected_mel_frames = mel_np.shape[1]
         
         # Validation of lab file timing
@@ -704,7 +878,8 @@ class DatasetViewer(QMainWindow):
             end_times=end_times,
             sample_rate=sr,
             hop_length=self.hop_length,
-            width_scale_factor=self.width_scale_factor
+            width_scale_factor=self.width_scale_factor,
+            audio_duration=audio_duration
         )
 
 if __name__ == "__main__":
