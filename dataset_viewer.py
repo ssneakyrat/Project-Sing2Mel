@@ -1,19 +1,19 @@
 import sys
 import os
 import yaml
-import numpy as np
 import traceback
 import logging
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QTreeWidget, QTreeWidgetItem, QLabel,
                             QSplitter, QMessageBox, QPushButton, QScrollArea,
-                            QSlider, QGroupBox)
-from PyQt5.QtCore import Qt, QTimer
+                            QSlider, QGroupBox, QProgressDialog)
+from PyQt5.QtCore import Qt, QTimer, QUrl
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
-from PyQt5.QtCore import QUrl
-import glob
-from collections import namedtuple
 
+# Import our refactored modules
+from ui.dataset.dataset_manager import DatasetManager
+from ui.dataset.audio_processor import AudioProcessor
+from ui.dataset.lab_file_handler import LabFileHandler
 from ui.dataset.spectrogram_canvas import SpectrogramCanvas
 
 # Configure logging
@@ -25,16 +25,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("DatasetViewer")
-
-import soundfile as sf
-import torchaudio
-import torch
-
-# Create a namedtuple for file metadata
-FileMetadata = namedtuple('FileMetadata', [
-    'wav_file', 'lab_file', 'singer_id', 'language_id', 'singer_idx', 
-    'language_idx', 'base_name'
-])
 
 class ScrollableSpectrogramWidget(QScrollArea):
     """A scrollable container for the spectrogram canvas"""
@@ -51,7 +41,6 @@ class ScrollableSpectrogramWidget(QScrollArea):
         self.setWidgetResizable(False)  
         
         # Always show scrollbars for debugging purposes
-        # Change back to AsNeeded after confirming they work
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         
@@ -67,33 +56,14 @@ class DatasetViewer(QMainWindow):
         try:
             with open('config.yaml', 'r') as f:
                 self.config = yaml.safe_load(f)
-                
-            self.dataset_dir = self.config['data']['dataset_dir']
-            self.map_file = self.config['data']['map_file']
         except Exception as e:
             self.show_error(f"Error loading config: {str(e)}")
             self.config = None
-            self.dataset_dir = './datasets/'  # Default value
-            self.map_file = 'mappings.yaml'   # Default value
         
-        # Load mappings
-        try:
-            with open(self.map_file, 'r') as f:
-                self.mappings = yaml.safe_load(f)
-            self.singer_map = self.mappings.get('singer_map', {})
-            self.language_map = self.mappings.get('lang_map', {})
-            self.phone_map = self.mappings.get('phone_map', {})  # Load phone map for reference
-        except Exception as e:
-            self.show_error(f"Error loading mappings: {str(e)}")
-            self.singer_map = {}
-            self.language_map = {}
-            self.phone_map = {}
-            
-        # Initialize audio processing params from config
-        self.sr = self.config['model']['sample_rate'] if self.config else 24000
-        self.hop_length = self.config['model']['hop_length'] if self.config else 240
-        self.win_length = self.config['model']['win_length'] if self.config else 1024
-        self.n_mels = self.config['model']['n_mels'] if self.config else 80
+        # Initialize components
+        self.dataset_manager = DatasetManager(self.config)
+        self.audio_processor = AudioProcessor(self.config)
+        self.lab_file_handler = LabFileHandler(self.dataset_manager.phone_map)
         
         # Width scale factor for spectrograms
         self.width_scale_factor = 2.0
@@ -315,7 +285,7 @@ class DatasetViewer(QMainWindow):
         reply = QMessageBox.question(
             self,
             'Confirm Lab File Update',
-            f"This will overwrite the phoneme boundaries and labels in {os.path.basename(file_task.lab_file)}. Continue?",  # Updated message
+            f"This will overwrite the phoneme boundaries and labels in {os.path.basename(file_task.lab_file)}. Continue?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -323,8 +293,8 @@ class DatasetViewer(QMainWindow):
         if reply != QMessageBox.Yes:
             return
         
-        # Update the lab file
-        success = self.update_lab_file(file_task.lab_file, phones, start_times, end_times)
+        # Update the lab file using the lab file handler
+        success = self.lab_file_handler.write_lab_file(file_task.lab_file, phones, start_times, end_times)
         
         if success:
             # Disable save button and reset style
@@ -335,22 +305,11 @@ class DatasetViewer(QMainWindow):
             QMessageBox.information(
                 self,
                 "Save Complete",
-                f"Phoneme boundaries and labels have been updated in {os.path.basename(file_task.lab_file)}."  # Updated message
+                f"Phoneme boundaries and labels have been updated in {os.path.basename(file_task.lab_file)}."
             )
             
             # Reload to reflect changes
             self.display_spectrogram(file_task.wav_file, file_task.lab_file)
-    
-    def update_lab_file(self, lab_file, phones, start_times, end_times):
-        """Update a lab file with new phoneme boundaries"""
-        try:
-            with open(lab_file, 'w') as f:
-                for phone, start, end in zip(phones, start_times, end_times):
-                    f.write(f"{start:.6f} {end:.6f} {phone}\n")
-            return True
-        except Exception as e:
-            self.show_error(f"Error updating lab file: {str(e)}")
-            return False
     
     def on_scale_slider_changed(self, value):
         """Handle width scale slider value change"""
@@ -405,8 +364,8 @@ class DatasetViewer(QMainWindow):
                 )
                 
                 if reply == QMessageBox.Yes:
-                    # Perform normalization
-                    success = self.normalize_to_target_db(file_task.wav_file)
+                    # Perform normalization using audio processor
+                    success, details = self.audio_processor.normalize_audio(file_task.wav_file)
                     
                     if success:
                         QMessageBox.information(
@@ -414,6 +373,9 @@ class DatasetViewer(QMainWindow):
                             "Normalization Complete",
                             f"Audio file has been normalized to -18 dB FS."
                         )
+                        
+                        # Reload the current file
+                        self.display_spectrogram(file_task.wav_file, file_task.lab_file)
     
     def on_batch_normalize_clicked(self):
         """Handle batch normalize button click"""
@@ -473,64 +435,6 @@ class DatasetViewer(QMainWindow):
         # Enable play and normalize buttons
         self.play_button.setEnabled(True)
         self.normalize_button.setEnabled(True)
-        
-    def scan_directory(self):
-        """Scan dataset directory and find WAV and LAB file pairs"""
-        file_tasks = []
-        
-        if not os.path.exists(self.dataset_dir):
-            self.show_error(f"Dataset directory not found: {self.dataset_dir}")
-            return []
-            
-        try:
-            # First find the singer directories
-            singer_dirs = glob.glob(os.path.join(self.dataset_dir, '*'))
-            singer_dirs = [d for d in singer_dirs if os.path.isdir(d)]
-            
-            for singer_dir in singer_dirs:
-                singer_id = os.path.basename(singer_dir)
-                singer_idx = self.singer_map.get(singer_id, -1)
-                
-                if singer_idx == -1:
-                    continue  # Skip unmapped singers
-                
-                # Find language directories within this singer
-                language_dirs = glob.glob(os.path.join(singer_dir, '*'))
-                language_dirs = [d for d in language_dirs if os.path.isdir(d)]
-                
-                for language_dir in language_dirs:
-                    language_id = os.path.basename(language_dir)
-                    language_idx = self.language_map.get(language_id, -1)
-                   
-                    if language_idx == -1:
-                        continue  # Skip unmapped languages
-                    
-                    # Find all lab files
-                    lab_files = glob.glob(os.path.join(language_dir+'/lab', '*.lab'))
-                    
-                    for lab_file in lab_files:
-                        base_name = os.path.splitext(os.path.basename(lab_file))[0]
-                        wav_file = os.path.join(language_dir+'/wav', f"{base_name}.wav")
-                        
-                        # Create a file task
-                        task = FileMetadata(
-                            wav_file=wav_file,
-                            lab_file=lab_file,
-                            singer_id=singer_id,
-                            language_id=language_id,
-                            singer_idx=singer_idx,
-                            language_idx=language_idx,
-                            base_name=base_name
-                        )
-                        
-                        file_tasks.append(task)
-
-            return file_tasks
-            
-        except Exception as e:
-            error_message = f"Error scanning directory: {str(e)}\n{traceback.format_exc()}"
-            self.show_error(error_message)
-            return []
     
     def load_dataset(self):
         """Load and display the dataset structure"""
@@ -540,29 +444,16 @@ class DatasetViewer(QMainWindow):
         if self.spectrogram_canvas:
             self.spectrogram_canvas.clear()
             
-        # Scan directory
-        file_tasks = self.scan_directory()
+        # Scan directory using dataset manager
+        self.dataset_manager.scan_dataset()
+        file_tasks = self.dataset_manager.get_file_tasks()
+        dataset_structure = self.dataset_manager.get_dataset_structure()
         
         if not file_tasks:
             self.stats_label.setText("No dataset files found")
             return
             
-        # Organize by singer and language
-        dataset_structure = {}
-        
-        for task in file_tasks:
-            singer_id = task.singer_id
-            language_id = task.language_id
-            
-            if singer_id not in dataset_structure:
-                dataset_structure[singer_id] = {}
-            
-            if language_id not in dataset_structure[singer_id]:
-                dataset_structure[singer_id][language_id] = []
-            
-            dataset_structure[singer_id][language_id].append(task)
-        
-        # Populate tree widget
+        # Populate tree widget from dataset structure
         for singer_id in sorted(dataset_structure.keys()):
             singer_item = QTreeWidgetItem([f"Singer: {singer_id}"])
             self.tree_widget.addTopLevelItem(singer_item)
@@ -581,14 +472,13 @@ class DatasetViewer(QMainWindow):
         self.tree_widget.expandAll()
         
         # Update statistics
-        total_singers = len(dataset_structure)
-        total_languages = sum(len(languages) for languages in dataset_structure.values())
+        stats = self.dataset_manager.get_statistics()
         
         self.stats_label.setText(
             f"Dataset Statistics:\n"
-            f"• Singers: {total_singers}\n"
-            f"• Languages: {total_languages}\n"
-            f"• Files: {len(file_tasks)}"
+            f"• Singers: {stats['singers']}\n"
+            f"• Languages: {stats['languages']}\n"
+            f"• Files: {stats['files']}"
         )
     
     def on_item_clicked(self, item, column):
@@ -602,8 +492,8 @@ class DatasetViewer(QMainWindow):
             self.play_button.setText("Play")
             self.play_button.setEnabled(False)
             self.stop_button.setEnabled(False)
-            self.normalize_button.setEnabled(False)  # Disable normalize button until audio is loaded
-            self.save_boundaries_button.setEnabled(False)  # Disable save button until edits are made
+            self.normalize_button.setEnabled(False)
+            self.save_boundaries_button.setEnabled(False)
             self.time_label.setText("Position: 0:00 / 0:00")
             
             # Display file info
@@ -620,78 +510,18 @@ class DatasetViewer(QMainWindow):
             self.play_button.setText("Play")
             self.play_button.setEnabled(False)
             self.stop_button.setEnabled(False)
-            self.normalize_button.setEnabled(False)  # Disable normalize button
-            self.save_boundaries_button.setEnabled(False)  # Disable save button
+            self.normalize_button.setEnabled(False)
+            self.save_boundaries_button.setEnabled(False)
             self.time_label.setText("Position: 0:00 / 0:00")
             
             if self.spectrogram_canvas:
                 self.spectrogram_canvas.clear()
     
-    def extract_f0(self, audio, sr, hop_length):
-        """Extract F0 (fundamental frequency) from audio"""
-        try:
-            # Try to import parselmouth for better F0 extraction
-            import parselmouth
-            from parselmouth.praat import call
-            
-            # Create a Praat Sound object
-            sound = parselmouth.Sound(audio, sr)
-            
-            # Extract pitch using Praat
-            pitch = call(sound, "To Pitch", 0.0, 75, 600)
-            
-            # Extract F0 values at regular intervals
-            f0_values = []
-            for i in range(0, len(audio), hop_length):
-                time = i / sr
-                f0 = call(pitch, "Get value at time", time, "Hertz", "Linear")
-                if np.isnan(f0):
-                    f0 = 0.0  # Replace NaN with 0
-                f0_values.append(f0)
-            
-            return np.array(f0_values)
-            
-        except ImportError:
-            # Fall back to a simple method if parselmouth is not available
-            # This is just a placeholder and won't give accurate F0
-            return np.zeros(len(audio) // hop_length + 1)
-    
-    def normalize_mel(self, mel_db):
-        """Normalize mel spectrogram"""
-        # Simple normalization to 0-1 range
-        mel_min = torch.min(mel_db)
-        mel_max = torch.max(mel_db)
-        mel_norm = (mel_db - mel_min) / (mel_max - mel_min + 1e-5)
-        return mel_norm
-    
-    def read_lab_file(self, lab_file):
-        """Read phone labels from lab file"""
-        phones = []
-        start_times = []
-        end_times = []
-        
-        try:
-            with open(lab_file, 'r') as f:
-                for line in f:
-                    parts = line.strip().split()
-                    if len(parts) >= 3:
-                        start_time = float(parts[0])
-                        end_time = float(parts[1])
-                        phone = parts[2]
-                        
-                        start_times.append(start_time)
-                        end_times.append(end_time)
-                        phones.append(phone)
-            
-            return phones, start_times, end_times
-        except Exception as e:
-            print(f"Error reading lab file: {str(e)}")
-            return [], [], []
-    
     def display_spectrogram(self, wav_file, lab_file):
         """Load audio file and display its spectrogram with phoneme alignment and waveform"""
         if not os.path.exists(wav_file):
-            raise FileNotFoundError(f"WAV file not found: {wav_file}")
+            self.show_error(f"WAV file not found: {wav_file}")
+            return
             
         # Set current audio file
         self.current_audio_file = wav_file
@@ -700,263 +530,94 @@ class DatasetViewer(QMainWindow):
         if self.current_audio_file:
             self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(self.current_audio_file)))
             
-        # Load audio
-        audio, sr = sf.read(wav_file, dtype='float32')
-        
-        # Convert to mono if stereo
-        if len(audio.shape) > 1 and audio.shape[1] > 1:
-            audio = audio.mean(axis=1)
-        
-        # Resample if needed
-        if sr != self.sr:
-            audio_tensor = torch.FloatTensor(audio).unsqueeze(0)
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=sr, new_freq=self.sr
-            )
-            audio_tensor = resampler(audio_tensor)
-            audio = audio_tensor.squeeze(0).numpy()
-            sr = self.sr
-        
-        # Calculate audio duration
-        audio_duration = len(audio) / sr
-        
-        # Read phoneme information
-        phones, start_times, end_times = self.read_lab_file(lab_file)
-        
-        # Check for empty phoneme data
-        if not phones or not start_times or not end_times:
-            logger.warning(f"No phoneme data found in {lab_file}")
-        
-        # Extract F0
-        f0 = self.extract_f0(audio, sr, self.hop_length)
-        
-        # Convert audio to tensor
-        audio_tensor = torch.FloatTensor(audio).unsqueeze(0)
-            
-        # Extract mel spectrogram using torchaudio
-        mel_transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=sr,
-            n_fft=self.win_length,
-            win_length=self.win_length,
-            hop_length=self.hop_length,
-            f_min=40,  # Common minimum frequency
-            f_max=sr/2,  # Nyquist frequency
-            n_mels=self.n_mels,
-            power=2.0
-        )
-        
-        mel_spec = mel_transform(audio_tensor)
-        mel_db = torchaudio.transforms.AmplitudeToDB()(mel_spec)
-        mel_norm = self.normalize_mel(mel_db)
-        
-        # Convert to numpy for plotting
-        mel_np = mel_norm.squeeze(0).cpu().numpy()
-        
-        # Calculate audio duration and expected mel frames
-        expected_mel_frames = mel_np.shape[1]
-        
-        # Validation of lab file timing
-        if phones and len(phones) > 0:
-            lab_max_time = max(end_times)
-            if abs(lab_max_time - audio_duration) > 0.5:  # More than 0.5 seconds difference
-                logger.warning(f"Lab file timing mismatch: lab_max_time={lab_max_time:.2f}s, audio_duration={audio_duration:.2f}s")
-        
-        # Display spectrogram with phoneme alignment and waveform using current width scale factor
-        self.spectrogram_canvas.plot_spectrogram(
-            mel_np,
-            audio=audio,  # Pass the audio data for waveform display
-            f0=f0, 
-            phones=phones, 
-            start_times=start_times, 
-            end_times=end_times,
-            sample_rate=sr,
-            hop_length=self.hop_length,
-            width_scale_factor=self.width_scale_factor,
-            audio_duration=audio_duration
-        )
-    
-    def normalize_to_target_db(self, wav_file, target_db_fs=-18):
-        """
-        Normalize audio file to target dB FS level, overwrite the original file, and refresh display
-        
-        Args:
-            wav_file (str): Path to the WAV file
-            target_db_fs (float): Target dB FS level, typically -18 dB FS for EBU R128 reference
-        """
-        if not os.path.exists(wav_file):
-            self.show_error(f"WAV file not found: {wav_file}")
-            return False
-            
         try:
-            self.media_player.stop()
-            self.media_player.setMedia(QMediaContent()) 
-
-            # Load the audio file
-            audio, sr = sf.read(wav_file, dtype='float32')
+            # Load audio using audio processor
+            audio, sr = self.audio_processor.load_audio(wav_file)
             
-            # Convert to mono if stereo
-            if len(audio.shape) > 1 and audio.shape[1] > 1:
-                audio = audio.mean(axis=1)
+            # Extract features
+            features = self.audio_processor.extract_features(audio, sr)
+            mel_np = features['mel_spectrogram']
+            f0 = features['f0']
+            audio_duration = features['duration']
             
-            # Calculate peak amplitude
-            peak_amplitude = np.max(np.abs(audio))
+            # Read phoneme information using lab file handler
+            phones, start_times, end_times = self.lab_file_handler.read_lab_file(lab_file)
             
-            # Current level in dB FS
-            current_db_fs = 20 * np.log10(peak_amplitude) if peak_amplitude > 0 else -np.inf
+            # Check for empty phoneme data
+            if not phones or not start_times or not end_times:
+                logger.warning(f"No phoneme data found in {lab_file}")
             
-            # Calculate needed gain in dB
-            gain_db = target_db_fs - current_db_fs
+            # Validation of lab file timing
+            if phones and len(phones) > 0:
+                lab_max_time = max(end_times)
+                if abs(lab_max_time - audio_duration) > 0.5:  # More than 0.5 seconds difference
+                    logger.warning(f"Lab file timing mismatch: lab_max_time={lab_max_time:.2f}s, audio_duration={audio_duration:.2f}s")
             
-            # Convert dB gain to amplitude scalar
-            gain_factor = 10 ** (gain_db / 20)
-            
-            # Apply gain
-            normalized_audio = audio * gain_factor
-            
-            # Ensure we don't clip (shouldn't happen when normalizing to negative dB FS)
-            if np.max(np.abs(normalized_audio)) > 1.0:
-                normalized_audio = normalized_audio / np.max(np.abs(normalized_audio))
-                logger.warning(f"Audio was clipping after normalization. Applied additional scaling.")
-            
-            # Write back to the original file
-            sf.write(wav_file, normalized_audio, sr)
-            
-            # Log the normalization
-            logger.info(f"Normalized {os.path.basename(wav_file)} from {current_db_fs:.2f} dB FS to {target_db_fs:.2f} dB FS (gain: {gain_db:.2f} dB)")
-            
-            # Update the UI if this is the currently selected file
-            if wav_file == self.current_audio_file:
-                # Get the current lab file from the current file_task
-                current_item = self.tree_widget.currentItem()
-                if current_item:
-                    file_task = current_item.data(0, Qt.UserRole)
-                    if file_task and file_task.lab_file:
-                        # Reload the audio and regenerate the spectrogram
-                        self.display_spectrogram(wav_file, file_task.lab_file)
-                        
-                        # Update the media player
-                        self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(wav_file)))
-            
-            return True
+            # Display spectrogram with phoneme alignment and waveform using current width scale factor
+            self.spectrogram_canvas.plot_spectrogram(
+                mel_np,
+                audio=audio,  # Pass the audio data for waveform display
+                f0=f0, 
+                phones=phones, 
+                start_times=start_times, 
+                end_times=end_times,
+                sample_rate=sr,
+                hop_length=self.audio_processor.hop_length,
+                width_scale_factor=self.width_scale_factor,
+                audio_duration=audio_duration
+            )
         except Exception as e:
-            error_message = f"Error normalizing audio: {str(e)}\n{traceback.format_exc()}"
+            error_message = f"Error displaying spectrogram: {str(e)}\n{traceback.format_exc()}"
             self.show_error(error_message)
-            return False
     
-    def batch_normalize_dataset(self, target_db_fs=-10):
+    def batch_normalize_dataset(self, target_db_fs=-18):
         """
         Normalize all audio files in the dataset to target dB FS level
         
         Args:
             target_db_fs (float): Target dB FS level, typically -18 dB FS for EBU R128 reference
         """
-        # Scan directory to get all files
-        file_tasks = self.scan_directory()
+        # Get all files from dataset manager
+        file_tasks = self.dataset_manager.get_file_tasks()
         
         if not file_tasks:
             self.show_error("No dataset files found for batch normalization")
             return
         
-        # Create progress dialog
-        progress_dialog = QMessageBox(self)
-        progress_dialog.setWindowTitle("Batch Normalization")
-        progress_dialog.setText(f"Preparing to normalize {len(file_tasks)} files to {target_db_fs} dB FS...")
-        progress_dialog.setStandardButtons(QMessageBox.Cancel)
-        progress_dialog.setDefaultButton(QMessageBox.Cancel)
+        # Create a list of wav files
+        wav_files = [task.wav_file for task in file_tasks if os.path.exists(task.wav_file)]
         
         # Show the initial dialog to confirm
         confirm_dialog = QMessageBox(self)
         confirm_dialog.setWindowTitle("Confirm Batch Normalization")
-        confirm_dialog.setText(f"This will normalize all {len(file_tasks)} audio files to {target_db_fs} dB FS and overwrite the original files.\n\nDo you want to continue?")
+        confirm_dialog.setText(
+            f"This will normalize all {len(wav_files)} audio files to {target_db_fs} dB FS "
+            f"and overwrite the original files.\n\nDo you want to continue?"
+        )
         confirm_dialog.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
         confirm_dialog.setDefaultButton(QMessageBox.No)
         
         # If user confirms, proceed with batch normalization
         if confirm_dialog.exec_() == QMessageBox.Yes:
-            # Create a new progress dialog with a QProgressBar
-            from PyQt5.QtWidgets import QProgressDialog
-            from PyQt5.QtCore import Qt
-            
-            progress = QProgressDialog("Normalizing audio files...", "Cancel", 0, len(file_tasks), self)
+            # Create a progress dialog
+            progress = QProgressDialog("Normalizing audio files...", "Cancel", 0, len(wav_files), self)
             progress.setWindowModality(Qt.WindowModal)
             progress.setWindowTitle("Batch Normalization Progress")
             progress.setMinimumDuration(0)
             progress.setValue(0)
             
-            # Lists to track results
-            successful_files = []
-            failed_files = []
-            skipped_files = []
-            
-            # Process each file
-            for i, file_task in enumerate(file_tasks):
-                # Update progress
-                progress.setValue(i)
-                progress.setLabelText(f"Processing: {os.path.basename(file_task.wav_file)}")
-                
-                # Process events to keep UI responsive
+            # Define progress callback
+            def update_progress(current, total, filename):
+                progress.setValue(current)
+                progress.setLabelText(f"Processing: {filename}")
                 QApplication.processEvents()
-                
-                # Check if user canceled
-                if progress.wasCanceled():
-                    break
-                
-                # Check if file exists
-                if not os.path.exists(file_task.wav_file):
-                    skipped_files.append(file_task.wav_file)
-                    continue
-                
-                try:
-                    # Load the audio file
-                    audio, sr = sf.read(file_task.wav_file, dtype='float32')
-                    
-                    # Convert to mono if stereo
-                    if len(audio.shape) > 1 and audio.shape[1] > 1:
-                        audio = audio.mean(axis=1)
-                    
-                    # Calculate peak amplitude
-                    peak_amplitude = np.max(np.abs(audio))
-                    
-                    # Current level in dB FS
-                    current_db_fs = 20 * np.log10(peak_amplitude) if peak_amplitude > 0 else -np.inf
-                    
-                    # Skip if already within 0.5 dB of target (to avoid unnecessary processing)
-                    if abs(current_db_fs - target_db_fs) < 0.5:
-                        skipped_files.append(file_task.wav_file)
-                        logger.info(f"Skipped {os.path.basename(file_task.wav_file)} - already at {current_db_fs:.2f} dB FS (target: {target_db_fs:.2f} dB FS)")
-                        continue
-                    
-                    # Calculate needed gain in dB
-                    gain_db = target_db_fs - current_db_fs
-                    
-                    # Convert dB gain to amplitude scalar
-                    gain_factor = 10 ** (gain_db / 20)
-                    
-                    # Apply gain
-                    normalized_audio = audio * gain_factor
-                    
-                    # Ensure we don't clip (shouldn't happen when normalizing to negative dB FS)
-                    if np.max(np.abs(normalized_audio)) > 1.0:
-                        normalized_audio = normalized_audio / np.max(np.abs(normalized_audio))
-                        logger.warning(f"Audio was clipping after normalization. Applied additional scaling.")
-                    
-                    # Write back to the original file
-                    sf.write(file_task.wav_file, normalized_audio, sr)
-                    
-                    # Log the normalization
-                    logger.info(f"Normalized {os.path.basename(file_task.wav_file)} from {current_db_fs:.2f} dB FS to {target_db_fs:.2f} dB FS (gain: {gain_db:.2f} dB)")
-                    
-                    # Add to successful files
-                    successful_files.append(file_task.wav_file)
-                    
-                except Exception as e:
-                    # Log the error and add to failed files
-                    error_message = f"Error normalizing {os.path.basename(file_task.wav_file)}: {str(e)}"
-                    logger.error(error_message)
-                    failed_files.append((file_task.wav_file, str(e)))
+                return not progress.wasCanceled()
+            
+            # Perform batch normalization
+            results = self.audio_processor.batch_normalize(wav_files, target_db_fs, update_progress)
             
             # Complete the progress
-            progress.setValue(len(file_tasks))
+            progress.setValue(len(wav_files))
             
             # Update the UI if this is the currently selected file
             current_item = self.tree_widget.currentItem()
@@ -964,7 +625,7 @@ class DatasetViewer(QMainWindow):
                 file_task = current_item.data(0, Qt.UserRole)
                 if file_task and file_task.wav_file:
                     # Check if the current file was processed
-                    if file_task.wav_file in successful_files:
+                    if file_task.wav_file in results["successful"]:
                         # Reload the audio and regenerate the spectrogram
                         self.display_spectrogram(file_task.wav_file, file_task.lab_file)
                         
@@ -974,18 +635,18 @@ class DatasetViewer(QMainWindow):
             # Show summary dialog
             summary = f"Batch Normalization Summary:\n\n"
             summary += f"Target Level: {target_db_fs} dB FS\n"
-            summary += f"Files Processed: {len(successful_files) + len(failed_files) + len(skipped_files)}\n"
-            summary += f"   - Successfully Normalized: {len(successful_files)}\n"
-            summary += f"   - Already at Target Level: {len(skipped_files)}\n"
-            summary += f"   - Failed: {len(failed_files)}\n"
+            summary += f"Files Processed: {len(wav_files)}\n"
+            summary += f"   - Successfully Normalized: {len(results['successful'])}\n"
+            summary += f"   - Already at Target Level: {len(results['skipped'])}\n"
+            summary += f"   - Failed: {len(results['failed'])}\n"
             
-            if failed_files:
+            if results["failed"]:
                 summary += "\nFailed Files:\n"
-                for file_path, error in failed_files[:10]:  # Show first 10 failures
+                for file_path, error in results["failed"][:10]:  # Show first 10 failures
                     summary += f"   - {os.path.basename(file_path)}: {error}\n"
                 
-                if len(failed_files) > 10:
-                    summary += f"   - ... and {len(failed_files) - 10} more\n"
+                if len(results["failed"]) > 10:
+                    summary += f"   - ... and {len(results['failed']) - 10} more\n"
             
             QMessageBox.information(self, "Batch Normalization Complete", summary)
 
