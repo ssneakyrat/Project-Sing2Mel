@@ -51,84 +51,6 @@ MIN_PHONE = 5
 MIN_DURATION_MS = 10
 ENABLE_ALIGNMENT_PLOTS = False
 
-def collect_global_audio_statistics(file_tasks, sample_rate, max_files=None):
-    """
-    Collect global audio statistics from a subset of files for normalization.
-    
-    Args:
-        file_tasks: List of FileMetadata objects
-        sample_rate: Target sample rate
-        max_files: Maximum number of files to analyze (None for all)
-    
-    Returns:
-        Dictionary with global audio statistics
-    """
-    import random
-    import numpy as np
-    import soundfile as sf
-    import torch
-    import torchaudio
-    from tqdm import tqdm
-    
-    if max_files is not None and max_files < len(file_tasks):
-        # Randomly sample files to analyze
-        file_sample = random.sample(file_tasks, max_files)
-    else:
-        file_sample = file_tasks
-        
-    logger.info(f"Collecting audio statistics from {len(file_sample)} files")
-    
-    # Initialize stats
-    max_peak = 0.0
-    total_rms_squared = 0.0
-    file_count = 0
-    
-    # Process each file
-    for task in tqdm(file_sample, desc="Analyzing audio statistics"):
-        try:
-            # Load audio
-            audio, sr = sf.read(task.wav_file, dtype='float32')
-            
-            # Convert to mono if stereo
-            if len(audio.shape) > 1 and audio.shape[1] > 1:
-                audio = audio.mean(axis=1)
-            
-            # Resample if needed
-            if sr != sample_rate:
-                audio_tensor = torch.FloatTensor(audio).unsqueeze(0)
-                resampler = torchaudio.transforms.Resample(
-                    orig_freq=sr, new_freq=sample_rate
-                )
-                audio_tensor = resampler(audio_tensor)
-                audio = audio_tensor.squeeze(0).numpy()
-            
-            # Calculate statistics
-            file_peak = np.max(np.abs(audio))
-            file_rms_squared = np.mean(audio**2)
-            
-            # Update global statistics
-            max_peak = max(max_peak, file_peak)
-            total_rms_squared += file_rms_squared
-            file_count += 1
-            
-        except Exception as e:
-            logger.warning(f"Error analyzing {task.wav_file}: {str(e)}")
-            continue
-    
-    # Calculate global RMS
-    if file_count > 0:
-        global_rms = np.sqrt(total_rms_squared / file_count)
-    else:
-        global_rms = 0.0
-        
-    logger.info(f"Global statistics: Max peak = {max_peak}, Average RMS = {global_rms}")
-    
-    return {
-        'max_peak': max_peak,
-        'global_rms': global_rms,
-        'file_count': file_count
-    }
-
 def combined_global_normalize(audio, global_stats, target_peak_db=-3.0, 
                              rms_weight=0.5, peak_weight=0.5):
     """
@@ -171,7 +93,7 @@ def combined_global_normalize(audio, global_stats, target_peak_db=-3.0,
     return audio * combined_factor
 
 # Stage 1: File gathering and initial processing
-def stage1_process_file(file_metadata, phone_map, sample_rate, max_audio_length, max_mel_frames, hop_length, global_audio_stats=None):
+def stage1_process_file(file_metadata, phone_map, sample_rate, max_audio_length, max_mel_frames, hop_length):
     """
     Process a single audio/lab file pair and perform initial processing.
     Now includes global normalization, chunking to max_audio_length and padding of final chunk.
@@ -202,16 +124,6 @@ def stage1_process_file(file_metadata, phone_map, sample_rate, max_audio_length,
             audio_tensor = resampler(audio_tensor)
             audio = audio_tensor.squeeze(0).numpy()
             sr = sample_rate
-        
-        # Apply global normalization if stats are provided
-        if global_audio_stats is not None:
-            audio = combined_global_normalize(
-                audio, 
-                global_audio_stats, 
-                target_peak_db=-3.0,  # -3dB peak target as requested
-                rms_weight=0.5, 
-                peak_weight=0.5
-            )
         
         audio_length = len(audio)
         audio_duration_sec = audio_length / sr
@@ -321,10 +233,10 @@ def stage1_process_file(file_metadata, phone_map, sample_rate, max_audio_length,
 # Wrapper function for multiprocessing
 def process_file_for_mp(args):
     """Wrapper function that can be pickled for multiprocessing."""
-    file_metadata, phone_map, sample_rate, max_audio_length, max_mel_frames, hop_length, global_audio_stats = args
+    file_metadata, phone_map, sample_rate, max_audio_length, max_mel_frames, hop_length = args
     return stage1_process_file(
         file_metadata, phone_map, sample_rate, max_audio_length, 
-        max_mel_frames, hop_length, global_audio_stats
+        max_mel_frames, hop_length
     )
 
 # Stage 2: GPU-based feature extraction
@@ -548,7 +460,6 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         self.singer_duration = source_dataset.singer_duration
         self.language_duration = source_dataset.language_duration
         self.phone_language_stats = source_dataset.phone_language_stats
-        self.global_audio_stats = source_dataset.global_audio_stats
         self.max_audio_length = source_dataset.max_audio_length
         self.max_mel_frames = source_dataset.max_mel_frames
         
@@ -584,11 +495,6 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         # Estimate max audio length and mel frames
         self.max_audio_length, self.max_mel_frames = estimate_max_lengths(
             all_tasks, self.sample_rate, self.hop_length, max_files=100, context_window_sec=self.context_window_sec
-        )
-        
-        # NEW: Collect global audio statistics for normalization
-        self.global_audio_stats = collect_global_audio_statistics(
-            all_tasks, self.sample_rate, max_files=10
         )
         
         # Set random seed for reproducible file selection
@@ -709,7 +615,7 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         # Prepare args for multiprocessing - must be picklable
         mp_args = [
             (task, self.phone_map, self.sample_rate, self.max_audio_length, 
-            self.max_mel_frames, self.hop_length, self.global_audio_stats) 
+            self.max_mel_frames, self.hop_length) 
             for task in tasks
         ]
         
@@ -756,7 +662,6 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
             'singer_duration': self.singer_duration,
             'language_duration': self.language_duration,
             'phone_language_stats': self.phone_language_stats,
-            'global_audio_stats': self.global_audio_stats,  # Save global stats
             'is_train': self.is_train,
             'max_audio_length': self.max_audio_length,
             'max_mel_frames': self.max_mel_frames
@@ -782,7 +687,6 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         self.singer_duration = cache_data.get('singer_duration', {})
         self.language_duration = cache_data.get('language_duration', {})
         self.phone_language_stats = cache_data.get('phone_language_stats', {})
-        self.global_audio_stats = cache_data.get('global_audio_stats', None)  # Load global stats
         
         # Load max dimensions
         self.max_audio_length = cache_data.get('max_audio_length')
@@ -790,9 +694,6 @@ class SingingVoiceDataset(torch.utils.data.Dataset):
         
         logger.info(f"Loaded {len(self.data)} segments with {len(self.singer_map)} singers, "
                 f"{len(self.language_map)} languages, and {len(self.phone_map)} unique phones")
-        if self.global_audio_stats:
-            logger.info(f"Loaded global audio statistics: Max peak = {self.global_audio_stats['max_peak']:.4f}, "
-                    f"Global RMS = {self.global_audio_stats['global_rms']:.4f}")
         logger.info(f"Max audio length: {self.max_audio_length} samples, Max mel frames: {self.max_mel_frames}")
     
     def generate_distribution_log(self, dataset_type="dataset"):
