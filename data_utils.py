@@ -371,8 +371,8 @@ def process_file_metadata(lab_file, phone_map, min_phone=5, min_duration_ms=10):
             parts = line.strip().split()
             if len(parts) == 3:
                 start, end, phone = parts
-                start_times.append(int(start))
-                end_times.append(int(end))
+                start_times.append(int(float(start)))
+                end_times.append(int(float(end)))
                 phones.append(phone)
     
     # Skip files with fewer phones than MIN_PHONE
